@@ -2,8 +2,10 @@
 //!
 //! A candidate is checked with `lust check --json --sandbox`, optionally
 //! repaired with `lust fix`, then built with
-//! `lust build --sandbox --max-memory <bytes> -o <bin>`. The host runs that
-//! binary itself so the wall-clock kill is ours: lust does not limit time.
+//! `lust build --sandbox --max-memory <bytes> --time-limit <duration> -o <bin>`.
+//! `--time-limit` is passed when the binary advertises it. The host still
+//! kills on the wall clock: a straight-line body is not probed, and a lust
+//! that predates the flag has no guest deadline.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +22,7 @@ pub struct LustTool {
     pub bin: PathBuf,
     pub version: String,
     pub supports_max_memory: bool,
+    pub supports_time_limit: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -39,6 +42,8 @@ pub struct CheckResult {
 pub enum RunClass {
     Clean,
     TimedOut,
+    /// The guest printed `error[L0533]` and exited. Lust's own deadline.
+    TimeLust,
     MemoryLust,
     MemoryHost,
     SandboxDenied,
@@ -87,12 +92,37 @@ pub fn probe(bin: &Path, timeout: Duration) -> Result<LustTool> {
         stderr: String::new(),
         elapsed: Duration::ZERO,
     });
-    let help_text = format!("{}{}", help.stdout, help.stderr);
+    // `lust build --help` is not a help page on a real binary: the client
+    // treats `--help` as a file name. A limit flag with no value is a usage
+    // error and prints the usage line, which names every flag.
+    let usage = tool_output(bin, &["build", "--time-limit"], timeout, &[]).unwrap_or(ExecResult {
+        kind: StopKind::Exited(2),
+        stdout: String::new(),
+        stderr: String::new(),
+        elapsed: Duration::ZERO,
+    });
+    let help_text = format!(
+        "{}{}{}{}",
+        help.stdout, help.stderr, usage.stdout, usage.stderr
+    );
     Ok(LustTool {
         bin: bin.to_path_buf(),
         version,
         supports_max_memory: help_text.contains("--max-memory"),
+        supports_time_limit: help_text.contains("--time-limit"),
     })
+}
+
+/// `2s` when the duration is a whole number of seconds, otherwise `500ms`.
+pub fn format_time_limit(limit: Duration) -> String {
+    let ms = limit.as_millis();
+    if ms >= 1000 && ms % 1000 == 0 {
+        format!("{}s", ms / 1000)
+    } else if ms == 0 {
+        "1ms".to_string()
+    } else {
+        format!("{ms}ms")
+    }
 }
 
 pub fn check(tool: &LustTool, source: &Path, timeout: Duration) -> Result<CheckResult> {
@@ -143,6 +173,7 @@ pub fn build(
     source: &Path,
     output: &Path,
     max_memory: u64,
+    time_limit: Option<Duration>,
     timeout: Duration,
 ) -> Result<()> {
     let memory = max_memory.to_string();
@@ -150,6 +181,12 @@ pub fn build(
     if tool.supports_max_memory {
         args.push("--max-memory".to_string());
         args.push(memory);
+    }
+    if tool.supports_time_limit {
+        if let Some(limit) = time_limit {
+            args.push("--time-limit".to_string());
+            args.push(format_time_limit(limit));
+        }
     }
     args.push("-o".to_string());
     args.push(output.display().to_string());
@@ -207,6 +244,9 @@ pub fn classify(result: &ExecResult) -> RunClass {
         return RunClass::MemoryHost;
     }
     let stderr = &result.stderr;
+    if stderr.contains("error[L0533]") {
+        return RunClass::TimeLust;
+    }
     if stderr.contains("error[L0532]") && stderr.contains("max-memory") {
         return RunClass::MemoryLust;
     }
@@ -343,6 +383,13 @@ mod tests {
             elapsed: Duration::from_millis(400),
         };
         assert_eq!(classify(&timed), RunClass::TimedOut);
+        let guest = ExecResult {
+            kind: StopKind::Exited(101),
+            stdout: "before\n".into(),
+            stderr: "error[L0533]: this program was built with --time-limit 300ms and tried to run longer\n".into(),
+            elapsed: Duration::from_millis(300),
+        };
+        assert_eq!(classify(&guest), RunClass::TimeLust);
         let host = ExecResult {
             kind: StopKind::MemorySignal,
             stdout: String::new(),

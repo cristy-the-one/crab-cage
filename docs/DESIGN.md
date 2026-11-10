@@ -281,15 +281,15 @@ Sizes are the amount of code and the surface that changes. They are not a schedu
 
 - `crab-cage evolve` runs the tank demo with the mock backend, prints the curve and the best fitness, and writes `best_controller.rs`, `report.md`, and `report.json`.
 - `--backend local` talks to a loopback model server and refuses anything else.
-- With lust 0.3.0 on `PATH` or `--lust-bin`, the winner is `lust check --sandbox` and, when `--max-memory` is advertised, `lust build --sandbox --max-memory`.
+- With lust 0.3.0 on `PATH` or `--lust-bin`, the winner is `lust check --sandbox` and, when the flags are advertised, `lust build --sandbox --max-memory --time-limit`.
 - Without lust, the winner is compiled with `rustc` and replayed under the host memory cap and the wall clock. The report says lust was absent.
-- Tests cover: the search improves fitness on several seeds and repeats bit-for-bit; a hand PI beats a weak proportional; the emitted file compiles with `rustc` and matches the genome; the host kills a sleeper; the host memory cap stops a large allocation and allows a small one; a fake lust is invoked with `--sandbox` and `--max-memory`, and an `L0532` memory line is classified as a guest memory stop.
+- Tests cover: the search improves fitness on several seeds and repeats bit-for-bit; a hand PI beats a weak proportional; the emitted file compiles with `rustc` and matches the genome; the host kills a sleeper; the host memory cap stops a large allocation and allows a small one; a fake lust is invoked with `--sandbox`, `--max-memory` and `--time-limit`, and `L0532` / `L0533` lines are classified as a guest memory stop and a guest time stop.
 
 ## Gaps in lust
 
-These are proposals for lust. Crab Cage works around them. None of them are implemented in the lust tree by this project.
+These are proposals for lust. Crab Cage works around the ones that are still open. The time limit is the exception: the implementation is `docs/lust-time-limit.patch`, against `feat/sandbox-limits` at `cbc913832b6f`. Apply it there with `git am`. This environment has no credentials for `github.com/cristy-the-one/lust-lang`, so the patch is the copy of that commit. Crab Cage passes the flag when the binary advertises it.
 
-1. **No time limit.** `docs/sandbox.md` says the host kills a long run. A guest can spin or `thread::sleep` (sleep is on the allowed list) until the host notices. Proposal: `--max-time` on `build` and `run`, checked from the same places as `--max-memory` plus a probe on loop back-edges, with its own diagnostic code. `L0532` already means both "refused family" and "over the memory cap"; a third meaning would be hard to classify. Exit 101, one stderr line, stdout flushed first, same as the memory stop.
+1. **Time limit.** `lust build` and `lust run` take `--sandbox --time-limit <duration>`. A bare number is seconds; `500ms`, `2s` and `1m` name the unit. The deadline is monotonic and set in `main`. A loop checks it on every back-edge, a function entry checks it every 64th call, and `thread::sleep` does not sleep past it. The stop is `error[L0533]`, exit 101, stdout flushed first. It is not another meaning of `L0532`. `check` does not take the flag. A straight-line body that never loops, calls, or sleeps is not probed, and a recursion that fills the stack first is still the stack-overflow stop, so the host wall clock stays the backstop. Crab Cage passes the configured run timeout when `lust build --help` or the usage text contains `--time-limit`.
 
 2. **`--max-memory` is not in a release.** It is pull request 29, the 0.3.0 branch. v0.2.0 does not have the flag. Crab Cage detects it with `lust build --help` and otherwise uses only the host cap. Shipping v0.3.0 is the lust-side fix. Crab Cage must not be the thing that tags that release.
 

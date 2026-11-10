@@ -56,6 +56,7 @@ pub struct Verification {
     pub lust: String,
     pub lust_version: Option<String>,
     pub lust_max_memory: bool,
+    pub lust_time_limit: bool,
     pub lust_check: String,
 }
 

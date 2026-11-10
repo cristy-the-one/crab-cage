@@ -331,5 +331,10 @@ fn probe(lust_bin: Option<PathBuf>) -> Result<()> {
     } else {
         println!("--max-memory: no (host memory backstop still applies)");
     }
+    if tool.supports_time_limit {
+        println!("--time-limit: yes");
+    } else {
+        println!("--time-limit: no (host wall clock still applies)");
+    }
     Ok(())
 }

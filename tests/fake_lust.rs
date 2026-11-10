@@ -16,7 +16,15 @@ fn fake_lust() -> PathBuf {
     } else {
         "fake_lust"
     });
-    if !output.is_file() {
+    let source_newer = fs::metadata(&source)
+        .and_then(|src| {
+            fs::metadata(&output).map(|bin| {
+                src.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+                    > bin.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+            })
+        })
+        .unwrap_or(true);
+    if !output.is_file() || source_newer {
         let status = Command::new("rustc")
             .args([
                 "--edition",
@@ -52,6 +60,10 @@ fn runner_passes_sandbox_and_max_memory_and_classifies_the_guest_stop() {
         tool.supports_max_memory,
         "help text should advertise --max-memory"
     );
+    assert!(
+        tool.supports_time_limit,
+        "help text should advertise --time-limit"
+    );
     assert!(tool.version.contains("0.3.0"));
 
     let broken = dir.join("broken.rs");
@@ -69,7 +81,15 @@ fn runner_passes_sandbox_and_max_memory_and_classifies_the_guest_stop() {
     );
 
     let built = dir.join(if cfg!(windows) { "guest.exe" } else { "guest" });
-    lust::build(&tool, &source, &built, 1024 * 1024, Duration::from_secs(10)).unwrap();
+    lust::build(
+        &tool,
+        &source,
+        &built,
+        1024 * 1024,
+        Some(Duration::from_millis(500)),
+        Duration::from_secs(10),
+    )
+    .unwrap();
     let ran = supervisor::run_capture(
         Command::new(&built),
         &Limits {

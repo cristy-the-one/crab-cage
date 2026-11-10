@@ -27,7 +27,7 @@ fn main() {
             println!("lust 0.3.0-fake");
         }
         Some("build") if args.get(1).map(String::as_str) == Some("--help") => {
-            println!("Usage: lust build <file.rs> --sandbox --max-memory <size> -o <out>");
+            println!("Usage: lust build <file.rs> --sandbox --max-memory <size> --time-limit <duration> -o <out>");
         }
         Some("check") => cmd_check(&args),
         Some("fix") => cmd_fix(&args),
@@ -65,8 +65,11 @@ fn cmd_fix(args: &[String]) {
 }
 
 fn cmd_build(args: &[String], exe: &std::path::Path) {
-    if !args.iter().any(|arg| arg == "--sandbox") || !args.iter().any(|arg| arg == "--max-memory") {
-        eprintln!("build requires --sandbox and --max-memory");
+    if !args.iter().any(|arg| arg == "--sandbox")
+        || !args.iter().any(|arg| arg == "--max-memory")
+        || !args.iter().any(|arg| arg == "--time-limit")
+    {
+        eprintln!("build requires --sandbox, --max-memory and --time-limit");
         process::exit(3);
     }
     let out = match flag(args, "-o") {

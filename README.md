@@ -51,7 +51,7 @@ crab-cage evolve --seed 2 --population 16 --generations 12 --out-dir crab-out
 crab-cage evolve --eval native --no-verify          # search only, no rustc/lust replay
 crab-cage evolve --lust-bin /path/to/lust           # a lust that is not on PATH
 crab-cage models                                    # the 16 GB model notes
-crab-cage lust-probe                                # version, path, and whether --max-memory exists
+crab-cage lust-probe                                # version, path, and whether --max-memory and --time-limit exist
 ```
 
 Copy `crab-cage.toml.example` to `crab-cage.toml` to set the lust path and the model endpoint without flags. A flag that differs from the built-in default wins over the file.
@@ -66,7 +66,7 @@ crab-cage lust-probe --lust-bin "$HOME/lust/bin/lust"
 crab-cage evolve --lust-bin "$HOME/lust/bin/lust"
 ```
 
-With a 0.3.0 binary the winner is checked with `lust check --json --sandbox` and built with `lust build --sandbox --max-memory`. The host still enforces the wall clock, because lust does not limit time, and it still sets an address-space cap (Unix) or a job-object commit cap (Windows), because the guest cap does not cover the stack or a later touch of reserved pages.
+With a 0.3.0 binary the winner is checked with `lust check --json --sandbox` and built with `lust build --sandbox --max-memory`. When that binary also advertises `--time-limit`, the same build carries the run timeout and a guest that runs past it exits 101 with `L0533`. The host still enforces the wall clock, because a straight-line body is not probed and an older lust has no guest deadline, and it still sets an address-space cap (Unix) or a job-object commit cap (Windows), because the guest cap does not cover the stack or a later touch of reserved pages.
 
 `--max-memory` defaults to `128M`. The host backstop defaults to `1G`. Both accept lust's syntax: `64K`, `128M`, `1G`, or a bare byte count.
 
@@ -109,7 +109,7 @@ The suite checks that:
 - the emitted controller compiles with `rustc` and matches the in-process genome,
 - a candidate that ignores the wall clock is killed,
 - a large allocation dies under a tight host cap and a small one survives a loose cap,
-- the lust runner passes `--sandbox` and `--max-memory`, and classifies lust's `L0532` memory stop.
+- the lust runner passes `--sandbox`, `--max-memory` and `--time-limit`, and classifies lust's `L0532` memory stop and `L0533` time stop.
 
 CI runs that suite on Linux and Windows, plus `cargo fmt --check` and `cargo deny`. `deny.toml` allows MIT, Apache-2.0, BSD, ISC, Zlib, and the Unicode licenses used by the parser crates. GPL and LGPL are not allowed. Dependencies come from crates.io only.
 

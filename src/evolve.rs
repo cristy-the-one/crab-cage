@@ -107,6 +107,7 @@ pub fn execute(options: &RunOptions) -> Result<RunOutput> {
         lust: "not used".into(),
         lust_version: None,
         lust_max_memory: false,
+        lust_time_limit: false,
         lust_check: "skipped".into(),
     };
 
@@ -124,7 +125,7 @@ pub fn execute(options: &RunOptions) -> Result<RunOutput> {
         run_timeout_ms: options.run_timeout.as_millis() as u64,
         lust_max_memory_bytes: options.max_memory,
         host_memory_bytes: options.host_memory,
-        note: "Lust does not limit time. The host kills the candidate when the wall clock expires. --max-memory is passed to lust build --sandbox when that flag exists (lust 0.3.0). The host backstop is RLIMIT_AS on Unix and a job-object commit cap on Windows.",
+        note: "When the lust binary advertises --time-limit, the sandbox build carries that deadline and a guest that runs past it exits 101 with L0533. The host wall clock stays the backstop. --max-memory is passed when that flag exists (lust 0.3.0). The host memory backstop is RLIMIT_AS on Unix and a job-object commit cap on Windows.",
     };
     let report = report::build_report(
         &evolution,
@@ -222,14 +223,20 @@ fn verify_winner(
     if let Some(tool) = &lust_tool {
         verification.lust_version = Some(tool.version.clone());
         verification.lust_max_memory = tool.supports_max_memory;
+        verification.lust_time_limit = tool.supports_time_limit;
         verification.lust = format!(
-            "{} ({}); --max-memory {}",
+            "{} ({}); --max-memory {}; --time-limit {}",
             tool.bin.display(),
             tool.version,
             if tool.supports_max_memory {
                 "yes"
             } else {
                 "no, host backstop only"
+            },
+            if tool.supports_time_limit {
+                "yes"
+            } else {
+                "no, host wall clock only"
             }
         );
         let checked = lust::check(tool, source_path, options.compile_timeout)?;
@@ -260,6 +267,7 @@ fn verify_winner(
                 source_path,
                 &built,
                 options.max_memory,
+                Some(options.run_timeout),
                 options.compile_timeout,
             )?;
             let error = replay(genome, &built, options)?;
@@ -301,6 +309,7 @@ fn compile_candidate(source: &Path, work: &Path, options: &RunOptions) -> Result
             source,
             &built,
             options.max_memory,
+            Some(options.run_timeout),
             options.compile_timeout,
         )?;
         return Ok(built);
@@ -314,6 +323,7 @@ fn compile_candidate(source: &Path, work: &Path, options: &RunOptions) -> Result
                     source,
                     &built,
                     options.max_memory,
+                    Some(options.run_timeout),
                     options.compile_timeout,
                 )?;
                 return Ok(built);
@@ -359,6 +369,7 @@ fn replay(genome: &Genome, bin: &Path, options: &RunOptions) -> Result<f64> {
         if matches!(
             class,
             RunClass::TimedOut
+                | RunClass::TimeLust
                 | RunClass::MemoryLust
                 | RunClass::MemoryHost
                 | RunClass::SandboxDenied
