@@ -10,7 +10,7 @@ Crab Cage is MIT OR Apache-2.0. It does not phone home. The only network client 
 
 - Rust (the 1.74 toolchain or anything newer). Linux and Windows are the tested hosts. macOS is the same Unix path as Linux for the address-space cap.
 - Nothing else for the demo. The mock backend is deterministic and does not load a model.
-- Optional: a lust 0.3.0 binary on `PATH`. `--max-memory` arrives with that version (lust-lang pull request 29). A 0.2.0 binary still runs; Crab Cage sees that the flag is missing and uses the host memory cap instead.
+- Optional: a lust 0.3.0 binary on `PATH`. `--max-memory` is in that release, on lust-lang main. A 0.2.0 binary still runs; Crab Cage sees that the flag is missing and uses the host memory cap instead.
 - Optional, for `--backend local`: Ollama or llama.cpp, and a GGUF that fits in 16 GB. See below. Download the weights once, then disconnect.
 
 ## Build

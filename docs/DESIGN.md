@@ -23,13 +23,13 @@ Crab Cage then
 
 ## What lust is, here
 
-Lust compiles a subset of Rust. A program it accepts is valid Rust and, on that subset, matches `rustc`. Crab Cage relies on the surface in the 0.3.0 work (pull request 29 on `cristy-the-one/lust-lang`, title "lust 0.3.0: lust fix, reject rewrites, --max-memory, and the release setup") and on `docs/sandbox.md` there.
+Lust compiles a subset of Rust. A program it accepts is valid Rust and, on that subset, matches `rustc`. Crab Cage relies on the surface in lust-lang v0.3.0 / main (pull request 29, merged: lust fix, reject rewrites, `--max-memory`, and the release setup) and on `docs/sandbox.md` there.
 
 | Command | What Crab Cage uses it for |
 |---|---|
 | `lust check --json --sandbox file.rs` | Type-check and borrow-check a candidate. JSON lines carry `code`, `message`, `span`, `fix`, `edits`. |
 | `lust fix file.rs --all` | Apply the edits those diagnostics carry, then check again. `--sandbox` is passed; if that build of lust rejects the flag, Crab Cage retries without it. |
-| `lust build --sandbox --max-memory <bytes> -o bin file.rs` | Build the guest. `--max-memory` is the cap from pull request 29. It requires `--sandbox`. |
+| `lust build --sandbox --max-memory <bytes> -o bin file.rs` | Build the guest. `--max-memory` is the cap in lust-lang v0.3.0 / main. It requires `--sandbox`. |
 | `lust check --rustc` | Second opinion from real `rustc`. Not the default path. `--rustc` refuses `--sandbox`. |
 | `lust watch check` | Editor loop, kept for a later UI. The search loop calls `check` itself. |
 | `lust capabilities --json` | The subset the prompt should stay inside. |
@@ -287,11 +287,11 @@ Sizes are the amount of code and the surface that changes. They are not a schedu
 
 ## Gaps in lust
 
-These are proposals for lust. Crab Cage works around the ones that are still open. The time limit is the exception: the implementation is `docs/lust-time-limit.patch`, against `feat/sandbox-limits` at `cbc913832b6f`. Apply it there with `git am`. This environment has no credentials for `github.com/cristy-the-one/lust-lang`, so the patch is the copy of that commit. Crab Cage passes the flag when the binary advertises it.
+These are proposals for lust. Crab Cage works around the ones that are still open. The time limit is the exception: the implementation is `docs/lust-time-limit.patch`, against lust-lang v0.3.0 / main at `cbc913832b6f`. Apply it there with `git am`. This environment has no credentials for `github.com/cristy-the-one/lust-lang`, so the patch is the copy of that commit. Crab Cage passes the flag when the binary advertises it.
 
 1. **Time limit.** `lust build` and `lust run` take `--sandbox --time-limit <duration>`. A bare number is seconds; `500ms`, `2s` and `1m` name the unit. The deadline is monotonic and set in `main`. A loop checks it on every back-edge, a function entry checks it every 64th call, and `thread::sleep` does not sleep past it. The stop is `error[L0533]`, exit 101, stdout flushed first. It is not another meaning of `L0532`. `check` does not take the flag. A straight-line body that never loops, calls, or sleeps is not probed, and a recursion that fills the stack first is still the stack-overflow stop, so the host wall clock stays the backstop. Crab Cage passes the configured run timeout when `lust build --help` or the usage text contains `--time-limit`.
 
-2. **`--max-memory` is not in a release.** It is pull request 29, the 0.3.0 branch. v0.2.0 does not have the flag. Crab Cage detects it with `lust build --help` and otherwise uses only the host cap. Shipping v0.3.0 is the lust-side fix. Crab Cage must not be the thing that tags that release.
+2. **`--max-memory` is in lust-lang v0.3.0 / main.** v0.2.0 does not have the flag. Crab Cage detects it from the binary's help or usage text and otherwise uses only the host cap.
 
 3. **The guest cap misses some memory.** It samples on allocation. Memory reserved and touched later, with no further allocation, is not seen. The stack is excluded (`fatal runtime error: stack overflow` is a different stop). A sampler thread cannot be the fix: the sandbox refuses threads. Proposal: a back-edge probe in codegen, and an optional stack size on the sandbox profile. Until then the host `RLIMIT_AS` / job object is the backstop, which is what `docs/sandbox.md` already tells the host to keep.
 

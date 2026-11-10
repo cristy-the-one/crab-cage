@@ -320,7 +320,7 @@ fn probe(lust_bin: Option<PathBuf>) -> Result<()> {
     let path = match lust_bin {
         Some(path) => path,
         None => lust::which("lust").ok_or_else(|| {
-            err("lust is not on PATH. Pass --lust-bin, or set lust_bin in crab-cage.toml. A released 0.2.0 build has no --max-memory; that flag arrives with v0.3.0.")
+            err("lust is not on PATH. Pass --lust-bin, or set lust_bin in crab-cage.toml. A 0.2.0 build has no --max-memory; that flag is in lust-lang v0.3.0 / main.")
         })?,
     };
     let tool = lust::probe(&path, Duration::from_secs(10))?;
