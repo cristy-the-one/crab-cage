@@ -66,7 +66,15 @@ fn runner_passes_sandbox_and_max_memory_and_classifies_the_guest_stop() {
     );
     assert!(tool.version.contains("0.3.0"));
 
-    let broken = dir.join("broken.rs");
+    // A backslash is legal in a Unix file name. On Windows every absolute
+    // path already contains one. Either way the diagnostic must stay valid JSON.
+    let broken_dir = if cfg!(windows) {
+        dir.clone()
+    } else {
+        dir.join("win\\path")
+    };
+    fs::create_dir_all(&broken_dir).unwrap();
+    let broken = broken_dir.join("broken.rs");
     fs::write(&broken, "fn main() { let _ = BROKEN_TOKEN; }\n").unwrap();
     let checked = lust::check(&tool, &broken, Duration::from_secs(10)).unwrap();
     assert!(!checked.ok);

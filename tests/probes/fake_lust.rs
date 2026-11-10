@@ -47,9 +47,11 @@ fn cmd_check(args: &[String]) {
     let file = rust_file(args);
     let text = fs::read_to_string(&file).unwrap_or_default();
     if text.contains("BROKEN_TOKEN") {
+        // The span path is a JSON string. Windows paths contain `\`, and a
+        // raw splice is invalid JSON, so the host drops the L0102 line.
+        let file = json_string(&file);
         println!(
-            "{{\"code\":\"L0102\",\"message\":\"cannot find value `BROKEN_TOKEN` in this scope\",\"span\":{{\"file\":\"{file}\",\"line\":1,\"col\":1}},\"fix\":\"replace BROKEN_TOKEN\",\"edits\":[]}}",
-            file = file
+            "{{\"code\":\"L0102\",\"message\":\"cannot find value `BROKEN_TOKEN` in this scope\",\"span\":{{\"file\":{file},\"line\":1,\"col\":1}},\"fix\":\"replace BROKEN_TOKEN\",\"edits\":[]}}"
         );
         process::exit(1);
     }
@@ -116,6 +118,28 @@ fn run_program(mode: &str) {
         writeln!(stdout, "0.5000000000 0.0000000000 28.0000000000").ok();
         stdout.flush().ok();
     }
+}
+
+/// Quote `text` as a JSON string. The probe is built with `rustc`, so it
+/// cannot depend on serde.
+fn json_string(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 2);
+    out.push('"');
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => {
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
 }
 
 fn rust_file(args: &[String]) -> String {
