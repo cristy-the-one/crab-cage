@@ -1,0 +1,802 @@
+From b40f38688ccb2bf2581cb73f200921d70105a59c Mon Sep 17 00:00:00 2001
+From: Cursor Agent <cursoragent@cursor.com>
+Date: Tue, 10 Nov 2026 12:19:58 +0000
+Subject: [PATCH] Add --time-limit to sandboxed build and run.
+
+A loop back-edge, every 64th function entry, and thread::sleep stop the
+program with L0533 when it runs past the deadline. The host wall clock
+stays the backstop for a straight-line body.
+---
+ README.md                |  2 +-
+ docs/ARCH.md             |  2 +-
+ docs/errors/L0533.md     | 34 ++++++++++++++++++
+ docs/errors/README.md    |  1 +
+ docs/errors/REGISTRY.md  |  3 +-
+ docs/sandbox.md          | 37 +++++++++++++++++--
+ scripts/check-explain.sh | 34 +++++++++++++++++-
+ scripts/test-sandbox.sh  | 44 +++++++++++++++++++++++
+ src/capabilities.rs      |  3 +-
+ src/cgen.rs              | 57 ++++++++++++++++++++++++-----
+ src/check/collect.rs     |  5 +++
+ src/check/delta_audit.rs |  1 +
+ src/check/prog_shift.rs  |  1 +
+ src/driver/compile.rs    |  1 +
+ src/explain.rs           |  1 +
+ src/protocol.rs          | 71 +++++++++++++++++++++++++++++++-----
+ src/runtime/sync.c       | 78 +++++++++++++++++++++++++++++++++++++++-
+ tests/sandbox/time.rs    | 19 ++++++++++
+ 18 files changed, 370 insertions(+), 24 deletions(-)
+ create mode 100644 docs/errors/L0533.md
+ create mode 100644 tests/sandbox/time.rs
+
+diff --git a/README.md b/README.md
+index 0a91198..acce283 100644
+--- a/README.md
++++ b/README.md
+@@ -336,7 +336,7 @@ Known limit: one file builds as `rustc --edition 2024 -C panic=abort -C overflow
+ 
+ `--json` prints one diagnostic per line, each with `code`, `message`, `span`, `fix`, and `edits`. The `fix` text tells the user what to write instead. This format exists for coding agents.
+ 
+-`--sandbox` (on `check`, `build`, `run`) is for code a tool or a model wrote: the program may read stdin and write stdout and stderr, and nothing else. Check refuses std paths to the file system, the network, the environment, processes and threads (L0532), and the built program stops before any other OS call. See [docs/sandbox.md](docs/sandbox.md).
++`--sandbox` (on `check`, `build`, `run`) is for code a tool or a model wrote: the program may read stdin and write stdout and stderr, and nothing else. Check refuses std paths to the file system, the network, the environment, processes and threads (L0532), and the built program stops before any other OS call. `build` and `run` also take `--time-limit` (seconds, or `Nms` / `Ns` / `Nm`): the program stops with L0533 when it runs longer. See [docs/sandbox.md](docs/sandbox.md).
+ 
+ `--opt` (on `build` and `run`, with or without `--sandbox`) compiles that same program with an optimising C compiler instead of tcc. `--opt=bg` still links the fast tcc build for this run and starts the optimised build in the background; a later run of the same source installs the cached binary. The default, with neither flag, is unchanged. See [docs/opt.md](docs/opt.md).
+ 
+diff --git a/docs/ARCH.md b/docs/ARCH.md
+index 2495491..91d6d6b 100644
+--- a/docs/ARCH.md
++++ b/docs/ARCH.md
+@@ -5166,7 +5166,7 @@ rationale, the registry is the enforced list.
+ | L0501-L0509 | Modules and imports (L0501 import cycle does not settle, L0502 ambiguous module file, L0503 module file not found, L0504 generated name changes an earlier resolution) |
+ | L0510-L0519 | Visibility |
+ | L0520-L0529 | cfg and attributes (L0520 unknown cfg name, L0521 unknown attribute) |
+-| L0530-L0539 | Crate session (L0530 unsupported edition, L0531 unsupported deny-level lint, L0532 refused in a `--sandbox` build) |
++| L0530-L0539 | Crate session (L0530 unsupported edition, L0531 unsupported deny-level lint, L0532 refused in a `--sandbox` build, L0533 ran past `--time-limit`) |
+ | L0601-L0609 | Types and aliases (L0601 alias cycle) |
+ | L0610-L0619 | Traits and inference (L0610 type annotations needed or type must be known, L0611 selection overflow, L0612 no impl, L0613 impl parameter not known from trait inputs, L0615 overlapping impls) |
+ | L0620-L0629 | Associated items (L0620 GAT) |
+diff --git a/docs/errors/L0533.md b/docs/errors/L0533.md
+new file mode 100644
+index 0000000..56259ac
+--- /dev/null
++++ b/docs/errors/L0533.md
+@@ -0,0 +1,34 @@
++# L0533: ran past a time limit
++
++<!-- rustc-wrong: pass -->
++<!-- runtime-stop -->
++<!-- lust-args: --sandbox --time-limit 300ms -->
++
++The build used `--sandbox --time-limit`, and the program ran longer than
++that limit. The limit is built into the program. A loop checks it on every
++back-edge, a function entry checks it every 64th call, and `thread::sleep`
++does not sleep past it. The program prints this line on stderr and exits
++with status 101. What it printed before that is flushed first.
++
++A check does not run the program, so this code is not a check error. The
++source below is valid Rust. It fails when the built program runs.
++
++Pass a duration the program can finish inside, or make the program finish.
++The host should still kill a program that runs too long: a straight-line
++body that never loops, calls, or sleeps is not probed. See `docs/sandbox.md`.
++
++## Wrong
++
++```rust
++fn main() {
++    loop {}
++}
++```
++
++## Fixed
++
++```rust
++fn main() {
++    println!("done");
++}
++```
+diff --git a/docs/errors/README.md b/docs/errors/README.md
+index 0e5357d..8694215 100644
+--- a/docs/errors/README.md
++++ b/docs/errors/README.md
+@@ -65,6 +65,7 @@ ranges; `scripts/check-codes.sh` enforces it. Read it before you add a code.
+ | [L0530](L0530.md) | unsupported edition |
+ | [L0531](L0531.md) | unsupported deny-level lint |
+ | [L0532](L0532.md) | refused in a sandboxed build |
++| [L0533](L0533.md) | ran past `--time-limit` |
+ | [L0522](L0522.md) | this attribute is not supported yet |
+ | [L0523](L0523.md) | unstable cfg predicate |
+ | [L0524](L0524.md) | attribute used wrongly |
+diff --git a/docs/errors/REGISTRY.md b/docs/errors/REGISTRY.md
+index ebbc25f..1a28968 100644
+--- a/docs/errors/REGISTRY.md
++++ b/docs/errors/REGISTRY.md
+@@ -55,7 +55,8 @@ prints "reserved, not yet emitted".
+ | L0525-L0529 | cfg and attributes | W-MACRO | reserved | |
+ | L0530-L0531 | Crate session | W-RESOLVE | in use | L0530 unsupported edition, L0531 unsupported deny-level lint |
+ | L0532 | Crate session | W-DRIVER | in use | Refused in a `--sandbox` build (check/sandbox.rs) |
+-| L0533-L0539 | Crate session | W-DRIVER | reserved | |
++| L0533 | Crate session | W-DRIVER | in use | Ran past `--time-limit` (runtime/sync.c `lust_time_stop`) |
++| L0534-L0539 | Crate session | W-DRIVER | reserved | |
+ | L0540 | Known-value checks | check | in use | Arithmetic operation will overflow (rustc `arithmetic_overflow`) |
+ | L0541 | Known-value checks | check | in use | Operation will panic at runtime (rustc `unconditional_panic`) |
+ | L0542 | Known-value checks | W-THREADS | in use | Invalid atomic memory ordering (rustc `invalid_atomic_ordering`) |
+diff --git a/docs/sandbox.md b/docs/sandbox.md
+index f175cdc..f02446e 100644
+--- a/docs/sandbox.md
++++ b/docs/sandbox.md
+@@ -44,7 +44,8 @@ the program's stdout is lust's.
+ | 101 | `thread 'main' (<tid>) panicked at <file>:<line>:<col>:` then the message | A panic. The line is rustc's, byte for byte (rule zero), so a host parses one format for both builds. `<file>` is the path as the build command named it. |
+ | 101 | `error[L0532]: this program was built with --sandbox and tried to use <family>` | The codegen stop (above). Nothing ran past it. |
+ | 101 | `error[L0532]: this program was built with --max-memory <bytes> and tried to use more memory` | The memory limit (below). What the program printed before it is flushed first. |
+-| any other | whatever the program wrote | `std::process::exit(n)`, or a signal (killed by the host on a time limit). |
++| 101 | `error[L0533]: this program was built with --time-limit <duration> and tried to run longer` | The time limit (below). What the program printed before it is flushed first. |
++| any other | whatever the program wrote | `std::process::exit(n)`, or a signal (killed by the host, which keeps its own wall clock as the backstop). |
+ 
+ Check and build errors come before any run, as JSON with `--json`, each
+ with its `edits`.
+@@ -76,9 +77,41 @@ Limits of the limit:
+ - The stack is not part of this limit. A stack overflow is its own stop
+   (`fatal runtime error: stack overflow`, then an abort).
+ 
++## The time limit
++
++`lust build --sandbox --time-limit <duration>` (and `lust run`) builds a
++deadline into the program. `<duration>` is a number of seconds (`2`, `2s`),
++milliseconds (`500ms`), or minutes (`1m`). The program stops, as the table
++above shows, when it has run longer than that. The flag needs `--sandbox`,
++and a limit is its own daemon session, like `--sandbox` and `--max-memory`.
++`check` does not take it: a check does not run the program.
++
++The clock is monotonic. `main` records the deadline before the program
++runs. Three probes read it:
++
++- A jump back to the same block or an earlier one (a loop) checks every
++  iteration.
++- A function entry checks every 64th call, so a recursion that never
++  loops still stops.
++- `thread::sleep` waits only for the time still left. A sleep that would
++  run past the deadline does not.
++
++The stop comes at the next probe after the deadline, so one long loop
++body or one of those 64 calls can run past it. What the limit does not
++see:
++
++- A straight-line body that does not loop, call, or sleep. The host's
++  wall clock is the backstop for that shape.
++- The stack. A recursion that fills the stack first is the stack-overflow
++  stop, not L0533.
++
++The host should keep its own wall clock anyway. This limit is the stop
++the program can report; the host kill is what happens when the probes
++do not run.
++
+ ## What it does not do
+ 
+-- It does not limit time. The host kills a program that runs too long.
++- It does not limit time unless the build asks (`--time-limit`, above).
+   Memory has a limit when the build asks for one (`--max-memory`, above).
+ - It does not change what an allowed program prints. A sandboxed program
+   that only uses allowed services behaves as the rustc build of the same
+diff --git a/scripts/check-explain.sh b/scripts/check-explain.sh
+index eae05dc..461c0da 100755
+--- a/scripts/check-explain.sh
++++ b/scripts/check-explain.sh
+@@ -2,9 +2,12 @@
+ # Checks every `lust explain` page in docs/errors/:
+ #   1. Every L#### code in src/ has a page, and every page is listed in the index.
+ #   2. The wrong example fails under `lust build` with exactly that code present.
++#      A page marked `<!-- runtime-stop -->` is valid Rust: the wrong example
++#      builds, and running it exits with the code on stderr.
+ #   3. The wrong example fails under rustc too, unless the page carries the marker
+ #      `<!-- rustc-wrong: pass -->` (valid Rust that lust rejects on purpose).
+-#   4. The fixed example builds under both lust and rustc.
++#   4. The fixed example builds under both lust and rustc. A runtime-stop page
++#      also runs the fixed example.
+ # Usage: scripts/check-explain.sh [filter]
+ set -uo pipefail
+ root=$(cd "$(dirname "$0")/.." && pwd)
+@@ -72,6 +75,35 @@ for page in "$root"/docs/errors/L*.md; do
+   if [ ! -s "$work/$code-wrong.rs" ] || [ ! -s "$work/$code-fixed.rs" ]; then
+     report bad "$code" "missing a Wrong or Fixed example"; continue
+   fi
++  # A runtime stop (L0533) is valid Rust. The wrong example builds, then
++  # the program exits with the code on stderr. The fixed example runs.
++  if grep -q 'runtime-stop' "$page"; then
++    # shellcheck disable=SC2086 # lust_args is a word list by design
++    if ! "$lust" build "$work/$code-wrong.rs" -o "$work/$code.bin" $lust_args >"$work/$code-rt.lerr" 2>&1; then
++      report bad "$code" "lust rejected the runtime example: $(head -3 "$work/$code-rt.lerr")"; continue
++    fi
++    timeout 5 "$work/$code.bin" >"$work/$code-rt.out" 2>"$work/$code-rt.err"
++    rc=$?
++    if [ $rc -eq 0 ] || [ $rc -eq 124 ] || ! grep -q "$code" "$work/$code-rt.err"; then
++      report bad "$code" "runtime stop: exit $rc, stderr $(head -3 "$work/$code-rt.err")"; continue
++    fi
++    if ! rustc "${rustc_flags[@]}" "$work/$code-wrong.rs" -o "$work/$code.rbin" >"$work/$code-rt.rerr" 2>&1; then
++      report bad "$code" "rustc rejects the runtime example: $(head -3 "$work/$code-rt.rerr")"; continue
++    fi
++    # shellcheck disable=SC2086
++    if ! "$lust" build "$work/$code-fixed.rs" -o "$work/$code-fixed.bin" $lust_args >"$work/$code-fixed.lerr" 2>&1; then
++      report bad "$code" "lust rejects the fixed example: $(head -3 "$work/$code-fixed.lerr")"; continue
++    fi
++    timeout 5 "$work/$code-fixed.bin" >"$work/$code-fixed.out" 2>"$work/$code-fixed.run"
++    if [ $? -ne 0 ]; then
++      report bad "$code" "the fixed example did not run: $(head -3 "$work/$code-fixed.run")"; continue
++    fi
++    if ! rustc "${rustc_flags[@]}" "$work/$code-fixed.rs" -o "$work/$code.rbin" >"$work/$code-fixed.rerr" 2>&1; then
++      report bad "$code" "rustc rejects the fixed example: $(head -3 "$work/$code-fixed.rerr")"; continue
++    fi
++    report ok "$code"
++    continue
++  fi
+   # 2. Wrong under lust.
+   # shellcheck disable=SC2086 # lust_args is a word list by design
+   out=$("$lust" build --json "$work/$code-wrong.rs" -o "$work/$code.bin" $lust_args 2>&1)
+diff --git a/scripts/test-sandbox.sh b/scripts/test-sandbox.sh
+index 7ab2ca5..a40e4ad 100755
+--- a/scripts/test-sandbox.sh
++++ b/scripts/test-sandbox.sh
+@@ -129,6 +129,50 @@ fi
+ lust_to build --max-memory 64M "$root/tests/sandbox/memory.rs" -o "$work/x" >/dev/null 2>&1; [ $? -eq 2 ] && report ok memory-needs-sandbox || report bad memory-needs-sandbox "--max-memory without --sandbox should be a usage error"
+ lust_to check --sandbox --max-memory 64M "$root/tests/sandbox/memory.rs" >/dev/null 2>&1; [ $? -eq 2 ] && report ok memory-not-on-check || report bad memory-not-on-check "--max-memory on check should be a usage error"
+ lust_to build --sandbox --max-memory lots "$root/tests/sandbox/memory.rs" -o "$work/x" >/dev/null 2>&1; [ $? -eq 2 ] && report ok memory-bad-value || report bad memory-bad-value "a bad --max-memory value should be a usage error"
++# --time-limit: a spin and a long sleep stop with exit 101 and one L0533
++# line, soon. A program that finishes inside the limit runs as usual.
++time_run() { # time_run <exe> <mode> : leaves time.out, time.stderr; prints the exit code
++  set +o pipefail
++  printf '%s\n' "$2" | timeout 5 "$1" >"$work/time.out" 2>"$work/time.stderr"
++  local code=${PIPESTATUS[1]}
++  set -o pipefail
++  echo "$code"
++}
++time_stops() { # time_stops <name> <exe> <mode>
++  local start end code
++  start=$(date +%s)
++  code=$(time_run "$2" "$3")
++  end=$(date +%s)
++  if [ "$code" -eq 101 ] && [ "$(head -1 "$work/time.out")" = before ] && ! grep -q after "$work/time.out" \
++    && grep -qx 'error\[L0533\]: this program was built with --time-limit 300ms and tried to run longer' "$work/time.stderr" \
++    && [ $((end - start)) -lt 3 ]; then
++    report ok "$1"
++  else
++    report bad "$1" "exit $code after $((end - start))s, stdout $(cat "$work/time.out"), stderr $(cat "$work/time.stderr")"
++  fi
++}
++if lust_to build --sandbox --time-limit 300ms "$root/tests/sandbox/time.rs" -o "$work/time300" >"$work/time.err" 2>&1 \
++  && lust_to build --sandbox --time-limit=2s "$root/tests/sandbox/time.rs" -o "$work/time2s" >>"$work/time.err" 2>&1; then
++  time_stops time-spin "$work/time300" spin
++  time_stops time-sleep "$work/time300" sleep
++  code=$(time_run "$work/time300" finish)
++  if [ "$code" -eq 0 ] && [ "$(tail -1 "$work/time.out")" = done ] && [ ! -s "$work/time.stderr" ]; then
++    report ok time-under-the-limit
++  else
++    report bad time-under-the-limit "exit $code, stdout $(cat "$work/time.out"), stderr $(cat "$work/time.stderr")"
++  fi
++  code=$(time_run "$work/time2s" finish)
++  if [ "$code" -eq 0 ] && [ "$(tail -1 "$work/time.out")" = done ]; then
++    report ok time-seconds-suffix
++  else
++    report bad time-seconds-suffix "exit $code, stdout $(cat "$work/time.out"), stderr $(cat "$work/time.stderr")"
++  fi
++else
++  report bad time-builds "$(head -3 "$work/time.err")"
++fi
++lust_to build --time-limit 1s "$root/tests/sandbox/time.rs" -o "$work/x" >/dev/null 2>&1; [ $? -eq 2 ] && report ok time-needs-sandbox || report bad time-needs-sandbox "--time-limit without --sandbox should be a usage error"
++lust_to check --sandbox --time-limit 1s "$root/tests/sandbox/time.rs" >/dev/null 2>&1; [ $? -eq 2 ] && report ok time-not-on-check || report bad time-not-on-check "--time-limit on check should be a usage error"
++lust_to build --sandbox --time-limit fast "$root/tests/sandbox/time.rs" -o "$work/x" >/dev/null 2>&1; [ $? -eq 2 ] && report ok time-bad-value || report bad time-bad-value "a bad --time-limit value should be a usage error"
+ # The same source without the flag still reaches the file system.
+ lust_to build "$root/tests/sandbox/path_exists.rs" -o "$work/exists.plain" >/dev/null 2>&1 && "$work/exists.plain" | grep -qx true \
+   && report ok plain-unchanged || report bad plain-unchanged "the plain build should print true"
+diff --git a/src/capabilities.rs b/src/capabilities.rs
+index 27b2540..b32f691 100644
+--- a/src/capabilities.rs
++++ b/src/capabilities.rs
+@@ -1891,7 +1891,8 @@ pub fn summary() -> String {
+     }
+     out.push_str(
+         "With --sandbox: the program reads stdin and writes stdout and stderr only; std::fs, std::net, std::env, \
+-         std::os, std::process other than exit, thread spawning and include_str! are refused (L0532).\n",
++         std::os, std::process other than exit, thread spawning and include_str! are refused (L0532). \
++         `--time-limit` (with `--sandbox`, on build and run) stops the program when it runs longer (L0533).\n",
+     );
+     out
+ }
+diff --git a/src/cgen.rs b/src/cgen.rs
+index f3d1658..356a8d8 100644
+--- a/src/cgen.rs
++++ b/src/cgen.rs
+@@ -3193,6 +3193,13 @@ impl FnGen<'_, '_> {
+         if zc {
+             self.flags_at_term = self.flags_maybe_set();
+         }
++        // `--time-limit`: a function entry is a probe. The clock is read
++        // every 64th call (`lust_time_tick`), so a recursion stops and a
++        // program with no loop still cannot call forever. No probe when
++        // the build has no limit, so that C is unchanged.
++        if p.time_limit_ms != 0 {
++            self.out.push_str("  lust_time_tick();\n");
++        }
+         self.blocks(&order);
+         self.kstr_finish();
+         self.out.push_str("}\n");
+@@ -4355,24 +4362,47 @@ impl FnGen<'_, '_> {
+         }
+     }
+ 
++    /// A jump back to this block or an earlier one is a loop edge. With
++    /// `--time-limit` it probes the clock before the jump. A forward jump
++    /// is the text it always was, so a build with no limit emits the same C.
++    fn time_back(&self, target: u32) -> bool {
++        self.p.time_limit_ms != 0 && (target as usize) <= self.cur_bb
++    }
++
++    /// `goto bbN;`, or the same goto with a time probe in front of a back-edge.
++    fn goto_arm(&self, target: u32) -> String {
++        if self.time_back(target) {
++            format!("{{ lust_time_check(); goto bb{target}; }}")
++        } else {
++            format!("goto bb{target};")
++        }
++    }
++
++    fn timed_goto(&mut self, target: u32) {
++        if self.time_back(target) {
++            self.out.push_str("  lust_time_check();\n");
++        }
++        let _ = writeln!(self.out, "  goto bb{target};");
++    }
++
+     fn term(&mut self, t: &Terminator, span: Span, next_block: Option<usize>) {
+         let loc = self.loc(span);
+         let mut post = Vec::new();
+         match t {
+             Terminator::Goto(b) => {
+-                let _ = writeln!(self.out, "  goto bb{};", b.0);
++                self.timed_goto(b.0);
+             }
+             Terminator::If(o, a, b) => {
+                 let (c, _) = self.operand(o, &loc, &mut post);
+-                let _ = writeln!(self.out, "  if ({c}) goto bb{}; else goto bb{};", a.0, b.0);
++                let _ = writeln!(self.out, "  if ({c}) {} else {};", self.goto_arm(a.0), self.goto_arm(b.0));
+             }
+             Terminator::Switch(o, cases, other) => {
+                 let (c, _) = self.operand(o, &loc, &mut post);
+                 let _ = write!(self.out, "  switch ({c}) {{");
+                 for (v, b) in cases {
+-                    let _ = write!(self.out, " case {v}: goto bb{};", b.0);
++                    let _ = write!(self.out, " case {v}: {}", self.goto_arm(b.0));
+                 }
+-                let _ = writeln!(self.out, " default: goto bb{}; }}", other.0);
++                let _ = writeln!(self.out, " default: {} }}", self.goto_arm(other.0));
+             }
+             Terminator::Call { target, args, dest, next, unwind } => {
+                 // Calls carry a cleanup (unwind) successor since
+@@ -4466,7 +4496,7 @@ impl FnGen<'_, '_> {
+                     self.out.push_str(&text);
+                 }
+                 if Some(next.0 as usize) != next_block {
+-                    let _ = writeln!(self.out, "  goto bb{};", next.0);
++                    self.timed_goto(next.0);
+                 }
+             }
+             Terminator::Return => {
+@@ -10941,6 +10971,8 @@ pub struct UnwindInit {
+     pub hook_runner: Option<u32>,
+     /// `--max-memory` (0: none): main sets the runtime's limit first.
+     pub max_memory: u64,
++    /// `--time-limit` in milliseconds (0: none): main sets the deadline first.
++    pub time_limit_ms: u64,
+ }
+ 
+ /// The `main_unit` argument for `p` (`slot_of` maps a fn to its slot).
+@@ -10958,7 +10990,7 @@ pub fn unwind_init(p: &Program, slot_of: impl Fn(LocalDefId) -> u32) -> Option<U
+         .map(|i| slot_of(LocalDefId(i as u32)));
+     let (a, b) = crate::check::any::type_id_words(p, &p.tys, REF_STR);
+     let (c, d) = crate::check::any::type_id_words(p, &p.tys, STRING);
+-    Some(UnwindInit { unwind: p.unwind, tables: p.unwind_tables, ids: [a, b, c, d], hook_runner: runner, max_memory: p.max_memory })
++    Some(UnwindInit { unwind: p.unwind, tables: p.unwind_tables, ids: [a, b, c, d], hook_runner: runner, max_memory: p.max_memory, time_limit_ms: p.time_limit_ms })
+ }
+ 
+ /// The location unit: the per-slot line and file tables and
+@@ -11004,10 +11036,19 @@ pub fn main_unit(main_slot: u32, overlays: &[usize], init: Option<UnwindInit>) -
+     let tables = init.as_ref().is_some_and(|i| i.unwind && i.tables);
+     let runner_slot = init.as_ref().and_then(|i| i.hook_runner);
+     let (init, runner) = match init {
+-        Some(UnwindInit { unwind, tables, ids: [a, b, c, d], hook_runner, max_memory }) => (
++        Some(UnwindInit { unwind, tables, ids: [a, b, c, d], hook_runner, max_memory, time_limit_ms }) => (
+             format!(
+                 "{}\n  lust_unw_init({}, {a}ull, {b}ull, {c}ull, {d}ull);",
+-                if max_memory != 0 { format!("\n  lust_mem_limit_set({max_memory}ull);") } else { String::new() },
++                {
++                    let mut prefix = String::new();
++                    if max_memory != 0 {
++                        prefix.push_str(&format!("\n  lust_mem_limit_set({max_memory}ull);"));
++                    }
++                    if time_limit_ms != 0 {
++                        prefix.push_str(&format!("\n  lust_time_limit_set({time_limit_ms}ull);"));
++                    }
++                    prefix
++                },
+                 if unwind && tables { 2 } else { unwind as u8 }
+             ),
+             hook_runner.map_or(String::new(), |s| {
+diff --git a/src/check/collect.rs b/src/check/collect.rs
+index be33127..01817fc 100644
+--- a/src/check/collect.rs
++++ b/src/check/collect.rs
+@@ -450,6 +450,10 @@ pub struct Program {
+     /// `--max-memory` (0: none): `main` sets the runtime's limit
+     /// (cgen `main_unit`). Set by the driver from the session's profile.
+     pub max_memory: u64,
++    /// `--time-limit` in milliseconds (0: none): `main` sets the runtime's
++    /// deadline, and codegen probes loop back-edges and function entries.
++    /// Set by the driver from the session's profile.
++    pub time_limit_ms: u64,
+     /// panic=unwind with unwind tables (`lust_unwind_mode` 2, runtime/panic.c): codegen gives
+     /// each frame with drops one cleanup variable and stores its ladder entry before calls
+     /// that can unwind, instead of a flag check after each call. Needs a C compiler with
+@@ -3506,6 +3510,7 @@ pub fn collect_reuse(
+         debug_assertions: true,
+         sandbox: false,
+         max_memory: 0,
++        time_limit_ms: 0,
+         unwind_tables: false,
+         regions: Default::default(),
+         fp_memo: Default::default(),
+diff --git a/src/check/delta_audit.rs b/src/check/delta_audit.rs
+index 3b55222..eef9b7c 100644
+--- a/src/check/delta_audit.rs
++++ b/src/check/delta_audit.rs
+@@ -89,6 +89,7 @@ pub fn digest(p: &Program) -> Vec<(&'static str, u64)> {
+         debug_assertions: _, // same
+         sandbox: _,          // same
+         max_memory: _,       // same
++        time_limit_ms: _,    // same
+         unwind_tables: _,   // same
+         regions,         // replace (`fns`, `opaque_sigs`); rerun (outlives)
+         fp_memo: _,      // the driver clears it
+diff --git a/src/check/prog_shift.rs b/src/check/prog_shift.rs
+index 7477033..f6b1dc5 100644
+--- a/src/check/prog_shift.rs
++++ b/src/check/prog_shift.rs
+@@ -68,6 +68,7 @@ pub fn shift_program(p: &mut Program, f: &mut dyn FnMut(Span) -> Span) -> usize
+         debug_assertions: _,
+         sandbox: _,
+         max_memory: _,
++        time_limit_ms: _,
+         unwind_tables: _,
+         regions: _,
+         fp_memo: _,
+diff --git a/src/driver/compile.rs b/src/driver/compile.rs
+index aa29366..47e8f9e 100644
+--- a/src/driver/compile.rs
++++ b/src/driver/compile.rs
+@@ -3795,6 +3795,7 @@ pub fn compile(req: &Request, session: &mut Session) -> Response {
+     program.debug_assertions = session_key.profile.debug_assertions;
+     program.sandbox = session_key.profile.sandbox;
+     program.max_memory = session_key.profile.max_memory;
++    program.time_limit_ms = session_key.profile.time_limit_ms;
+     // Unwind tables need a C compiler with -fexceptions and a C++ driver, never tcc: a
+     // release driver build uses them, one-shot or from a persistent session such as a
+     // front image (LUST_UNWIND_TABLES=0 turns them off); --emit-c in a one-shot process
+diff --git a/src/explain.rs b/src/explain.rs
+index 16d1ccb..edbdc80 100644
+--- a/src/explain.rs
++++ b/src/explain.rs
+@@ -64,6 +64,7 @@ const DOCS: &[(&str, &str)] = &[
+     ("L0530", include_str!("../docs/errors/L0530.md")),
+     ("L0531", include_str!("../docs/errors/L0531.md")),
+     ("L0532", include_str!("../docs/errors/L0532.md")),
++    ("L0533", include_str!("../docs/errors/L0533.md")),
+     ("L0522", include_str!("../docs/errors/L0522.md")),
+     ("L0523", include_str!("../docs/errors/L0523.md")),
+     ("L0524", include_str!("../docs/errors/L0524.md")),
+diff --git a/src/protocol.rs b/src/protocol.rs
+index d1ba90e..7001084 100644
+--- a/src/protocol.rs
++++ b/src/protocol.rs
+@@ -88,11 +88,16 @@ pub struct ProfileFlags {
+     /// `lust_mem_note_slow`). 0 is no limit. The limit is built into the
+     /// program, so it is part of the session and cache keys.
+     pub max_memory: u64,
++    /// `--time-limit <duration>`, with `--sandbox`: the program stops when
++    /// it has run longer than this many milliseconds (runtime/sync.c
++    /// `lust_time_check`). 0 is no limit. Built into the program, so it is
++    /// part of the session and cache keys, like `max_memory`.
++    pub time_limit_ms: u64,
+ }
+ 
+ impl ProfileFlags {
+     /// The dev flags with `-C panic=abort`.
+-    pub const DEV: ProfileFlags = ProfileFlags { panic_abort: true, overflow_checks: true, debug_assertions: true, sandbox: false, opt: false, max_memory: 0 };
++    pub const DEV: ProfileFlags = ProfileFlags { panic_abort: true, overflow_checks: true, debug_assertions: true, sandbox: false, opt: false, max_memory: 0, time_limit_ms: 0 };
+     /// rustc's and Cargo's dev defaults (panics unwind): a single-file compile
+     /// and a Cargo dev profile that does not set `panic`.
+     pub const DEV_UNWIND: ProfileFlags = ProfileFlags { panic_abort: false, ..ProfileFlags::DEV };
+@@ -167,7 +172,7 @@ impl SessionKey {
+         let b = |x: bool| if x { "1" } else { "0" };
+         let manifest = self.krate.manifest_path.as_ref().map_or_else(|| "-".to_string(), |p| p.to_string_lossy().into_owned());
+         format!(
+-            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={} sandbox={} opt={} max_memory={} offline={} locked={}",
++            "pkg={} manifest={} {}:{} root={} test={} features=[{}] default_features={} all_features={} target={} panic_abort={} overflow_checks={} debug_assertions={} sandbox={} opt={} max_memory={} time_limit={} offline={} locked={}",
+             self.krate.package_id,
+             manifest,
+             self.krate.target_kind,
+@@ -184,6 +189,7 @@ impl SessionKey {
+             b(self.profile.sandbox),
+             b(self.profile.opt),
+             self.profile.max_memory,
++            self.profile.time_limit_ms,
+             b(self.cargo_net.offline),
+             b(self.cargo_net.locked),
+         )
+@@ -427,7 +433,7 @@ pub enum Invocation {
+     },
+ }
+ 
+-pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [--mark-unread <fn path>]... [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen] [--sandbox [--max-memory <bytes|N[K|M|G]>]] [--opt | --opt=bg]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust test <root.rs> --manifest-path <Cargo.toml> --lib | --test <name> [crate flags] [filter] [--json] [--timeout SECONDS]\n       lust query <def|type> <file.rs> <line>:<col> [--in <file.rs>] [crate flags] [--json]\n       lust fix <file.rs> [--all] [--dry-run] [crate flags]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json | --summary]\n       lust daemon\n       lust --version";
++pub const USAGE: &str = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [--mark-unread <fn path>]... [-- args]\n       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [-C overflow-checks=on|off] [-C debug-assertions=on|off] [--offline] [--locked] [--frozen] [--sandbox [--max-memory <bytes|N[K|M|G]>] [--time-limit <N|Nms|Ns|Nm>]] [--opt | --opt=bg]\n       lust build <file.rs> --release | --profile <name> [-o out] [--offline] [--locked] [--frozen]\n       lust build <file.rs> --release | --profile <name> --target <triple> [--target <triple>...] [crate flags] [-o out-or-dir] (lust release driver: zig cc)\n       lust check <file.rs> --rustc\n       lust test <file.rs> [filter] [--json] [--timeout SECONDS] [--max-errors N]\n       lust test <root.rs> --manifest-path <Cargo.toml> --lib | --test <name> [crate flags] [filter] [--json] [--timeout SECONDS]\n       lust query <def|type> <file.rs> <line>:<col> [--in <file.rs>] [crate flags] [--json]\n       lust fix <file.rs> [--all] [--dry-run] [crate flags]\n       lust explain <L####>\n       lust expand <file.rs>\n       lust capabilities [--json | --summary]\n       lust daemon\n       lust --version";
+ 
+ /// Crate-selection flags from the command line, before defaults are filled in.
+ #[derive(Clone, Default)]
+@@ -768,6 +774,26 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
+     // 0 off, 1 `--opt` (blocking), 2 `--opt=bg` (fast build now, optimised later).
+     let mut opt_mode: u8 = 0;
+     let mut max_memory = 0u64;
++    let mut time_limit_ms = 0u64;
++    // Seconds, or an explicit unit: 2, 2s, 500ms, 1m. A bare number is
++    // seconds, as `lust test --timeout` takes them. The stored unit is
++    // milliseconds.
++    fn time_limit(v: &str) -> Option<u64> {
++        let (digits, mul) = if let Some(rest) = v.strip_suffix("ms") {
++            (rest, 1u64)
++        } else if let Some(rest) = v.strip_suffix('s') {
++            (rest, 1_000)
++        } else if let Some(rest) = v.strip_suffix('m') {
++            (rest, 60_000)
++        } else {
++            (v, 1_000)
++        };
++        if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
++            return None;
++        }
++        let n: u64 = digits.parse().ok()?;
++        n.checked_mul(mul).filter(|&n| n > 0)
++    }
+     // A byte count, or one with a binary suffix: 512M, 1G, 64K.
+     fn byte_size(v: &str) -> Option<u64> {
+         let (digits, shift) = match v.as_bytes().last()? {
+@@ -829,6 +855,8 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
+             "--opt=bg" | "--opt=background" => opt_mode = 2,
+             "--max-memory" => max_memory = byte_size(it.next()?)?,
+             _ if a.starts_with("--max-memory=") => max_memory = byte_size(&a["--max-memory=".len()..])?,
++            "--time-limit" => time_limit_ms = time_limit(it.next()?)?,
++            _ if a.starts_with("--time-limit=") => time_limit_ms = time_limit(&a["--time-limit=".len()..])?,
+             "--frozen" => net = CargoNet { offline: true, locked: true },
+             "-C" => match it.next()?.as_str() {
+                 "panic=unwind" => panic_abort = Some(false),
+@@ -861,8 +889,9 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
+     if file.as_os_str().is_empty() {
+         return None;
+     }
+-    // The memory limit is part of the sandbox, and of a build lust runs.
+-    if max_memory != 0 && (!sandbox || cmd == "check" || cmd == "query") {
++    // The memory and time limits are part of the sandbox, and of a build
++    // lust runs. `check` does not run the program, so it has nothing to limit.
++    if (max_memory != 0 || time_limit_ms != 0) && (!sandbox || cmd == "check" || cmd == "query") {
+         return None;
+     }
+     let abs = |p: &Path| std::path::absolute(p).unwrap_or_else(|_| p.to_path_buf());
+@@ -996,6 +1025,7 @@ fn parse_command(args: &[String]) -> Option<Invocation> {
+     let opt_now = opt_mode == 1;
+     session.profile.opt = opt_now;
+     session.profile.max_memory = max_memory;
++    session.profile.time_limit_ms = time_limit_ms;
+     let client = Client::current(&typed);
+     let req = Request {
+         cmd: if cmd == "check" { Cmd::Check } else { Cmd::Build },
+@@ -1233,7 +1263,7 @@ pub fn encode(r: &Request) -> Vec<u8> {
+     let s = &r.session;
+     let env_count = r.client.env.as_ref().map_or_else(|| "-".to_string(), |e| e.len().to_string());
+     let mut out = format!(
+-        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {} {} {} {} {} {} {}\n",
++        "{cmd} {} {} {} {} {} {} {} {} {} {} {} {env_count} {} {} {} {} {} {} {} {} {} {}\n",
+         b(r.json),
+         b(r.timings),
+         b(r.debug),
+@@ -1253,6 +1283,7 @@ pub fn encode(r: &Request) -> Vec<u8> {
+         b(s.profile.opt),
+         b(r.opt_bg),
+         s.profile.max_memory,
++        s.profile.time_limit_ms,
+         build_id()
+     )
+     .into_bytes();
+@@ -1306,7 +1337,8 @@ pub fn read_request(r: &mut impl BufRead) -> Result<Request, ReadError> {
+         return Err(ReadError::Bad);
+     }
+     let f: Vec<&str> = head.split_whitespace().collect();
+-    if f.len() != 22 || f[21] != build_id() {
++    // 23 words: the fields above, then max_memory, time_limit_ms, build_id.
++    if f.len() != 23 || f[22] != build_id() {
+         // The first word is always a command, so a short header of a known
+         // command is a client from before this field.
+         return Err(if matches!(f.first(), Some(&"check" | &"build")) { ReadError::OtherBuild } else { ReadError::Bad });
+@@ -1397,6 +1429,7 @@ fn read_fields(r: &mut impl BufRead, f: &[&str]) -> Option<Request> {
+                 sandbox: f[15] == "1",
+                 opt: f[18] == "1",
+                 max_memory: f[20].parse().ok()?,
++                time_limit_ms: f[21].parse().ok()?,
+             },
+             cargo_net: CargoNet { offline: f[13] == "1", locked: f[14] == "1" },
+         },
+@@ -1704,6 +1737,7 @@ pub fn cargo_profile(manifest: Option<&Path>, name: &str) -> Result<CargoProfile
+             sandbox: false,
+             opt: false,
+             max_memory: 0,
++            time_limit_ms: 0,
+         },
+         opt_level: lookup("opt-level").unwrap_or_else(|| if release { "3" } else { "0" }.into()),
+     })
+@@ -2068,6 +2102,27 @@ mod tests {
+         assert!(parse_args(&args(&["check", "/tmp/x/main.rs", "--rustc", "--target", "t"])).is_none());
+     }
+ 
++    /// `--time-limit` is a sandbox build flag. A bare number is seconds.
++    /// `ms`, `s` and `m` name the unit. It is part of the session key.
++    #[test]
++    fn time_limit_is_part_of_the_sandbox_profile() {
++        let ms = compile_req(&["run", "/tmp/x/main.rs", "--sandbox", "--time-limit", "500ms"]);
++        assert_eq!(ms.session.profile.time_limit_ms, 500);
++        assert!(ms.session.describe().contains("time_limit=500"));
++        let secs = compile_req(&["build", "/tmp/x/main.rs", "--sandbox", "--time-limit=2s"]);
++        assert_eq!(secs.session.profile.time_limit_ms, 2_000);
++        let bare = compile_req(&["build", "/tmp/x/main.rs", "--sandbox", "--time-limit", "2"]);
++        assert_eq!(bare.session.profile.time_limit_ms, 2_000);
++        let minutes = compile_req(&["run", "/tmp/x/main.rs", "--sandbox", "--time-limit", "1m"]);
++        assert_eq!(minutes.session.profile.time_limit_ms, 60_000);
++        assert!(parse_args(&args(&["build", "/tmp/x/main.rs", "--time-limit", "1s"])).is_none());
++        assert!(parse_args(&args(&["check", "/tmp/x/main.rs", "--sandbox", "--time-limit", "1s"])).is_none());
++        assert!(parse_args(&args(&["build", "/tmp/x/main.rs", "--sandbox", "--time-limit", "0s"])).is_none());
++        assert!(parse_args(&args(&["build", "/tmp/x/main.rs", "--sandbox", "--time-limit", "fast"])).is_none());
++        let both = compile_req(&["build", "/tmp/x/main.rs", "--sandbox", "--max-memory", "64M", "--time-limit", "300ms"]);
++        assert_eq!((both.session.profile.max_memory, both.session.profile.time_limit_ms), (64 << 20, 300));
++    }
++
+     /// `--release --target` is the release driver: one cc request per
+     /// target, crate flags as inputs, output per target under `-o`.
+     /// Without a target `--release` stays the Cargo form, and several
+@@ -2247,7 +2302,7 @@ mod tests {
+         let m = dir.join("Cargo.toml");
+         std::fs::write(&m, "[package]\nname = \"p\"\n\n[profile.goport]\ninherits = \"release\"\nlto = \"fat\"\n\n[profile.chk]\ninherits = \"goport\"\noverflow-checks = true\n\n[profile.a]\ninherits = \"b\"\n[profile.b]\ninherits = \"a\"\n").unwrap();
+         let rel = cargo_profile(Some(&m), "release").unwrap();
+-        assert_eq!(rel.flags, ProfileFlags { panic_abort: false, overflow_checks: false, debug_assertions: false, sandbox: false, opt: false, max_memory: 0 });
++        assert_eq!(rel.flags, ProfileFlags { panic_abort: false, overflow_checks: false, debug_assertions: false, sandbox: false, opt: false, max_memory: 0, time_limit_ms: 0 });
+         assert_eq!(rel.opt_level, "3");
+         assert_eq!(cargo_profile(Some(&m), "goport").unwrap(), rel, "goport inherits release");
+         let chk = cargo_profile(Some(&m), "chk").unwrap();
+diff --git a/src/runtime/sync.c b/src/runtime/sync.c
+index c7176f9..08f1c35 100644
+--- a/src/runtime/sync.c
++++ b/src/runtime/sync.c
+@@ -1850,10 +1850,85 @@ lust_u128 lust_dur_as(lust_Duration d, uint64_t per_sec, uint64_t nanos_per) LUS
+ #endif
+ #endif
+ 
++/* `--sandbox --time-limit` (docs/sandbox.md). The deadline is a monotonic
++   millisecond count; 0 means no limit. main sets it (`lust_time_limit_set`)
++   before the program runs. A loop back-edge calls `lust_time_check` (the
++   clock, every iteration). A function entry calls `lust_time_tick` (the
++   clock every 64th call), which stops a recursion that never loops.
++   `thread::sleep` is shortened so one call cannot run past the deadline.
++   The sandbox refuses thread spawning, so these globals are not shared.
++   A straight-line body with no call and no sleep is not probed; the host
++   wall clock stays the backstop for that shape, as it does for a stack
++   overflow (`fatal runtime error: stack overflow`). */
++#ifdef LUST_IMPL
++static uint64_t lust_time_deadline_ms;
++static uint64_t lust_time_limit_ms;
++static uint32_t lust_time_calls;
++
++static uint64_t lust_time_now_ms(void) {
++    long ts[2];
++    lust_mono_now(ts);
++    if (ts[0] < 0) return 0;
++    return (uint64_t)ts[0] * 1000ull + (uint64_t)ts[1] / 1000000ull;
++}
++
++static void lust_time_stop(void) {
++    char text[32];
++    uint64_t n = lust_time_limit_ms;
++    if (n >= 60000ull && n % 60000ull == 0) sprintf(text, "%llum", (unsigned long long)(n / 60000ull));
++    else if (n >= 1000ull && n % 1000ull == 0) sprintf(text, "%llus", (unsigned long long)(n / 1000ull));
++    else sprintf(text, "%llums", (unsigned long long)n);
++    lust_print_flush();
++    fprintf(stderr, "error[L0533]: this program was built with --time-limit %s and tried to run longer\n", text);
++    fflush(stderr);
++    exit(101);
++}
++
++/* 1 when `*d` was shortened to the time still left. Already past the
++   deadline does not return. A sleep shorter than the time left is unchanged. */
++static int lust_time_cap(lust_Duration *d) {
++    uint64_t now, left, sec;
++    uint32_t nano;
++    if (!lust_time_deadline_ms) return 0;
++    now = lust_time_now_ms();
++    if (now >= lust_time_deadline_ms) lust_time_stop();
++    left = lust_time_deadline_ms - now;
++    sec = left / 1000ull;
++    nano = (uint32_t)(left % 1000ull) * 1000000u;
++    if (d->secs < sec || (d->secs == sec && d->nanos < nano)) return 0;
++    d->secs = sec;
++    d->nanos = nano;
++    return 1;
++}
++#endif
++
++void lust_time_limit_set(uint64_t ms) LUST_BODY({
++    uint64_t now, dl;
++    lust_time_limit_ms = ms;
++    now = lust_time_now_ms();
++    dl = now + ms;
++    if (dl < now) dl = ~0ull;
++    if (!dl) dl = 1;
++    lust_time_deadline_ms = dl;
++})
++
++void lust_time_check(void) LUST_BODY({
++    if (lust_time_deadline_ms && lust_time_now_ms() >= lust_time_deadline_ms) lust_time_stop();
++})
++
++void lust_time_tick(void) LUST_BODY({
++    if (!lust_time_deadline_ms) return;
++    if ((++lust_time_calls & 63u) != 0) return;
++    if (lust_time_now_ms() >= lust_time_deadline_ms) lust_time_stop();
++})
++
+ /* `thread::sleep`: nanosleep through syscall (no <time.h> in the runtime
+    text), resumed after a signal. On Darwin, libc nanosleep (runtime.h
+-   included <time.h> there), the same loop. */
++   included <time.h> there), the same loop. A sleep that would run past
++   `--time-limit` waits only for the time left, then the limit stops the
++   program if that wait reached the deadline. */
+ void lust_thread_sleep(lust_Duration d) LUST_BODY({
++    int capped = lust_time_cap(&d);
+ #ifdef _WIN32
+     while (d.secs > 0 || d.nanos > 0) {
+         uint64_t ms = d.secs > 4000000 ? 4000000000ull : d.secs * 1000 + d.nanos / 1000000;
+@@ -1884,4 +1959,5 @@ void lust_thread_sleep(lust_Duration d) LUST_BODY({
+     (void)d;
+     sched_yield();
+ #endif
++    if (capped) lust_time_check();
+ })
+diff --git a/tests/sandbox/time.rs b/tests/sandbox/time.rs
+new file mode 100644
+index 0000000..6c10464
+--- /dev/null
++++ b/tests/sandbox/time.rs
+@@ -0,0 +1,19 @@
++// `--time-limit`: the mode is a line on stdin (a sandboxed program reads
++// no arguments). `spin` loops, `sleep` waits far longer than a short
++// limit, `finish` returns at once.
++use std::io::Read;
++
++fn main() {
++    println!("before");
++    let mut mode = String::new();
++    std::io::stdin().read_to_string(&mut mode).unwrap();
++    match mode.trim() {
++        "spin" => loop {},
++        "sleep" => {
++            std::thread::sleep(std::time::Duration::from_secs(30));
++            println!("after");
++        }
++        "finish" => println!("done"),
++        other => println!("unknown {other}"),
++    }
++}
+-- 
+2.43.0
+

@@ -1,0 +1,15 @@
+# Flat config. Copy to crab-cage.toml. Flags on the command line win when
+# they differ from the built-in defaults.
+
+lust_bin = "lust"
+backend = "mock"
+endpoint = "http://127.0.0.1:11434/v1"
+model = "qwen2.5-coder:14b"
+eval = "auto"
+max_memory = "128M"
+host_memory = "1G"
+timeout_ms = 5000
+population = 16
+generations = 12
+seed = 1
+out_dir = "crab-out"
