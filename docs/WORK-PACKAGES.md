@@ -48,7 +48,8 @@ Phase 3:  L-03 … L-11, any order
 | WP-17 | done | crab-cage #16; see WP-17 for the numbers |
 | WP-17b | done | crab-cage #16, `src/spawn.rs`; numbers below WP-17 |
 | WP-18 | done | crab-cage #15; the proposer has run against a mock and a scripted stand-in server, not yet a real model |
-| WP-18b | in progress | the model proposer's feedback: an "already tried" list, the failing case, verdicts by hash |
+| WP-18b | done | crab-cage #18: an "already tried" list, the failing case, verdicts by hash |
+| The model prompt, tuned against a real model | done | see "First run against a real model" below |
 | WP-19 | docs done; the tank port is not planned | README and DESIGN.md |
 | WP-20 | open | needs zig |
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
@@ -59,6 +60,17 @@ Phase 3:  L-03 … L-11, any order
 | L-10 | in review | lust-lang [#39](https://github.com/cristy-the-one/lust-lang/pull/39); it also closes the same leak for file descriptors on Unix |
 | L-11 | new, open | below |
 
+## First run against a real model (2026-11-11)
+
+Ollama 0.40 on the work laptop (Ryzen 7 8840HS, no discrete GPU, CPU inference), model `Thox-ai/thoxcode-8b` (Qwen family, 7.6B, Q4_K_M), demo nugget, `--jobs 1`. About 2 s per reply with a 1,500-token prompt.
+
+- Asked fresh, the model wrote the whole correct region every time, with the first wording and with the current one.
+- One run began with a fragment (`.map(|x| x * x)`, a continuation of the old line). After that rejection the first wording got a fragment back every time, and the proposer gave up after two candidates.
+- Two changes fixed it, each measured by replaying the exact prompt eight to ten times: the system prompt says the reply *replaces* the lines and must never be a fragment, and the user prompt shows the current lines and puts the request **last**, after the diagnostics and the "already tried" list. With the request first, 8 of 8 replies were fragments; with it last, 8 of 8 were the whole region.
+- In the loop: 10 of 10 plain runs solved in one request (about 5 s for the run); 6 of 6 runs whose first reply was forced to be a fragment solved in two.
+
+What this does not show: a harder nugget, a `minimize` nugget, any other model, or `--jobs` above 1.
+
 Decisions made while building, which later packages must keep:
 
 - **Exit code of `crab-cage run`.** A `pass_all` nugget exits 0 only when a proven candidate has score 0. A `minimize` nugget exits 0 when any candidate is proven.
@@ -66,6 +78,7 @@ Decisions made while building, which later packages must keep:
 - **The oracle matches lust's profile.** rustc is run with `-C debug-assertions=on -C overflow-checks=on`.
 - **The daemon needs one file.** With lust's daemon on, lust always compiles `<work>/slot.rs`. A new file name per candidate is slower than no daemon at all.
 - **The hash.** `pipeline::candidate_hash` is the only hash function. Do not copy it.
+- **The model prompt ends with the request.** Feedback and the "already tried" list come before it. Changing the order or the wording needs a replay against a real model, not only the mock.
 
 ---
 

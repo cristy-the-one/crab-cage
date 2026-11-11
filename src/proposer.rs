@@ -341,9 +341,18 @@ const TRIED_LIMIT: usize = 8;
 /// One retry, after a reply repeats a region in that list.
 const REPEAT_TEMPERATURE: f64 = 0.8;
 const SYSTEM_PREFIX: &str = "\
-You write the body of one region of a Rust program. Reply with only the new region text, no markdown fence, no explanation. Stay inside this subset of Rust:";
+You rewrite one marked region of a Rust program. Your reply replaces every line between the two markers, so it must be complete Rust statements or an expression that compile in that place. Reply with the replacement lines only: no markers, no markdown fence, no explanation, and never a fragment that continues the old code. Stay inside this subset of Rust:";
 
 /// Asks a loopback chat model for the next region.
+///
+/// The wording of the prompt was settled against a real 7B coding model
+/// (2026-11-11). Asked fresh, it wrote the whole region with either wording.
+/// After one rejected fragment (`.map(|x| x * x)`, a continuation of the old
+/// line), the earlier wording ("write the lines that go between the
+/// markers") got a fragment back ten times out of ten; saying that the reply
+/// *replaces* the lines, showing the lines, and ruling out a fragment got
+/// the whole region ten times out of ten. The order matters as much: the
+/// request has to be the last thing in the prompt, after the feedback.
 ///
 /// The capability summary is fixed at construction (empty when lust is
 /// absent). A reply that still contains a region marker, or an empty reply,
@@ -647,7 +656,6 @@ fn user_prompt(
     out.push('\n');
     out.push_str(objective_sentence(nugget.objective));
     out.push('\n');
-    out.push_str("Write the lines that go between // CRAB:BEGIN and // CRAB:END.\n");
     if let Some(verdict) = own {
         if verdict.status == Status::Rejected {
             append_rejection(&mut out, verdict);
@@ -658,6 +666,19 @@ fn user_prompt(
         }
     }
     append_tried(&mut out, tried, pending);
+    // The request comes last, after the feedback. With the request first and
+    // a rejected fragment listed after it, the model continued the fragment
+    // eight times out of eight; with the request last it wrote the whole
+    // region eight times out of eight.
+    if !out.ends_with("\n\n") {
+        out.push('\n');
+    }
+    out.push_str("The lines between // CRAB:BEGIN and // CRAB:END are now:\n");
+    out.push_str(base);
+    if !base.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("Reply with the complete new lines that replace them.\n");
     out
 }
 
@@ -1124,11 +1145,11 @@ mod tests {
         assert!(proposer.prompts[0].user.contains("Objective: pass_all."));
         assert!(proposer.prompts[0]
             .user
-            .contains("Write the lines that go between // CRAB:BEGIN and // CRAB:END."));
+            .contains("Reply with the complete new lines that replace them."));
         assert!(!proposer.prompts[0].user.contains("L0110"));
         assert!(proposer.prompts[0].system.contains("no unsafe"));
         assert!(proposer.prompts[0].system.starts_with(
-            "You write the body of one region of a Rust program. Reply with only the new region text, no markdown fence, no explanation. Stay inside this subset of Rust:"
+            "You rewrite one marked region of a Rust program. Your reply replaces every line between the two markers, so it must be complete Rust statements or an expression that compile in that place. Reply with the replacement lines only: no markers, no markdown fence, no explanation, and never a fragment that continues the old code. Stay inside this subset of Rust:"
         ));
 
         // Line 4 is already region-relative. region_first_line is 3, so a
@@ -1173,7 +1194,7 @@ mod tests {
         assert!(prompt.contains("score: <number>"), "{prompt}");
         assert_eq!(
             proposer.prompts[0].system,
-            "You write the body of one region of a Rust program. Reply with only the new region text, no markdown fence, no explanation. Stay inside this subset of Rust:"
+            "You rewrite one marked region of a Rust program. Your reply replaces every line between the two markers, so it must be complete Rust statements or an expression that compile in that place. Reply with the replacement lines only: no markers, no markdown fence, no explanation, and never a fragment that continues the old code. Stay inside this subset of Rust:"
         );
     }
 
@@ -1389,7 +1410,7 @@ mod tests {
         );
         assert!(prompt.contains("ran, failed 2 of 3 cases"), "{prompt}");
         assert!(!prompt.contains("SECRET_NOTE"), "{prompt}");
-        assert!(prompt.contains("Write the lines that go between // CRAB:BEGIN and // CRAB:END."));
+        assert!(prompt.contains("Reply with the complete new lines that replace them."));
     }
 
     #[test]
