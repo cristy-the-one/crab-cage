@@ -24,6 +24,8 @@ cargo test --locked
 
 The binary is `target/release/crab-cage` (`crab-cage.exe` on Windows).
 
+The tests use a fake lust, so they cannot see how a real lust behaves. `tests/real_lust.rs` runs the default evolution and the probe against a real binary. It does nothing unless `CRAB_LUST_BIN` is set. Set `LUST_NO_DAEMON=1` too, so lust leaves no background daemon: `CRAB_LUST_BIN=/path/to/lust cargo test --test real_lust` (PowerShell: `$env:CRAB_LUST_BIN = "C:\path\to\lust.exe"; $env:LUST_NO_DAEMON = "1"; cargo test --test real_lust`).
+
 ## Run the demo
 
 ```sh
@@ -54,7 +56,7 @@ crab-cage models                                    # the 16 GB model notes
 crab-cage lust-probe                                # version, path, and whether --max-memory and --time-limit exist
 ```
 
-Copy `crab-cage.toml.example` to `crab-cage.toml` to set the lust path and the model endpoint without flags. A flag that differs from the built-in default wins over the file.
+Copy `crab-cage.toml.example` to `crab-cage.toml` to set the lust path and the model endpoint without flags. A flag on the command line wins over the file, and the file wins over the built-in default.
 
 ## Lust
 

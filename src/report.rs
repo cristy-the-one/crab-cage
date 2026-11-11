@@ -58,6 +58,10 @@ pub struct Verification {
     pub lust_max_memory: bool,
     pub lust_time_limit: bool,
     pub lust_check: String,
+    pub rustc_edition: Option<String>,
+    pub lust_replay_error: Option<f64>,
+    pub rustc_replay_error: Option<f64>,
+    pub oracle_agrees: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -80,7 +84,7 @@ pub fn build_report(
 ) -> Report {
     let genome = &evolution.best.genome;
     Report {
-        schema: 1,
+        schema: 2,
         tool: "crab-cage",
         demo: "jacketed-tank",
         seed,
@@ -204,6 +208,27 @@ pub fn markdown(report: &Report) -> String {
         "- lust check: {}\n",
         report.verification.lust_check
     ));
+    let v = &report.verification;
+    out.push_str(&format!(
+        "- rustc edition: {}\n",
+        v.rustc_edition.as_deref().unwrap_or("n/a")
+    ));
+    out.push_str(&format!(
+        "- lust replay max abs error: {}\n",
+        fmt_error(v.lust_replay_error)
+    ));
+    out.push_str(&format!(
+        "- rustc replay max abs error: {}\n",
+        fmt_error(v.rustc_replay_error)
+    ));
+    out.push_str(&format!(
+        "- oracle agrees (lust and rustc printed identical lines): {}\n",
+        match v.oracle_agrees {
+            Some(true) => "true",
+            Some(false) => "false",
+            None => "n/a (needs both lust and rustc)",
+        }
+    ));
     out.push_str(&format!(
         "- limits: wall {} ms, lust --max-memory {} bytes, host backstop {} bytes\n",
         report.limits.run_timeout_ms,
@@ -212,6 +237,13 @@ pub fn markdown(report: &Report) -> String {
     ));
     out.push_str(&format!("\n{}\n", report.limits.note));
     out
+}
+
+fn fmt_error(value: Option<f64>) -> String {
+    match value {
+        Some(error) => format!("{error:.3e}"),
+        None => "n/a".to_string(),
+    }
 }
 
 pub fn best_genome(evolution: &Evolution) -> &Genome {

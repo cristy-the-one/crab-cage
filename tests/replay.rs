@@ -28,7 +28,7 @@ fn emitted_controller_compiles_and_matches_the_genome() {
     } else {
         dir.join("controller")
     };
-    lust::compile_rustc(&source_path, &bin, Duration::from_secs(120)).unwrap();
+    lust::compile_rustc(&source_path, &bin, "2021", Duration::from_secs(120)).unwrap();
 
     let options = RunOptions {
         run_timeout: Duration::from_secs(20),

@@ -29,6 +29,12 @@ fn main() {
         Some("build") if args.get(1).map(String::as_str) == Some("--help") => {
             println!("Usage: lust build <file.rs> --sandbox --max-memory <size> --time-limit <duration> -o <out>");
         }
+        None => {
+            eprintln!(
+                "usage: lust <check|build|run> <file.rs> [--sandbox] [--max-memory <size>] [--time-limit <duration>]"
+            );
+            process::exit(2);
+        }
         Some("check") => cmd_check(&args),
         Some("fix") => cmd_fix(&args),
         Some("build") => cmd_build(&args, &exe),

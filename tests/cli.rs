@@ -66,3 +66,63 @@ fn cli_evolve_writes_the_controller_and_models_are_local() {
     assert!(text.contains("16 GB"));
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn command_line_flags_win_over_the_config_file() {
+    let exe = crab_exe();
+    assert!(exe.is_file(), "missing binary {}", exe.display());
+    let dir = std::env::temp_dir().join(format!("crab-cage-cli-merge-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let config = dir.join("crab.toml");
+    fs::write(&config, "seed = 7\ngenerations = 3\n").unwrap();
+    let output = Command::new(&exe)
+        .current_dir(&dir)
+        .args([
+            "evolve",
+            "--seed",
+            "1",
+            "--eval",
+            "native",
+            "--out-dir",
+            "out",
+        ])
+        .arg("--config")
+        .arg(&config)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report = fs::read_to_string(dir.join("out/report.json")).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&report).unwrap();
+    assert_eq!(value["seed"], 1, "the flag must beat the file: {report}");
+    assert_eq!(
+        value["generations"], 3,
+        "the file must beat the default: {report}"
+    );
+
+    let bad = dir.join("bad.toml");
+    fs::write(&bad, "max_memory = \"lots\"\n").unwrap();
+    let output = Command::new(&exe)
+        .current_dir(&dir)
+        .args([
+            "evolve",
+            "--eval",
+            "native",
+            "--no-verify",
+            "--out-dir",
+            "out2",
+        ])
+        .arg("--config")
+        .arg(&bad)
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "a bad max_memory must be an error"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

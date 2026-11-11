@@ -78,7 +78,7 @@ pub fn which(name: &str) -> Option<PathBuf> {
 }
 
 pub fn probe(bin: &Path, timeout: Duration) -> Result<LustTool> {
-    let version = tool_output(bin, &["--version"], timeout, &[])?;
+    let version = tool_output(bin, &["--version"], timeout, &[("LUST_NO_DAEMON", "1")])?;
     let version = first_line(&version.stdout, &version.stderr);
     if version.is_empty() {
         return Err(err(format!(
@@ -86,31 +86,50 @@ pub fn probe(bin: &Path, timeout: Duration) -> Result<LustTool> {
             bin.display()
         )));
     }
-    let help = tool_output(bin, &["build", "--help"], timeout, &[]).unwrap_or(ExecResult {
-        kind: StopKind::Exited(0),
-        stdout: String::new(),
-        stderr: String::new(),
-        elapsed: Duration::ZERO,
-    });
-    // `lust build --help` is not a help page on a real binary: the client
-    // treats `--help` as a file name. A limit flag with no value is a usage
-    // error and prints the usage line, which names every flag.
-    let usage = tool_output(bin, &["build", "--time-limit"], timeout, &[]).unwrap_or(ExecResult {
+    // Real lust prints its usage text when it is run with no arguments.
+    // Only the `usage:` line and its indented continuation lines count:
+    // an error message that merely contains a flag name proves nothing.
+    let usage = tool_output(bin, &[], timeout, &[("LUST_NO_DAEMON", "1")]).unwrap_or(ExecResult {
         kind: StopKind::Exited(2),
         stdout: String::new(),
         stderr: String::new(),
         elapsed: Duration::ZERO,
     });
-    let help_text = format!(
-        "{}{}{}{}",
-        help.stdout, help.stderr, usage.stdout, usage.stderr
+    let usage_text = format!(
+        "{}
+{}",
+        usage.stdout, usage.stderr
     );
+    let (supports_max_memory, supports_time_limit) = flags_from_usage(&usage_text);
     Ok(LustTool {
         bin: bin.to_path_buf(),
         version,
-        supports_max_memory: help_text.contains("--max-memory"),
-        supports_time_limit: help_text.contains("--time-limit"),
+        supports_max_memory,
+        supports_time_limit,
     })
+}
+
+/// `(--max-memory named, --time-limit named)` in lust's usage text. The usage
+/// text is the first `usage:` line plus every line after it that is itself a
+/// `usage:` line or starts with whitespace. With no `usage:` line, both are
+/// false.
+fn flags_from_usage(text: &str) -> (bool, bool) {
+    let mut usage_text = String::new();
+    let mut seen_usage = false;
+    for line in text.lines() {
+        let starts_usage = line.starts_with("usage:");
+        if starts_usage {
+            seen_usage = true;
+        }
+        if seen_usage && (starts_usage || line.starts_with(char::is_whitespace)) {
+            usage_text.push_str(line);
+            usage_text.push('\n');
+        }
+    }
+    (
+        usage_text.contains("--max-memory"),
+        usage_text.contains("--time-limit"),
+    )
 }
 
 /// `2s` when the duration is a whole number of seconds, otherwise `500ms`.
@@ -135,7 +154,7 @@ pub fn check(tool: &LustTool, source: &Path, timeout: Duration) -> Result<CheckR
             &source.display().to_string(),
         ],
         timeout,
-        &[],
+        &[("LUST_NO_DAEMON", "1")],
     )?;
     let text = format!("{}{}", result.stdout, result.stderr);
     let diagnostics = parse_diagnostics(&text);
@@ -209,13 +228,13 @@ pub fn build(
     Ok(())
 }
 
-pub fn compile_rustc(source: &Path, output: &Path, timeout: Duration) -> Result<()> {
+pub fn compile_rustc(source: &Path, output: &Path, edition: &str, timeout: Duration) -> Result<()> {
     let rustc = which("rustc").ok_or_else(|| err("rustc is not on PATH"))?;
     let result = tool_output(
         &rustc,
         &[
             "--edition",
-            "2021",
+            edition,
             "-C",
             "opt-level=2",
             "-C",
@@ -397,6 +416,31 @@ mod tests {
             elapsed: Duration::from_millis(20),
         };
         assert_eq!(classify(&host), RunClass::MemoryHost);
+    }
+
+    #[test]
+    fn usage_without_the_flags_gives_false() {
+        // The first two lines of `lust` with no arguments, lust 0.2.0.
+        let text = "usage: lust <check|build|run> <file.rs> [--json] [--max-errors N] [--timings] [-o out] [-g] [--emit-c prefix] [-- args]
+       lust <check|build|run> <file.rs> [--manifest-path <Cargo.toml>] [--package <name>] [--bin <name> | --lib] [--features <a,b>] [--no-default-features] [--all-features] [--target <triple>] [-C panic=unwind|abort] [--offline] [--locked] [--frozen]
+";
+        assert_eq!(flags_from_usage(text), (false, false));
+    }
+
+    #[test]
+    fn an_error_naming_a_flag_is_not_usage() {
+        assert_eq!(
+            flags_from_usage("error: cannot read C:\\x\\--time-limit"),
+            (false, false)
+        );
+    }
+
+    #[test]
+    fn usage_naming_the_flags_gives_true() {
+        let text = "usage: lust <check|build|run> <file.rs> [--max-memory <size>]
+       lust build <file.rs> [--time-limit <duration>]
+";
+        assert_eq!(flags_from_usage(text), (true, true));
     }
 
     #[test]

@@ -40,34 +40,41 @@ enum Command {
 
 #[derive(Parser, Clone, Debug, Default)]
 struct EvolveArgs {
-    #[arg(long, default_value_t = 1)]
-    seed: u64,
-    #[arg(long, default_value_t = 16)]
-    population: usize,
-    #[arg(long, default_value_t = 12)]
-    generations: usize,
-    /// `mock` (deterministic, no model server) or `local` (loopback HTTP).
-    #[arg(long, default_value = "mock")]
-    backend: String,
-    #[arg(long, default_value = "http://127.0.0.1:11434/v1")]
-    endpoint: String,
-    #[arg(long, default_value = "qwen2.5-coder:14b")]
-    model: String,
+    /// Default 1.
+    #[arg(long)]
+    seed: Option<u64>,
+    /// Default 16.
+    #[arg(long)]
+    population: Option<usize>,
+    /// Default 12.
+    #[arg(long)]
+    generations: Option<usize>,
+    /// `mock` (deterministic, no model server) or `local` (loopback HTTP). Default mock.
+    #[arg(long)]
+    backend: Option<String>,
+    /// Default http://127.0.0.1:11434/v1.
+    #[arg(long)]
+    endpoint: Option<String>,
+    /// Default qwen2.5-coder:14b.
+    #[arg(long)]
+    model: Option<String>,
     #[arg(long)]
     lust_bin: Option<PathBuf>,
-    /// `auto` (native search, sandboxed winner), `native`, or `sandbox`.
-    #[arg(long, default_value = "auto")]
-    eval: String,
-    /// Guest cap passed to `lust build --sandbox --max-memory` (lust 0.3.0).
-    #[arg(long, default_value = "128M")]
-    max_memory: String,
-    /// Host backstop: RLIMIT_AS on Unix, job commit cap on Windows.
-    #[arg(long, default_value = "1G")]
-    host_memory: String,
-    #[arg(long, default_value_t = 5000)]
-    timeout_ms: u64,
-    #[arg(long, default_value = "crab-out")]
-    out_dir: PathBuf,
+    /// `auto` (native search, sandboxed winner), `native`, or `sandbox`. Default auto.
+    #[arg(long)]
+    eval: Option<String>,
+    /// Guest cap passed to `lust build --sandbox --max-memory` (lust 0.3.0). Default 128M.
+    #[arg(long)]
+    max_memory: Option<String>,
+    /// Host backstop: RLIMIT_AS on Unix, job commit cap on Windows. Default 1G.
+    #[arg(long)]
+    host_memory: Option<String>,
+    /// Default 5000.
+    #[arg(long)]
+    timeout_ms: Option<u64>,
+    /// Default crab-out.
+    #[arg(long)]
+    out_dir: Option<PathBuf>,
     #[arg(long)]
     config: Option<PathBuf>,
     /// Skip rustc / lust replay of the winner.
@@ -96,57 +103,122 @@ fn main() -> ExitCode {
 }
 
 fn evolve(args: EvolveArgs) -> Result<()> {
-    let mut options = options_from_args(&args)?;
-    if let Some(path) = &args.config {
-        let file = read_config(path)?;
-        merge_unset(&mut options, &file, &args);
+    let file = if let Some(path) = &args.config {
+        Some(read_config(path)?)
     } else {
         let path = std::path::Path::new("crab-cage.toml");
         if path.is_file() {
-            let file = read_config(path)?;
-            merge_unset(&mut options, &file, &args);
+            Some(read_config(path)?)
+        } else {
+            None
         }
-    }
+    };
+    let options = resolve_options(&args, file.as_ref())?;
     let output = execute(&options)?;
     print!("{}", format_summary(&output));
     Ok(())
 }
 
-fn options_from_args(args: &EvolveArgs) -> Result<RunOptions> {
-    let backend = match args.backend.as_str() {
-        "mock" => BackendChoice::Mock,
-        "local" | "openai" | "ollama" | "llama" => BackendChoice::Local,
-        other => {
-            return Err(err(format!(
-                "unknown backend `{other}` (expected mock or local)"
-            )))
-        }
+fn parse_backend(value: &str) -> Result<BackendChoice> {
+    match value {
+        "mock" => Ok(BackendChoice::Mock),
+        "local" | "openai" | "ollama" | "llama" => Ok(BackendChoice::Local),
+        other => Err(err(format!(
+            "unknown backend `{other}` (expected mock or local)"
+        ))),
+    }
+}
+
+fn parse_eval(value: &str) -> Result<EvalMode> {
+    match value {
+        "auto" => Ok(EvalMode::Auto),
+        "native" => Ok(EvalMode::Native),
+        "sandbox" => Ok(EvalMode::Sandbox),
+        other => Err(err(format!(
+            "unknown eval mode `{other}` (expected auto, native, or sandbox)"
+        ))),
+    }
+}
+
+/// Each option: the command-line flag, then the config file, then the
+/// built-in default from `RunOptions::default()`.
+fn resolve_options(args: &EvolveArgs, file: Option<&FileConfig>) -> Result<RunOptions> {
+    let defaults = RunOptions::default();
+    let backend = match args
+        .backend
+        .as_deref()
+        .or(file.and_then(|f| f.backend.as_deref()))
+    {
+        Some(value) => parse_backend(value)?,
+        None => defaults.backend,
     };
-    let eval = match args.eval.as_str() {
-        "auto" => EvalMode::Auto,
-        "native" => EvalMode::Native,
-        "sandbox" => EvalMode::Sandbox,
-        other => {
-            return Err(err(format!(
-                "unknown eval mode `{other}` (expected auto, native, or sandbox)"
-            )))
-        }
+    let eval = match args
+        .eval
+        .as_deref()
+        .or(file.and_then(|f| f.eval.as_deref()))
+    {
+        Some(value) => parse_eval(value)?,
+        None => defaults.eval,
+    };
+    let max_memory = match args
+        .max_memory
+        .as_deref()
+        .or(file.and_then(|f| f.max_memory.as_deref()))
+    {
+        Some(value) => supervisor::parse_memory(value)?,
+        None => defaults.max_memory,
+    };
+    let host_memory = match args
+        .host_memory
+        .as_deref()
+        .or(file.and_then(|f| f.host_memory.as_deref()))
+    {
+        Some(value) => supervisor::parse_memory(value)?,
+        None => defaults.host_memory,
     };
     Ok(RunOptions {
-        seed: args.seed,
-        population: args.population,
-        generations: args.generations,
+        seed: args
+            .seed
+            .or(file.and_then(|f| f.seed))
+            .unwrap_or(defaults.seed),
+        population: args
+            .population
+            .or(file.and_then(|f| f.population))
+            .unwrap_or(defaults.population),
+        generations: args
+            .generations
+            .or(file.and_then(|f| f.generations))
+            .unwrap_or(defaults.generations),
         backend,
-        endpoint: args.endpoint.clone(),
-        model: args.model.clone(),
+        endpoint: args
+            .endpoint
+            .clone()
+            .or(file.and_then(|f| f.endpoint.clone()))
+            .unwrap_or(defaults.endpoint),
+        model: args
+            .model
+            .clone()
+            .or(file.and_then(|f| f.model.clone()))
+            .unwrap_or(defaults.model),
         llm_timeout: Duration::from_secs(180),
-        lust_bin: args.lust_bin.clone(),
+        lust_bin: args
+            .lust_bin
+            .clone()
+            .or(file.and_then(|f| f.lust_bin.clone())),
         eval,
-        max_memory: supervisor::parse_memory(&args.max_memory)?,
-        host_memory: supervisor::parse_memory(&args.host_memory)?,
-        run_timeout: Duration::from_millis(args.timeout_ms),
+        max_memory,
+        host_memory,
+        run_timeout: args
+            .timeout_ms
+            .or(file.and_then(|f| f.timeout_ms))
+            .map(Duration::from_millis)
+            .unwrap_or(defaults.run_timeout),
         compile_timeout: Duration::from_secs(180),
-        out_dir: args.out_dir.clone(),
+        out_dir: args
+            .out_dir
+            .clone()
+            .or(file.and_then(|f| f.out_dir.clone()))
+            .unwrap_or(defaults.out_dir),
         verify: !args.no_verify,
     })
 }
@@ -236,84 +308,18 @@ fn read_config(path: &std::path::Path) -> Result<FileConfig> {
             other => return Err(err(format!("{}: unknown key `{other}`", path.display()))),
         }
     }
+    // A bad value in the file is an error even when a flag overrides it.
+    if let Some(value) = &file.backend {
+        parse_backend(value).map_err(|e| err(format!("{}: {}", path.display(), e.message)))?;
+    }
+    if let Some(value) = &file.eval {
+        parse_eval(value).map_err(|e| err(format!("{}: {}", path.display(), e.message)))?;
+    }
+    for value in [&file.max_memory, &file.host_memory].into_iter().flatten() {
+        supervisor::parse_memory(value)
+            .map_err(|e| err(format!("{}: {}", path.display(), e.message)))?;
+    }
     Ok(file)
-}
-
-fn merge_unset(options: &mut RunOptions, file: &FileConfig, args: &EvolveArgs) {
-    // Clap always has defaults, so a flag the user did not pass is
-    // indistinguishable from the default. The config file overrides those
-    // defaults, and a non-default flag wins because we only replace a field
-    // when the parsed args still hold the default.
-    if args.seed == 1 {
-        if let Some(seed) = file.seed {
-            options.seed = seed;
-        }
-    }
-    if args.population == 16 {
-        if let Some(population) = file.population {
-            options.population = population;
-        }
-    }
-    if args.generations == 12 {
-        if let Some(generations) = file.generations {
-            options.generations = generations;
-        }
-    }
-    if args.backend == "mock" {
-        if let Some(backend) = &file.backend {
-            if backend == "local" {
-                options.backend = BackendChoice::Local;
-            }
-        }
-    }
-    if args.endpoint == "http://127.0.0.1:11434/v1" {
-        if let Some(endpoint) = &file.endpoint {
-            options.endpoint = endpoint.clone();
-        }
-    }
-    if args.model == "qwen2.5-coder:14b" {
-        if let Some(model) = &file.model {
-            options.model = model.clone();
-        }
-    }
-    if args.lust_bin.is_none() {
-        if let Some(bin) = &file.lust_bin {
-            options.lust_bin = Some(bin.clone());
-        }
-    }
-    if args.max_memory == "128M" {
-        if let Some(value) = &file.max_memory {
-            if let Ok(bytes) = supervisor::parse_memory(value) {
-                options.max_memory = bytes;
-            }
-        }
-    }
-    if args.host_memory == "1G" {
-        if let Some(value) = &file.host_memory {
-            if let Ok(bytes) = supervisor::parse_memory(value) {
-                options.host_memory = bytes;
-            }
-        }
-    }
-    if args.timeout_ms == 5000 {
-        if let Some(timeout) = file.timeout_ms {
-            options.run_timeout = Duration::from_millis(timeout);
-        }
-    }
-    if args.eval == "auto" {
-        if let Some(eval) = &file.eval {
-            options.eval = match eval.as_str() {
-                "native" => EvalMode::Native,
-                "sandbox" => EvalMode::Sandbox,
-                _ => EvalMode::Auto,
-            };
-        }
-    }
-    if args.out_dir == PathBuf::from("crab-out") {
-        if let Some(dir) = &file.out_dir {
-            options.out_dir = dir.clone();
-        }
-    }
 }
 
 fn probe(lust_bin: Option<PathBuf>) -> Result<()> {
