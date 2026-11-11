@@ -29,6 +29,11 @@ pub struct LustTool {
 pub struct Diagnostic {
     pub code: String,
     pub message: String,
+    pub severity: String,
+    pub line: u32,
+    pub col: u32,
+    pub fix: String,
+    pub auto_edits: usize,
     pub raw: String,
 }
 
@@ -324,15 +329,34 @@ fn parse_diagnostics(text: &str) -> Vec<Diagnostic> {
         if !line.starts_with('{') {
             continue;
         }
-        if let Ok(value) = serde_json::from_str::<DiagLine>(line) {
-            if value.message.is_none() && value.code.is_none() && value.ok == Some(true) {
-                continue;
+        match serde_json::from_str::<DiagLine>(line) {
+            Ok(value) => {
+                if value.message.is_none() && value.code.is_none() && value.ok == Some(true) {
+                    continue;
+                }
+                // `line` and `col` live under `span`. A missing field, or JSON
+                // null, becomes an empty string or 0. `span.file` (the old fake
+                // lust shape) is ignored; real lust puts the path at the top.
+                let span = value.span.unwrap_or_default();
+                out.push(Diagnostic {
+                    code: value.code.unwrap_or_default(),
+                    message: value.message.unwrap_or_default(),
+                    severity: value.severity.unwrap_or_default(),
+                    line: span.line.unwrap_or(0),
+                    col: span.col.unwrap_or(0),
+                    fix: value.fix.unwrap_or_default(),
+                    auto_edits: value.edits.unwrap_or_default().len(),
+                    raw: line.to_string(),
+                });
             }
-            out.push(Diagnostic {
-                code: value.code.unwrap_or_default(),
-                message: value.message.unwrap_or_default(),
-                raw: line.to_string(),
-            });
+            // A field of the wrong type (a string `line`, an object `edits`)
+            // fails the struct parse. Keep the text fields that are still
+            // readable so the proposer hears about the error.
+            Err(_) => {
+                if let Some(diagnostic) = loose_diagnostic(line) {
+                    out.push(diagnostic);
+                }
+            }
         }
     }
     out
@@ -346,6 +370,64 @@ struct DiagLine {
     message: Option<String>,
     #[serde(default)]
     ok: Option<bool>,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    span: Option<DiagSpan>,
+    #[serde(default)]
+    fix: Option<String>,
+    #[serde(default)]
+    edits: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Default, Deserialize)]
+struct DiagSpan {
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    col: Option<u32>,
+}
+
+/// Reads each field on its own after the strict parse fails. A number that
+/// fits in `u32` is kept; anything else at `span.line` or `span.col` is 0.
+/// `auto_edits` is the length of `edits` when that field is an array.
+fn loose_diagnostic(line: &str) -> Option<Diagnostic> {
+    let value: serde_json::Value = serde_json::from_str(line).ok()?;
+    let code = json_str(&value, "code");
+    let message = json_str(&value, "message");
+    if code.is_empty() && message.is_empty() {
+        return None;
+    }
+    let span = value.get("span");
+    Some(Diagnostic {
+        code,
+        message,
+        severity: json_str(&value, "severity"),
+        line: json_u32(span.and_then(|span| span.get("line"))),
+        col: json_u32(span.and_then(|span| span.get("col"))),
+        fix: json_str(&value, "fix"),
+        auto_edits: value
+            .get("edits")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len)
+            .unwrap_or(0),
+        raw: line.to_string(),
+    })
+}
+
+fn json_str(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn json_u32(value: Option<&serde_json::Value>) -> u32 {
+    value
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|number| u32::try_from(number).ok())
+        .unwrap_or(0)
 }
 
 fn first_line(stdout: &str, stderr: &str) -> String {
@@ -449,5 +531,58 @@ mod tests {
         let diags = parse_diagnostics(text);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "L0102");
+        assert_eq!(diags[0].severity, "");
+        assert_eq!(diags[0].line, 0);
+        assert_eq!(diags[0].col, 0);
+        assert_eq!(diags[0].fix, "");
+        assert_eq!(diags[0].auto_edits, 0);
+    }
+
+    #[test]
+    fn parses_a_real_lust_diagnostic() {
+        let text = r#"{"schema":1,"kind":"diagnostic","code":"L0110","severity":"error","message":"mismatched types: expected `u32`, found `&str`","file":"C:\\t\\bad.rs","span":{"start":29,"end":32,"line":2,"col":18,"end_line":2,"end_col":21},"labels":[],"fix":"Change the value to type `u32`, or change the expected type.","edits":[]}"#;
+        let diags = parse_diagnostics(text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "L0110");
+        assert_eq!(diags[0].line, 2);
+        assert_eq!(diags[0].col, 18);
+        assert!(diags[0].fix.starts_with("Change"));
+    }
+
+    #[test]
+    fn parses_the_old_fake_lust_shape() {
+        // `span.file`, no `severity`. The path is a JSON string, so a Windows
+        // backslash arrives as `\\`.
+        let text = r#"{"code":"L0102","message":"cannot find value `BROKEN_TOKEN` in this scope","span":{"file":"C:\\t\\broken.rs","line":1,"col":1},"fix":"replace BROKEN_TOKEN","edits":[{},{"kind":"replace"}]}"#;
+        let diags = parse_diagnostics(text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "L0102");
+        assert_eq!(diags[0].severity, "");
+        assert_eq!(diags[0].line, 1);
+        assert_eq!(diags[0].col, 1);
+        assert_eq!(diags[0].fix, "replace BROKEN_TOKEN");
+        assert_eq!(diags[0].auto_edits, 2);
+    }
+
+    #[test]
+    fn keeps_code_and_message_when_a_field_has_the_wrong_type() {
+        let text = "{\"schema\":1,\"ok\":true}\n\
+{\"code\":\"L0110\",\"severity\":\"error\",\"message\":\"mismatched types\",\"span\":{\"line\":\"2\",\"col\":18},\"fix\":\"Change it\",\"edits\":{\"not\":\"a list\"}}\n\
+{\"code\":\"L0101\",\"message\":\"cannot find value\",\"span\":{\"line\":3,\"col\":20},\"edits\":{}}\n";
+        let diags = parse_diagnostics(text);
+        assert_eq!(diags.len(), 2);
+        assert_eq!(diags[0].code, "L0110");
+        assert_eq!(diags[0].message, "mismatched types");
+        assert_eq!(diags[0].severity, "error");
+        assert_eq!(diags[0].line, 0);
+        assert_eq!(diags[0].col, 18);
+        assert_eq!(diags[0].fix, "Change it");
+        assert_eq!(diags[0].auto_edits, 0);
+        assert!(diags[0].raw.contains("L0110"));
+        assert_eq!(diags[1].code, "L0101");
+        assert_eq!(diags[1].message, "cannot find value");
+        assert_eq!(diags[1].line, 3);
+        assert_eq!(diags[1].col, 20);
+        assert_eq!(diags[1].auto_edits, 0);
     }
 }
