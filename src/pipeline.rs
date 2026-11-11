@@ -336,11 +336,12 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
     for case in &nugget.cases {
         let result = supervisor::run_capture(Command::new(bin), &limits, case.input.as_bytes())?;
         let class = lust::classify(&result);
+        // A timeout or other unclean stop rejects the candidate. Later cases
+        // would not change that, so they are not run. A Clean run with the
+        // wrong output is still scored and the remaining cases still run.
         if class != RunClass::Clean {
-            if unclean.is_none() {
-                unclean = Some(class);
-            }
-            continue;
+            unclean = Some(class);
+            break;
         }
         match nugget.objective {
             Objective::PassAll => {

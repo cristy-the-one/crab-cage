@@ -182,20 +182,54 @@ fn a_panic_is_rejected_at_run_with_the_class_name() {
 }
 
 #[test]
-fn an_endless_loop_is_rejected_at_run_by_either_clock() {
-    // No lust here, so the host wall clock is the clock that can fire.
-    // A real lust may instead stop the guest with L0533 (`TimeLust`).
-    // Either class is a reject at `run`; this test accepts both.
-    let nugget = tiny(Objective::PassAll, 500, Some("ok\n"));
-    let verdict = evaluate(&nugget, "loop {}\n", &no_lust(), &options("loop")).unwrap();
-    assert_eq!(verdict.status, Status::Rejected);
+fn an_endless_loop_stops_after_the_first_unclean_case() {
+    // The first case exits clean. The second loops. The third must not run:
+    // one timeout is well under two. Either the host wall clock (`TimedOut`)
+    // or lust's own deadline (`TimeLust`) is a reject at `run`.
+    let timeout_ms = 500u64;
+    let mut nugget = tiny(Objective::PassAll, timeout_ms, Some("ok\n"));
+    nugget.cases = vec![
+        Case {
+            id: "a".to_string(),
+            input: "0\n".to_string(),
+            expected: Some("ok\n".to_string()),
+        },
+        Case {
+            id: "b".to_string(),
+            input: "1\n".to_string(),
+            expected: Some("ok\n".to_string()),
+        },
+        Case {
+            id: "c".to_string(),
+            input: "1\n".to_string(),
+            expected: Some("ok\n".to_string()),
+        },
+    ];
+    let candidate = "\
+use std::io::Read;
+let mut input = String::new();
+let _ = std::io::stdin().read_to_string(&mut input);
+if input.contains('1') {
+    loop {}
+}
+print!(\"ok\\n\");
+";
+    let verdict = evaluate(&nugget, candidate, &no_lust(), &options("loop")).unwrap();
+    assert_eq!(verdict.status, Status::Rejected, "{}", verdict.note);
     assert_eq!(verdict.gate, Gate::Run);
     assert!(
         verdict.note == "TimedOut" || verdict.note == "TimeLust",
         "note {}",
         verdict.note
     );
-    assert!(verdict.ms.run < 8_000, "run ms {}", verdict.ms.run);
+    assert!(verdict.score.is_none());
+    assert_eq!(verdict.total, 3);
+    assert_eq!(verdict.passed, 1);
+    assert!(
+        verdict.ms.run < 2 * timeout_ms,
+        "run ms {} is not under 2 x {timeout_ms}",
+        verdict.ms.run
+    );
 }
 
 #[test]
