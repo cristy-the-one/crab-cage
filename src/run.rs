@@ -20,6 +20,9 @@ use crate::nugget::{self, Nugget, Objective};
 use crate::pipeline::{self, candidate_hash, EvalOptions, Gate, Status, Toolchain, Verdict};
 use crate::proposer::{Feedback, LiteralProposer, ModelProposer, Proposer};
 
+/// Settled candidates kept for [`Feedback::recent`]. Older ones are dropped.
+const RECENT_LIMIT: usize = 32;
+
 const HOST_MEMORY: u64 = 1024 * 1024 * 1024;
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(180);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -176,6 +179,7 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
 
     let mut best = restored_best(&options.out_dir, &journal_path)?;
     let mut last: Option<(String, Verdict)> = None;
+    let mut recent: Vec<(String, Verdict)> = Vec::new();
     let mut evaluated = 0usize;
     let mut unjournaled = 0usize;
     let mut cursor = 0usize;
@@ -196,6 +200,7 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
             &journal_path,
             &mut best,
             &mut last,
+            &mut recent,
         )?;
         if outcome.recorded {
             evaluated += 1;
@@ -209,23 +214,35 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
     let mut done = false;
     while !done && evaluated < options.budget {
         // Gather a batch. Every proposal in it sees the same feedback: the
-        // best and the last verdict as they were before the batch.
+        // best and the settled verdicts as they were before the batch. The
+        // window is the last 32, so a proposer still finds its own verdict
+        // when another job settled later and `last` moved on.
         let want = jobs.min(options.budget - evaluated);
         let mut batch: Vec<(String, String)> = Vec::with_capacity(want);
         while batch.len() < want {
             let next = {
-                let feedback = feedback_of(&best, &last);
+                let view: Vec<(&str, &Verdict)> = recent
+                    .iter()
+                    .map(|(text, verdict)| (text.as_str(), verdict))
+                    .collect();
+                let feedback = feedback_of(&best, &last, &view);
                 next_candidate(proposers, &mut cursor, &mut exhausted, &nugget, &feedback)?
             };
             let Some((name, text)) = next else {
                 done = true;
                 break;
             };
-            let repeat = journal.seen(&candidate_hash(&text))
-                || batch.iter().any(|(_, other)| *other == text);
-            if repeat {
+            let in_batch = batch.iter().any(|(_, other)| *other == text);
+            let seen = journal.seen(&candidate_hash(&text));
+            if in_batch || seen {
                 if note_unjournaled(&mut unjournaled) {
                     done = true;
+                    break;
+                }
+                // The same region is already waiting in this batch. Asking
+                // again repeats the prompt, and a model at temperature 0.2
+                // answers it the same way. Evaluate what we have.
+                if in_batch {
                     break;
                 }
                 continue;
@@ -253,6 +270,7 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
                 &journal_path,
                 &mut best,
                 &mut last,
+                &mut recent,
             )?;
             if outcome.recorded {
                 evaluated += 1;
@@ -436,7 +454,11 @@ fn restored_best(out_dir: &Path, journal_path: &Path) -> Result<Option<Best>> {
     Ok(Some(Best { text, score }))
 }
 
-fn feedback_of<'a>(best: &'a Option<Best>, last: &'a Option<(String, Verdict)>) -> Feedback<'a> {
+fn feedback_of<'a>(
+    best: &'a Option<Best>,
+    last: &'a Option<(String, Verdict)>,
+    recent: &'a [(&'a str, &'a Verdict)],
+) -> Feedback<'a> {
     Feedback {
         best: best
             .as_ref()
@@ -444,6 +466,14 @@ fn feedback_of<'a>(best: &'a Option<Best>, last: &'a Option<(String, Verdict)>) 
         last: last
             .as_ref()
             .map(|(text, verdict)| (text.as_str(), verdict)),
+        recent,
+    }
+}
+
+fn push_recent(recent: &mut Vec<(String, Verdict)>, candidate: &str, verdict: &Verdict) {
+    recent.push((candidate.to_string(), verdict.clone()));
+    if recent.len() > RECENT_LIMIT {
+        recent.drain(0..recent.len() - RECENT_LIMIT);
     }
 }
 
@@ -492,6 +522,7 @@ fn settle(
     journal_path: &Path,
     best: &mut Option<Best>,
     last: &mut Option<(String, Verdict)>,
+    recent: &mut Vec<(String, Verdict)>,
 ) -> Result<Outcome> {
     let verdict = match first {
         Ok(verdict) => verdict,
@@ -511,7 +542,7 @@ fn settle(
     journal.append(&verdict, proposer)?;
     let n = last_journal_n(journal_path)?;
     println!("{}", format_candidate_line(n, &verdict, proposer));
-    remember(nugget, candidate, &verdict, best, last, out_dir)?;
+    remember(nugget, candidate, &verdict, best, last, recent, out_dir)?;
     Ok(Outcome {
         recorded: true,
         stop: solved(nugget, &verdict),
@@ -559,6 +590,7 @@ fn remember(
     verdict: &Verdict,
     best: &mut Option<Best>,
     last: &mut Option<(String, Verdict)>,
+    recent: &mut Vec<(String, Verdict)>,
     out_dir: &Path,
 ) -> Result<()> {
     if verdict.status == Status::Proven {
@@ -578,6 +610,7 @@ fn remember(
         }
     }
     *last = Some((candidate.to_string(), verdict.clone()));
+    push_recent(recent, candidate, verdict);
     Ok(())
 }
 
@@ -661,6 +694,7 @@ mod tests {
             diagnostics: Vec::<Diagnostic>::new(),
             ms: Ms::default(),
             note: String::new(),
+            failure: None,
         }
     }
 
@@ -713,7 +747,16 @@ mod tests {
 
         let mut diverged = verdict(Status::Diverged, Some(0.0));
         diverged.note.clear();
-        remember(&nugget, "worse\n", &diverged, &mut best, &mut last, &dir).unwrap();
+        remember(
+            &nugget,
+            "worse\n",
+            &diverged,
+            &mut best,
+            &mut last,
+            &mut Vec::new(),
+            &dir,
+        )
+        .unwrap();
         assert!(best.is_none());
         assert!(!dir.join("best.rs").exists());
 
@@ -725,6 +768,7 @@ mod tests {
             &nondeterministic,
             &mut best,
             &mut last,
+            &mut Vec::new(),
             &dir,
         )
         .unwrap();
@@ -736,6 +780,7 @@ mod tests {
             &verdict(Status::Proven, Some(2.0)),
             &mut best,
             &mut last,
+            &mut Vec::new(),
             &dir,
         )
         .unwrap();
@@ -755,6 +800,7 @@ mod tests {
             &verdict(Status::Proven, Some(2.0)),
             &mut best,
             &mut last,
+            &mut Vec::new(),
             &dir,
         )
         .unwrap();
@@ -769,6 +815,7 @@ mod tests {
             &verdict(Status::Proven, Some(0.0)),
             &mut best,
             &mut last,
+            &mut Vec::new(),
             &dir,
         )
         .unwrap();
@@ -863,6 +910,7 @@ mod tests {
             &verdict(Status::Proven, Some(2.0)),
             &mut stored,
             &mut last,
+            &mut Vec::new(),
             &dir,
         )
         .unwrap();
@@ -899,6 +947,7 @@ mod tests {
         let feedback = Feedback {
             best: None,
             last: None,
+            recent: &[],
         };
         let mut first = List {
             label: "one",
@@ -1020,5 +1069,82 @@ mod tests {
             needs_backend.to_string().contains("--backend local"),
             "{needs_backend}"
         );
+    }
+
+    #[test]
+    fn feedback_keeps_the_last_32_settled_candidates() {
+        let mut recent = Vec::new();
+        let sample = verdict(Status::Scored, Some(1.0));
+        for index in 0..33 {
+            push_recent(&mut recent, &format!("c{index}"), &sample);
+        }
+        assert_eq!(recent.len(), 32);
+        assert_eq!(recent[0].0, "c1");
+        assert_eq!(recent[31].0, "c32");
+        let view: Vec<(&str, &Verdict)> = recent
+            .iter()
+            .map(|(text, verdict)| (text.as_str(), verdict))
+            .collect();
+        let feedback = feedback_of(&None, &None, &view);
+        assert_eq!(feedback.recent.len(), 32);
+        assert_eq!(feedback.recent[0].0, "c1");
+        assert_eq!(feedback.recent[31].0, "c32");
+        assert!(feedback.last.is_none());
+    }
+
+    /// Returns one fixed region. `third_saw_own` is set when the third call
+    /// already sees that region in [`Feedback::recent`], which is only true
+    /// if the duplicate ended the batch and the region was settled.
+    struct SameRegion {
+        calls: usize,
+        third_saw_own: bool,
+    }
+
+    impl Proposer for SameRegion {
+        fn name(&self) -> &str {
+            "same"
+        }
+
+        fn next(&mut self, _nugget: &Nugget, feedback: &Feedback) -> Result<Option<String>> {
+            self.calls += 1;
+            if self.calls == 3 {
+                self.third_saw_own = feedback
+                    .recent
+                    .iter()
+                    .any(|(text, _)| text.contains("std::fs"));
+            }
+            Ok(Some("    std::fs::read(\"a\");\n".to_string()))
+        }
+    }
+
+    #[test]
+    fn a_duplicate_in_the_batch_is_settled_before_the_next_ask() {
+        let out =
+            std::env::temp_dir().join(format!("crab-cage-run-batch-dup-{}", std::process::id()));
+        if out.exists() {
+            fs::remove_dir_all(&out).unwrap();
+        }
+        fs::create_dir_all(&out).unwrap();
+        let mut same = SameRegion {
+            calls: 0,
+            third_saw_own: false,
+        };
+        let mut proposers: Vec<&mut dyn Proposer> = vec![&mut same];
+        execute(
+            &RunOptions {
+                nugget_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("nuggets")
+                    .join("sum-squares"),
+                budget: 8,
+                jobs: 3,
+                out_dir: out,
+                lust_bin: None,
+                lust_daemon: false,
+            },
+            &mut proposers,
+        )
+        .unwrap();
+        assert!(same.third_saw_own, "calls {}", same.calls);
+        assert!(same.calls < 60, "calls {}", same.calls);
     }
 }

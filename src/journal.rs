@@ -322,6 +322,7 @@ mod tests {
                 oracle: 0,
             },
             note: String::new(),
+            failure: None,
         }
     }
 

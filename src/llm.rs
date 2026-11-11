@@ -193,6 +193,7 @@ impl LlmBackend for LocalBackend {
             SYSTEM_MUTATE,
             &mutation_prompt(request),
             self.timeout,
+            DEFAULT_TEMPERATURE,
         )?;
         parse_mutation(&content)
     }
@@ -348,17 +349,22 @@ struct ChatContent {
     content: String,
 }
 
+/// Sampling temperature for an ordinary completion. A caller that is
+/// retrying a repeated region passes a higher value.
+pub(crate) const DEFAULT_TEMPERATURE: f64 = 0.2;
+
 pub(crate) fn chat(
     endpoint: &str,
     model: &str,
     system: &str,
     user: &str,
     timeout: Duration,
+    temperature: f64,
 ) -> Result<String> {
     let url = format!("{endpoint}/chat/completions");
     let body = serde_json::to_string(&ChatRequest {
         model,
-        temperature: 0.2,
+        temperature,
         messages: [
             ChatMessage {
                 role: "system",
