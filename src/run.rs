@@ -18,7 +18,7 @@ use crate::journal::Journal;
 use crate::lust;
 use crate::nugget::{self, Nugget, Objective};
 use crate::pipeline::{self, candidate_hash, EvalOptions, Gate, Status, Toolchain, Verdict};
-use crate::proposer::{Feedback, LiteralProposer, Proposer};
+use crate::proposer::{Feedback, LiteralProposer, ModelProposer, Proposer};
 
 const HOST_MEMORY: u64 = 1024 * 1024 * 1024;
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -29,6 +29,8 @@ const UNJOURNALED_LIMIT: usize = 50;
 /// `--tweak` has no seed flag. 1 is the evolve command's default seed, so a
 /// tweak run repeats on every machine.
 const TWEAK_SEED: u64 = 1;
+const LOCAL_ENDPOINT: &str = "http://127.0.0.1:11434/v1";
+const LOCAL_MODEL: &str = "qwen2.5-coder:14b";
 
 /// Knobs for [`execute`]. The command line's default budget is 200.
 pub struct RunOptions {
@@ -87,6 +89,53 @@ pub fn attach_tweak<'a>(
     if let Some(proposer) = slot.as_mut() {
         proposers.push(proposer);
     }
+}
+
+/// Append the local-model proposer when `--backend local` is set.
+///
+/// Proposers already in the list stay ahead of it. `slot` owns the proposer
+/// for the rest of the run. The endpoint must be loopback http. The lust
+/// capability summary is read once here. It is empty with no `--lust-bin`,
+/// and empty when lust runs but the summary command fails. A `--lust-bin`
+/// that cannot be probed is an error.
+pub fn attach_model<'a>(
+    backend: Option<&str>,
+    endpoint: Option<&str>,
+    model: Option<&str>,
+    lust_bin: Option<&Path>,
+    slot: &'a mut Option<ModelProposer>,
+    proposers: &mut Vec<&'a mut dyn Proposer>,
+) -> Result<()> {
+    if backend.is_none() && endpoint.is_none() && model.is_none() {
+        return Ok(());
+    }
+    match backend {
+        Some("local") => {}
+        Some(other) => {
+            return Err(err(format!("unknown backend `{other}` (expected local)")));
+        }
+        None => {
+            return Err(err("--endpoint and --model need --backend local"));
+        }
+    }
+    let endpoint = endpoint.unwrap_or(LOCAL_ENDPOINT);
+    let model = model.unwrap_or(LOCAL_MODEL);
+    // Reject a non-loopback URL before probing lust.
+    crate::llm::normalize_endpoint(endpoint)?;
+    let capabilities = capability_text(lust_bin)?;
+    *slot = Some(ModelProposer::new(endpoint, model, capabilities)?);
+    if let Some(proposer) = slot.as_mut() {
+        proposers.push(proposer);
+    }
+    Ok(())
+}
+
+fn capability_text(lust_bin: Option<&Path>) -> Result<String> {
+    let Some(path) = lust_bin else {
+        return Ok(String::new());
+    };
+    let tool = lust::probe(path, PROBE_TIMEOUT)?;
+    Ok(lust::capabilities_summary(&tool))
 }
 
 /// Evaluate the seed, then ask `proposers` in round-robin until the budget is
@@ -822,5 +871,74 @@ mod tests {
         assert_eq!(proposers.len(), 2);
         assert_eq!(proposers[0].name(), "folder");
         assert_eq!(proposers[1].name(), "tweak");
+    }
+
+    #[test]
+    fn the_local_model_joins_after_the_proposers_already_there() {
+        let mut folder = List {
+            label: "folder",
+            left: vec!["a".to_string()],
+        };
+        let mut proposers: Vec<&mut dyn Proposer> = vec![&mut folder];
+        let mut slot = None;
+        attach_model(None, None, None, None, &mut slot, &mut proposers).unwrap();
+        assert_eq!(proposers.len(), 1);
+        assert!(slot.is_none());
+
+        let mut folder = List {
+            label: "folder",
+            left: vec!["a".to_string()],
+        };
+        let mut proposers: Vec<&mut dyn Proposer> = vec![&mut folder];
+        let mut slot = None;
+        attach_model(
+            Some("local"),
+            None,
+            Some("demo"),
+            None,
+            &mut slot,
+            &mut proposers,
+        )
+        .unwrap();
+        assert_eq!(proposers.len(), 2);
+        assert_eq!(proposers[0].name(), "folder");
+        assert_eq!(proposers[1].name(), "local");
+
+        let mut slot = None;
+        let mut proposers: Vec<&mut dyn Proposer> = Vec::new();
+        let refused = attach_model(
+            Some("local"),
+            Some("http://api.openai.com/v1"),
+            None,
+            None,
+            &mut slot,
+            &mut proposers,
+        )
+        .unwrap_err();
+        assert!(refused.to_string().contains("refusing"), "{refused}");
+        drop(proposers);
+        assert!(slot.is_none());
+
+        let mut slot = None;
+        let mut proposers: Vec<&mut dyn Proposer> = Vec::new();
+        let unknown =
+            attach_model(Some("mock"), None, None, None, &mut slot, &mut proposers).unwrap_err();
+        assert!(unknown.to_string().contains("unknown backend"), "{unknown}");
+
+        let mut slot = None;
+        let mut proposers: Vec<&mut dyn Proposer> = Vec::new();
+        let needs_backend = attach_model(
+            None,
+            Some("http://127.0.0.1:11434/v1"),
+            None,
+            None,
+            &mut slot,
+            &mut proposers,
+        )
+        .unwrap_err();
+        assert!(
+            needs_backend.to_string().contains("--backend local"),
+            "{needs_backend}"
+        );
     }
 }

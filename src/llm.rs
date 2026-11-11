@@ -37,16 +37,9 @@ pub struct MutationResponse {
     pub note: String,
 }
 
-#[derive(Clone, Debug)]
-pub struct RepairRequest {
-    pub source: String,
-    pub diagnostics: String,
-}
-
 pub trait LlmBackend {
     fn name(&self) -> &str;
     fn mutate(&self, request: &MutationRequest) -> Result<MutationResponse>;
-    fn repair(&self, request: &RepairRequest) -> Result<Option<String>>;
 }
 
 /// Deterministic stand-in for the structural mutation operator.
@@ -64,13 +57,6 @@ impl LlmBackend for MockBackend {
 
     fn mutate(&self, request: &MutationRequest) -> Result<MutationResponse> {
         Ok(mock_proposal(request.generation, request.law))
-    }
-
-    fn repair(&self, request: &RepairRequest) -> Result<Option<String>> {
-        if request.source.contains("BROKEN_TOKEN") || request.diagnostics.contains("BROKEN_TOKEN") {
-            return Ok(Some(request.source.replace("BROKEN_TOKEN", "0.0")));
-        }
-        Ok(None)
     }
 }
 
@@ -210,25 +196,6 @@ impl LlmBackend for LocalBackend {
         )?;
         parse_mutation(&content)
     }
-
-    fn repair(&self, request: &RepairRequest) -> Result<Option<String>> {
-        let content = chat(
-            &self.endpoint,
-            &self.model,
-            SYSTEM_REPAIR,
-            &format!(
-                "Diagnostics:\n{}\n\nSource:\n{}",
-                request.diagnostics, request.source
-            ),
-            self.timeout,
-        )?;
-        let source = strip_fences(&content);
-        if source.contains("fn control") {
-            Ok(Some(source))
-        } else {
-            Ok(None)
-        }
-    }
 }
 
 pub fn normalize_endpoint(raw: impl AsRef<str>) -> Result<String> {
@@ -325,13 +292,32 @@ fn match_gene_name(name: &str) -> Option<&'static str> {
         .map(|(known, _)| *known)
 }
 
-fn strip_fences(text: &str) -> String {
+/// Drop one leading and one trailing markdown fence.
+///
+/// A language tag on the opening fence (`json`, `rust`, empty) goes with it.
+/// The body keeps its leading indent. With no fence, the trimmed text is
+/// returned, which is what the mutation parser already relied on.
+pub(crate) fn strip_fences(text: &str) -> String {
     let trimmed = text.trim();
-    let without = trimmed
-        .strip_prefix("```json")
-        .or_else(|| trimmed.strip_prefix("```"))
-        .unwrap_or(trimmed);
-    without.trim().trim_end_matches("```").trim().to_string()
+    let Some(after) = trimmed.strip_prefix("```") else {
+        return trimmed.to_string();
+    };
+    let body = match after.find('\n') {
+        Some(index) if is_fence_tag(&after[..index]) => &after[index + 1..],
+        _ => after,
+    };
+    let body = body.trim_end();
+    let body = match body.strip_suffix("```") {
+        Some(kept) => kept.trim_end(),
+        None => body,
+    };
+    body.to_string()
+}
+
+fn is_fence_tag(tag: &str) -> bool {
+    tag.trim()
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-')
 }
 
 #[derive(Serialize)]
@@ -362,7 +348,7 @@ struct ChatContent {
     content: String,
 }
 
-fn chat(
+pub(crate) fn chat(
     endpoint: &str,
     model: &str,
     system: &str,
@@ -402,12 +388,6 @@ The plant has many measured inputs (noisy delayed temperature, setpoint, ambient
 and two actuators (heater duty, coolant valve) plus a one-step temperature prediction. \
 Reply with JSON only. Never claim to call a network. Never emit unsafe Rust.";
 
-const SYSTEM_REPAIR: &str = "\
-You repair a Rust controller so it type-checks in lust's sandbox. \
-Return only the full Rust source. Keep it valid Rust. \
-No unsafe, no async, no std::fs, std::net, std::env, std::process, or threads. \
-std::io in main is allowed. Preserve fn control's signature.";
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,20 +398,6 @@ mod tests {
         assert_eq!(first.law, Some(LawKind::Pi));
         let again = mock_proposal(2, LawKind::Pi);
         assert!(again.law.is_none());
-    }
-
-    #[test]
-    fn mock_repairs_the_broken_token() {
-        let backend = MockBackend;
-        let fixed = backend
-            .repair(&RepairRequest {
-                source: "let x = BROKEN_TOKEN;".into(),
-                diagnostics: "cannot find BROKEN_TOKEN".into(),
-            })
-            .unwrap()
-            .unwrap();
-        assert!(fixed.contains("0.0"));
-        assert!(!fixed.contains("BROKEN_TOKEN"));
     }
 
     #[test]
@@ -452,5 +418,18 @@ mod tests {
         assert_eq!(parsed.law, Some(LawKind::Pi));
         assert_eq!(parsed.edits.len(), 1);
         assert_eq!(parsed.edits[0].name, "ki");
+    }
+
+    #[test]
+    fn strips_a_language_fence_and_keeps_the_region_indent() {
+        assert_eq!(
+            strip_fences("```rust\n    xs.iter().sum()\n```\n"),
+            "    xs.iter().sum()"
+        );
+        assert_eq!(
+            strip_fences("```json\n{\"law\":\"pi\"}\n```"),
+            "{\"law\":\"pi\"}"
+        );
+        assert_eq!(strip_fences("  plain  "), "plain");
     }
 }

@@ -130,6 +130,15 @@ struct RunArgs {
     /// Round-robin with `--candidates` when both are set.
     #[arg(long)]
     tweak: bool,
+    /// `local` asks a loopback model for each region.
+    #[arg(long)]
+    backend: Option<String>,
+    /// Loopback model URL. Default http://127.0.0.1:11434/v1.
+    #[arg(long)]
+    endpoint: Option<String>,
+    /// Model name sent to that URL. Default qwen2.5-coder:14b.
+    #[arg(long)]
+    model: Option<String>,
     /// Maximum number of candidates to evaluate, including the seed.
     #[arg(long, default_value_t = 200)]
     budget: usize,
@@ -399,6 +408,15 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
     }
     let mut tweak = None;
     run::attach_tweak(args.tweak, &mut tweak, &mut proposers);
+    let mut model = None;
+    run::attach_model(
+        args.backend.as_deref(),
+        args.endpoint.as_deref(),
+        args.model.as_deref(),
+        args.lust_bin.as_deref(),
+        &mut model,
+        &mut proposers,
+    )?;
     let output = run::execute(
         &run::RunOptions {
             nugget_dir: args.nugget_dir,

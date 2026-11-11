@@ -154,6 +154,31 @@ fn flags_from_usage(text: &str) -> (bool, bool) {
     )
 }
 
+/// Text of `lust capabilities --summary`.
+///
+/// The daemon is forced off for this call. Stdout is the summary; stderr is
+/// used when stdout is empty. A spawn failure, a timeout, or a non-zero exit
+/// is an empty string, so a missing summary does not stop a run.
+pub fn capabilities_summary(tool: &LustTool) -> String {
+    let Ok(result) = tool_output(
+        &tool.bin,
+        &["capabilities", "--summary"],
+        Duration::from_secs(10),
+        &[("LUST_NO_DAEMON", "1")],
+        None,
+    ) else {
+        return String::new();
+    };
+    if !result.success() {
+        return String::new();
+    }
+    if result.stdout.trim().is_empty() {
+        result.stderr
+    } else {
+        result.stdout
+    }
+}
+
 /// `2s` when the duration is a whole number of seconds, otherwise `500ms`.
 pub fn format_time_limit(limit: Duration) -> String {
     let ms = limit.as_millis();
@@ -781,5 +806,84 @@ mod tests {
         assert_eq!(diags[1].line, 3);
         assert_eq!(diags[1].col, 20);
         assert_eq!(diags[1].auto_edits, 0);
+    }
+
+    #[test]
+    fn capabilities_summary_reads_stdout_with_the_daemon_forced_off() {
+        let dir = std::env::temp_dir().join(format!("crab-cage-lust-caps-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let summary = compile_probe(
+            &dir,
+            "summary",
+            r#"
+fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let daemon = match std::env::var("LUST_NO_DAEMON") {
+        Ok(value) => value,
+        Err(_) => "unset".to_string(),
+    };
+    if args.len() == 2 && args[0] == "capabilities" && args[1] == "--summary" {
+        println!("summary-text");
+        println!("no_daemon={daemon}");
+        return;
+    }
+    std::process::exit(2);
+}
+"#,
+        );
+        let failing = compile_probe(&dir, "failing", "fn main() { std::process::exit(1); }\n");
+        // `daemon: true` would omit LUST_NO_DAEMON for check and build.
+        // The summary call sets it itself.
+        let text = capabilities_summary(&LustTool {
+            bin: summary,
+            version: "test".into(),
+            supports_max_memory: false,
+            supports_time_limit: false,
+            daemon: true,
+        });
+        assert!(text.contains("summary-text"), "{text}");
+        assert!(text.contains("no_daemon=1"), "{text}");
+        assert_eq!(
+            capabilities_summary(&LustTool {
+                bin: failing,
+                version: "test".into(),
+                supports_max_memory: false,
+                supports_time_limit: false,
+                daemon: false,
+            }),
+            ""
+        );
+        assert_eq!(
+            capabilities_summary(&LustTool {
+                bin: dir.join("missing-lust"),
+                version: "test".into(),
+                supports_max_memory: false,
+                supports_time_limit: false,
+                daemon: false,
+            }),
+            ""
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    fn compile_probe(dir: &Path, name: &str, source: &str) -> PathBuf {
+        let src = dir.join(format!("{name}.rs"));
+        fs::write(&src, source).unwrap();
+        let exe = dir.join(if cfg!(windows) {
+            format!("{name}.exe")
+        } else {
+            name.to_string()
+        });
+        let status = std::process::Command::new("rustc")
+            .arg("--edition")
+            .arg("2021")
+            .arg("-o")
+            .arg(&exe)
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(status.success(), "rustc {name}");
+        exe
     }
 }
