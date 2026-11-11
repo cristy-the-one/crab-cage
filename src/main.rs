@@ -135,6 +135,11 @@ struct RunArgs {
     /// lust binary. Without it, rustc runs the fast gates.
     #[arg(long)]
     lust_bin: Option<PathBuf>,
+    /// Start lust cold for every candidate. By default a run with
+    /// --lust-bin keeps lust's daemon warm in `<out>/work` and stops it when
+    /// the run ends.
+    #[arg(long)]
+    no_lust_daemon: bool,
 }
 
 fn main() -> ExitCode {
@@ -393,6 +398,7 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
             nugget_dir: args.nugget_dir,
             budget: args.budget,
             out_dir: args.out,
+            lust_daemon: args.lust_bin.is_some() && !args.no_lust_daemon,
             lust_bin: args.lust_bin,
         },
         &mut proposers,

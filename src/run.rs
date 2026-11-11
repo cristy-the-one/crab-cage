@@ -17,7 +17,7 @@ use crate::error::{err, Result};
 use crate::journal::Journal;
 use crate::lust;
 use crate::nugget::{self, Nugget, Objective};
-use crate::pipeline::{self, EvalOptions, Gate, Status, Toolchain, Verdict};
+use crate::pipeline::{self, candidate_hash, EvalOptions, Gate, Status, Toolchain, Verdict};
 use crate::proposer::{Feedback, Proposer};
 
 const HOST_MEMORY: u64 = 1024 * 1024 * 1024;
@@ -34,6 +34,10 @@ pub struct RunOptions {
     pub budget: usize,
     pub out_dir: PathBuf,
     pub lust_bin: Option<PathBuf>,
+    /// Use lust's warm daemon for the length of the run. It is started in
+    /// `<out>/work`, every candidate is compiled as `slot.rs` there, and it
+    /// is stopped when the run ends. Ignored without `lust_bin`.
+    pub lust_daemon: bool,
 }
 
 /// Whether this run's journal meets the objective's exit rule.
@@ -47,6 +51,15 @@ struct Best {
     /// Present when `best.region.rs` is the text of `score`'s journal line.
     text: Option<String>,
     score: f64,
+}
+
+/// Stops the lust daemon started in this directory when it is dropped.
+struct DaemonGuard(PathBuf);
+
+impl Drop for DaemonGuard {
+    fn drop(&mut self) {
+        lust::stop_daemon(&self.0);
+    }
 }
 
 struct Outcome {
@@ -72,11 +85,21 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
         Some(path) => Some(lust::probe(path, PROBE_TIMEOUT)?),
         None => None,
     };
+    let mut lust = lust;
+    let work_dir = options.out_dir.join("work");
+    // Declared before anything that can fail, so the daemon is stopped on
+    // every way out of this function, an error included.
+    let _daemon = match lust.as_mut() {
+        Some(tool) if options.lust_daemon => {
+            tool.daemon = true;
+            Some(DaemonGuard(work_dir.clone()))
+        }
+        _ => None,
+    };
     let tools = Toolchain { lust };
     fs::create_dir_all(&options.out_dir)?;
     let journal_path = options.out_dir.join("journal.jsonl");
     let mut journal = Journal::open(&journal_path)?;
-    let work_dir = options.out_dir.join("work");
 
     let mut best = restored_best(&options.out_dir, &journal_path)?;
     let mut last: Option<(String, Verdict)> = None;
@@ -466,17 +489,6 @@ fn last_journal_n(path: &Path) -> Result<u64> {
         .ok_or_else(|| err(format!("{}: journal line has no n", path.display())))
 }
 
-/// FNV-1a 64, 16 lowercase hex digits. `pipeline` keeps this private, and
-/// this package does not edit that file. The vectors match its test.
-fn candidate_hash(candidate: &str) -> String {
-    let mut hash = 0xcbf29ce484222325u64;
-    for &byte in candidate.as_bytes() {
-        hash ^= u64::from(byte);
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    format!("{hash:016x}")
-}
-
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -517,13 +529,6 @@ mod tests {
                 expected: None,
             }],
         }
-    }
-
-    #[test]
-    fn candidate_hash_matches_the_pipeline_vectors() {
-        assert_eq!(candidate_hash(""), "cbf29ce484222325");
-        assert_eq!(candidate_hash("a"), "af63dc4c8601ec8c");
-        assert_eq!(candidate_hash("foobar"), "85944171f73967e8");
     }
 
     #[test]

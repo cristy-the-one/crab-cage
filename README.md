@@ -84,6 +84,8 @@ lust keeps one warm session per source path, so with the daemon on every candida
 
 The daemon keeps running after `crab-cage` exits. It stops on its own after 30 minutes idle, or at once when `work/.lust-daemon-*.sock` is deleted.
 
+`crab-cage run` with `--lust-bin` uses the daemon without being asked: it starts lust in `<out>/work`, compiles every candidate as `slot.rs`, and removes the socket file when the run ends, so no daemon is left behind. `--no-lust-daemon` starts lust cold for every candidate instead. A run of 40 candidates on the demo nugget took 18 s with the daemon and 51 s without, measured back to back on the same laptop.
+
 Use a lust built from lust-lang `next` at `f2dc9a8b` or later. An older lust lets its daemon keep the caller's output pipes; Crab Cage no longer hangs on that, but each lust call then waits an extra half second.
 
 ## A local model
