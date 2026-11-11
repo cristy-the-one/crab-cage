@@ -3,6 +3,7 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 use crab_cage::nugget;
 
@@ -403,6 +404,68 @@ fn minimize_exits_zero_when_any_candidate_is_proven() {
     assert_eq!(records[0]["score"], 4.0);
     let region = fs::read_to_string(out.join("best.region.rs")).unwrap();
     assert_eq!(region, "println!(\"score: 4\");\n");
+}
+
+#[test]
+fn tweak_on_one_literal_stops_after_fifty_repeats() {
+    let out = scratch("tweak-stop");
+    let nugget_dir = scratch("tweak-stop-nugget");
+    // `std::fs` dies in the prefilter, so a repeat never reaches rustc.
+    // The only literal is `1`, whose legal steps are 0, 2, and 3.
+    write_probe(
+        &nugget_dir,
+        "pass_all",
+        "    std::fs::read(\"a\");\n    let n = 1;\n",
+        Some("ok\n"),
+    );
+    let started = Instant::now();
+    let output = run(
+        &out,
+        &[
+            "run",
+            nugget_dir.to_str().unwrap(),
+            "--tweak",
+            "--budget",
+            "2000",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    let elapsed = started.elapsed();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout {stdout} stderr {stderr}"
+    );
+    assert!(
+        stdout.contains("stopped: 50 proposals in a row left no journal line"),
+        "{stdout}"
+    );
+    let records = journal_records(&out);
+    eprintln!(
+        "tweak-stop journal_lines={} elapsed_ms={}",
+        records.len(),
+        elapsed.as_millis()
+    );
+    // Seed 1 reaches every legal step of `1` (0, 2, 3) before fifty repeats.
+    assert_eq!(records.len(), 4, "{stdout}");
+    assert_eq!(records[0]["proposer"], "seed");
+    assert!(records[1..]
+        .iter()
+        .all(|record| record["proposer"] == "tweak"));
+    for record in &records {
+        assert_eq!(record["status"], "rejected");
+        assert_eq!(record["gate"], "prefilter");
+        assert_eq!(record["ms"]["build"], 0);
+        assert_eq!(record["ms"]["run"], 0);
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "tweak stop spun: {elapsed:?}, journal lines {}",
+        records.len()
+    );
 }
 
 fn write_probe(dir: &std::path::Path, objective: &str, seed: &str, expected: Option<&str>) {

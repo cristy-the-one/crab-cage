@@ -18,7 +18,7 @@ use crate::journal::Journal;
 use crate::lust;
 use crate::nugget::{self, Nugget, Objective};
 use crate::pipeline::{self, candidate_hash, EvalOptions, Gate, Status, Toolchain, Verdict};
-use crate::proposer::{Feedback, Proposer};
+use crate::proposer::{Feedback, LiteralProposer, Proposer};
 
 const HOST_MEMORY: u64 = 1024 * 1024 * 1024;
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(180);
@@ -26,6 +26,9 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Proposals that are already in the journal, or whose evaluation returns an
 /// error, do not append a line. This many in a row ends the run.
 const UNJOURNALED_LIMIT: usize = 50;
+/// `--tweak` has no seed flag. 1 is the evolve command's default seed, so a
+/// tweak run repeats on every machine.
+const TWEAK_SEED: u64 = 1;
 
 /// Knobs for [`execute`]. The command line's default budget is 200.
 pub struct RunOptions {
@@ -65,6 +68,25 @@ impl Drop for DaemonGuard {
 struct Outcome {
     recorded: bool,
     stop: bool,
+}
+
+/// Append the literal-tweak proposer when `--tweak` is set.
+///
+/// Proposers already in the list stay ahead of it, so a folder proposer still
+/// goes first and the two alternate. `slot` owns the proposer for the rest of
+/// the run.
+pub fn attach_tweak<'a>(
+    enabled: bool,
+    slot: &'a mut Option<LiteralProposer>,
+    proposers: &mut Vec<&'a mut dyn Proposer>,
+) {
+    if !enabled {
+        return;
+    }
+    *slot = Some(LiteralProposer::new(TWEAK_SEED));
+    if let Some(proposer) = slot.as_mut() {
+        proposers.push(proposer);
+    }
 }
 
 /// Evaluate the seed, then ask `proposers` in round-robin until the budget is
@@ -776,5 +798,29 @@ mod tests {
             ("one".to_string(), "c".to_string())
         );
         assert_eq!(pull(&mut proposers), None);
+    }
+
+    #[test]
+    fn tweak_joins_the_round_robin_after_the_proposers_already_there() {
+        let mut folder = List {
+            label: "folder",
+            left: vec!["a".to_string()],
+        };
+        let mut proposers: Vec<&mut dyn Proposer> = vec![&mut folder];
+        let mut slot = None;
+        attach_tweak(false, &mut slot, &mut proposers);
+        assert_eq!(proposers.len(), 1);
+        assert_eq!(proposers[0].name(), "folder");
+
+        let mut folder = List {
+            label: "folder",
+            left: vec!["a".to_string()],
+        };
+        let mut proposers: Vec<&mut dyn Proposer> = vec![&mut folder];
+        let mut slot = None;
+        attach_tweak(true, &mut slot, &mut proposers);
+        assert_eq!(proposers.len(), 2);
+        assert_eq!(proposers[0].name(), "folder");
+        assert_eq!(proposers[1].name(), "tweak");
     }
 }
