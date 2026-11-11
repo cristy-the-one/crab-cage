@@ -11,6 +11,7 @@ pub mod http;
 pub mod llm;
 pub mod lust;
 pub mod models;
+pub mod nugget;
 pub mod plant;
 pub mod report;
 pub mod rng;

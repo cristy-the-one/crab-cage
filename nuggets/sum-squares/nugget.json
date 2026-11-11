@@ -1,0 +1,6 @@
+{
+  "name": "sum-squares",
+  "objective": "pass_all",
+  "timeout_ms": 2000,
+  "max_memory": "64M"
+}
