@@ -24,6 +24,14 @@ pub struct LustTool {
     pub version: String,
     pub supports_max_memory: bool,
     pub supports_time_limit: bool,
+    /// Let `check` and `build` use lust's warm daemon. Off after `probe`.
+    ///
+    /// The daemon keeps one warm session per source path, so it pays only
+    /// when every candidate is written to the same file (see
+    /// `pipeline::evaluate`). lust is then started in the source's
+    /// directory, which is where it puts its socket file and cache.
+    /// `stop_daemon` on that directory ends the daemon.
+    pub daemon: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -84,7 +92,13 @@ pub fn which(name: &str) -> Option<PathBuf> {
 }
 
 pub fn probe(bin: &Path, timeout: Duration) -> Result<LustTool> {
-    let version = tool_output(bin, &["--version"], timeout, &[("LUST_NO_DAEMON", "1")])?;
+    let version = tool_output(
+        bin,
+        &["--version"],
+        timeout,
+        &[("LUST_NO_DAEMON", "1")],
+        None,
+    )?;
     let version = first_line(&version.stdout, &version.stderr);
     if version.is_empty() {
         return Err(err(format!(
@@ -95,12 +109,13 @@ pub fn probe(bin: &Path, timeout: Duration) -> Result<LustTool> {
     // Real lust prints its usage text when it is run with no arguments.
     // Only the `usage:` line and its indented continuation lines count:
     // an error message that merely contains a flag name proves nothing.
-    let usage = tool_output(bin, &[], timeout, &[("LUST_NO_DAEMON", "1")]).unwrap_or(ExecResult {
-        kind: StopKind::Exited(2),
-        stdout: String::new(),
-        stderr: String::new(),
-        elapsed: Duration::ZERO,
-    });
+    let usage =
+        tool_output(bin, &[], timeout, &[("LUST_NO_DAEMON", "1")], None).unwrap_or(ExecResult {
+            kind: StopKind::Exited(2),
+            stdout: String::new(),
+            stderr: String::new(),
+            elapsed: Duration::ZERO,
+        });
     let usage_text = format!(
         "{}
 {}",
@@ -110,6 +125,7 @@ pub fn probe(bin: &Path, timeout: Duration) -> Result<LustTool> {
     Ok(LustTool {
         bin: bin.to_path_buf(),
         version,
+        daemon: false,
         supports_max_memory,
         supports_time_limit,
     })
@@ -160,7 +176,8 @@ pub fn check(tool: &LustTool, source: &Path, timeout: Duration) -> Result<CheckR
             &source.display().to_string(),
         ],
         timeout,
-        &[("LUST_NO_DAEMON", "1")],
+        daemon_env(tool),
+        daemon_dir(tool, source),
     )?;
     let text = format!("{}{}", result.stdout, result.stderr);
     let diagnostics = parse_diagnostics(&text);
@@ -174,6 +191,7 @@ pub fn fix(tool: &LustTool, source: &Path, timeout: Duration) -> Result<ExecResu
         &["fix", "--all", "--sandbox", &source.display().to_string()],
         timeout,
         &[("LUST_NO_DAEMON", "1")],
+        None,
     )?;
     if with_sandbox.success() {
         return Ok(with_sandbox);
@@ -190,6 +208,7 @@ pub fn fix(tool: &LustTool, source: &Path, timeout: Duration) -> Result<ExecResu
         &["fix", "--all", &source.display().to_string()],
         timeout,
         &[("LUST_NO_DAEMON", "1")],
+        None,
     )
 }
 
@@ -217,7 +236,13 @@ pub fn build(
     args.push(output.display().to_string());
     args.push(source.display().to_string());
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let result = tool_output(&tool.bin, &arg_refs, timeout, &[("LUST_NO_DAEMON", "1")])?;
+    let result = tool_output(
+        &tool.bin,
+        &arg_refs,
+        timeout,
+        daemon_env(tool),
+        daemon_dir(tool, source),
+    )?;
     if !result.success() {
         return Err(err(format!(
             "lust build failed ({:?}): {}",
@@ -300,6 +325,7 @@ pub fn compile_rustc(
         ],
         timeout,
         &[],
+        None,
     )
     .map_err(|error| RustcError::Failed {
         message: error.message,
@@ -390,14 +416,53 @@ pub fn run_session(bin: &Path, limits: &Limits) -> Result<Session> {
     Session::spawn(cmd, limits)
 }
 
+/// The environment for a `check` or `build`: the daemon is off unless the
+/// tool asks for it.
+fn daemon_env(tool: &LustTool) -> &'static [(&'static str, &'static str)] {
+    if tool.daemon {
+        &[]
+    } else {
+        &[("LUST_NO_DAEMON", "1")]
+    }
+}
+
+/// Where lust is started when the daemon is on: the source's directory, so
+/// the socket file and `.lust-cache` land there and not in the caller's
+/// current directory.
+fn daemon_dir<'a>(tool: &LustTool, source: &'a Path) -> Option<&'a Path> {
+    if !tool.daemon {
+        return None;
+    }
+    source.parent().filter(|dir| !dir.as_os_str().is_empty())
+}
+
+/// End the lust daemon that was started from `dir`, if there is one, by
+/// removing its socket file. That is lust's documented stop.
+pub fn stop_daemon(dir: &Path) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with(".lust-daemon-") && name.ends_with(".sock") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn tool_output(
     bin: &Path,
     args: &[&str],
     timeout: Duration,
     env: &[(&str, &str)],
+    cwd: Option<&Path>,
 ) -> Result<ExecResult> {
     let mut cmd = Command::new(bin);
     cmd.args(args);
+    if let Some(dir) = cwd {
+        cmd.current_dir(dir);
+    }
     for (key, value) in env {
         cmd.env(key, value);
     }
@@ -549,6 +614,48 @@ pub fn ensure_parent(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool(daemon: bool) -> LustTool {
+        LustTool {
+            bin: PathBuf::from("lust"),
+            version: "lust 0.3.0".into(),
+            supports_max_memory: true,
+            supports_time_limit: true,
+            daemon,
+        }
+    }
+
+    #[test]
+    fn the_daemon_is_off_unless_the_tool_asks_for_it() {
+        assert_eq!(daemon_env(&tool(false)), &[("LUST_NO_DAEMON", "1")]);
+        assert!(daemon_env(&tool(true)).is_empty());
+        let source = Path::new("work").join("slot.rs");
+        assert_eq!(daemon_dir(&tool(false), &source), None);
+        assert_eq!(daemon_dir(&tool(true), &source), Some(Path::new("work")));
+        // A bare file name has no directory to start lust in.
+        assert_eq!(daemon_dir(&tool(true), Path::new("slot.rs")), None);
+    }
+
+    #[test]
+    fn stop_daemon_removes_only_the_socket_files() {
+        let dir = std::env::temp_dir().join(format!("crab-cage-stop-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        for name in [
+            ".lust-daemon-abc123.sock",
+            ".lust-daemon-abc123.sock.lock",
+            "slot.rs",
+        ] {
+            fs::write(dir.join(name), "x").unwrap();
+        }
+        stop_daemon(&dir);
+        assert!(!dir.join(".lust-daemon-abc123.sock").exists());
+        assert!(dir.join(".lust-daemon-abc123.sock.lock").exists());
+        assert!(dir.join("slot.rs").exists());
+        // A missing directory is not an error.
+        stop_daemon(&dir.join("absent"));
+        let _ = fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn classifies_lust_memory_and_timeout() {

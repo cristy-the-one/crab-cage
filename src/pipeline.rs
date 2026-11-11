@@ -15,6 +15,10 @@ use crate::lust::{self, LustTool, RunClass};
 use crate::nugget::{Nugget, Objective};
 use crate::supervisor::{self, StopKind};
 
+/// The file lust compiles when its daemon is on. One path for every
+/// candidate keeps the daemon's session warm.
+pub const SLOT_FILE: &str = "slot.rs";
+
 /// Where the fast gates run. `lust: None` compiles them with rustc.
 pub struct Toolchain {
     pub lust: Option<LustTool>,
@@ -139,12 +143,24 @@ pub fn evaluate(
 
     fs::create_dir_all(&opts.work_dir)?;
     let source = opts.work_dir.join(format!("{hash}.rs"));
-    fs::write(&source, nugget.splice(candidate))?;
+    let spliced = nugget.splice(candidate);
+    fs::write(&source, &spliced)?;
+    // lust's daemon keeps one warm session per source path. With the daemon
+    // on, lust always compiles the same file, `slot.rs`, rewritten for each
+    // candidate; `<hash>.rs` stays as the record and is what rustc compiles.
+    let fast_source = match &tools.lust {
+        Some(tool) if tool.daemon => {
+            let slot = opts.work_dir.join(SLOT_FILE);
+            fs::write(&slot, &spliced)?;
+            slot
+        }
+        _ => source.clone(),
+    };
 
     if let Some(tool) = &tools.lust {
         verdict.gate = Gate::Check;
         let started = Instant::now();
-        let checked = lust::check(tool, &source, opts.compile_timeout)?;
+        let checked = lust::check(tool, &fast_source, opts.compile_timeout)?;
         verdict.ms.check = elapsed_ms(started);
         if !checked.ok {
             verdict.diagnostics = map_diagnostics(&checked.diagnostics, nugget, candidate);
@@ -161,7 +177,7 @@ pub fn evaluate(
     let built = if let Some(tool) = &tools.lust {
         lust::build(
             tool,
-            &source,
+            &fast_source,
             &binary,
             nugget.max_memory,
             Some(nugget.timeout),
@@ -252,7 +268,10 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn candidate_hash(candidate: &str) -> String {
+/// The `hash` of a verdict: FNV-1a 64 of the candidate text, as 16 hex
+/// digits. The journal is keyed by it, so a caller that asks the journal
+/// whether a candidate was seen must use this function.
+pub fn candidate_hash(candidate: &str) -> String {
     format!("{:016x}", fnv1a64(candidate.as_bytes()))
 }
 

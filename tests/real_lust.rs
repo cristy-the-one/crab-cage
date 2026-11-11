@@ -1,7 +1,8 @@
 //! Tests that talk to a real lust binary. They run only when
 //! `CRAB_LUST_BIN` names one:
 //! `CRAB_LUST_BIN=path/to/lust.exe cargo test --test real_lust`.
-//! Set `LUST_NO_DAEMON=1` as well so lust leaves no background daemon.
+//! The first two tests never start lust's daemon. The daemon test does, and
+//! stops it at the end; with `LUST_NO_DAEMON=1` set it still passes, cold.
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -59,4 +60,81 @@ fn real_lust_probe_returns_quickly() {
         elapsed < Duration::from_secs(15),
         "probe took {elapsed:?}, limit 15 s"
     );
+}
+
+/// With the daemon on, every candidate is compiled as `slot.rs` in the work
+/// directory, lust runs there, and the verdicts are the same as without it.
+/// Run without `LUST_NO_DAEMON` in the environment, or lust ignores the daemon.
+#[test]
+fn real_lust_daemon_gives_the_same_verdicts_from_one_slot_file() {
+    use crab_cage::nugget;
+    use crab_cage::pipeline::{evaluate, EvalOptions, Gate, Status, Toolchain, SLOT_FILE};
+
+    let Some(bin) = real_lust() else { return };
+    let demo = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("nuggets/sum-squares");
+    let nugget = nugget::load(&demo).expect("load the demo nugget");
+    let work = std::env::temp_dir().join(format!("crab-cage-real-daemon-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let mut tool = lust::probe(&bin, Duration::from_secs(15)).expect("probe");
+    tool.daemon = true;
+    let tools = Toolchain { lust: Some(tool) };
+    let opts = EvalOptions {
+        work_dir: work.clone(),
+        host_memory: 1024 * 1024 * 1024,
+        compile_timeout: Duration::from_secs(120),
+        oracle: false,
+    };
+
+    let good = evaluate(
+        &nugget,
+        "    xs.iter().map(|x| x * x).sum()
+",
+        &tools,
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(good.status, Status::Scored, "{good:?}");
+    assert_eq!(good.score, Some(0.0));
+    let wrong = evaluate(
+        &nugget,
+        "    xs.iter().sum()
+",
+        &tools,
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(wrong.status, Status::Scored, "{wrong:?}");
+    assert_eq!(wrong.score, Some(3.0));
+    let broken = evaluate(
+        &nugget,
+        "    let v: i64 = \"no\";
+    v
+",
+        &tools,
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(broken.gate, Gate::Check, "{broken:?}");
+    assert_eq!(broken.diagnostics[0].line, 1);
+    // A second good candidate after a rejected one: the slot must not keep
+    // the rejected text.
+    let again = evaluate(
+        &nugget,
+        "    xs.iter().map(|x| x * x).sum::<i64>()
+",
+        &tools,
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(again.score, Some(0.0), "{again:?}");
+
+    assert!(work.join(SLOT_FILE).is_file());
+    assert!(work.join(format!("{}.rs", good.hash)).is_file());
+    println!(
+        "daemon ms: first check {} build {}, fourth check {} build {}",
+        good.ms.check, good.ms.build, again.ms.check, again.ms.build
+    );
+    lust::stop_daemon(&work);
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = std::fs::remove_dir_all(&work);
 }

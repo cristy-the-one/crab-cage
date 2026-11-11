@@ -72,6 +72,20 @@ With a 0.3.0 binary the winner is checked with `lust check --json --sandbox` and
 
 `--max-memory` defaults to `128M`. The host backstop defaults to `1G`. Both accept lust's syntax: `64K`, `128M`, `1G`, or a bare byte count.
 
+### The warm daemon
+
+`crab-cage eval` runs lust with its daemon off by default: each call starts lust cold. `--lust-daemon` turns the daemon on. It needs `--lust-bin` and `--work-dir`:
+
+```sh
+crab-cage eval nuggets/sum-squares cand.rs --lust-bin "$HOME/lust/bin/lust"   --work-dir work --lust-daemon --json
+```
+
+lust keeps one warm session per source path, so with the daemon on every candidate is compiled as `work/slot.rs` (the candidate is still saved as `work/<hash>.rs`). lust is started in the work directory, and its socket file and `.lust-cache` stay there. The first call starts the daemon and is no faster. Later calls that name the same work directory are: on the Windows laptop this was measured on, `lust check` went from about 110 ms to about 27 ms and `lust build` from about 400 ms to about 45 ms.
+
+The daemon keeps running after `crab-cage` exits. It stops on its own after 30 minutes idle, or at once when `work/.lust-daemon-*.sock` is deleted.
+
+Use a lust built from lust-lang `next` at `f2dc9a8b` or later. An older lust lets its daemon keep the caller's output pipes; Crab Cage no longer hangs on that, but each lust call then waits an extra half second.
+
 ## A local model
 
 The mock backend is the default and is what CI runs. A real model is optional.

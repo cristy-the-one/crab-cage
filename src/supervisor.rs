@@ -297,6 +297,14 @@ fn prepare(cmd: &mut Command, limits: &Limits) {
             });
         }
     }
+    // Every child here gets pipes for its three standard streams. On Windows
+    // it would also get a copy of every other inheritable handle of this
+    // process, this process's own stdin, stdout and stderr among them, and
+    // would pass them on to whatever it starts. A background process two
+    // levels down (lust's daemon) then keeps this process's stdout open, and
+    // a caller reading it never sees end-of-file.
+    #[cfg(windows)]
+    windows::keep_std_handles_private();
     let _ = limits;
 }
 
@@ -551,6 +559,52 @@ mod windows {
         fn SetInformationJobObject(job: HANDLE, class: i32, info: *const u8, len: DWORD) -> BOOL;
         fn AssignProcessToJobObject(job: HANDLE, process: HANDLE) -> BOOL;
         fn CloseHandle(handle: HANDLE) -> BOOL;
+        fn GetStdHandle(id: DWORD) -> HANDLE;
+        fn SetHandleInformation(handle: HANDLE, mask: DWORD, flags: DWORD) -> BOOL;
+    }
+
+    #[cfg(test)]
+    extern "system" {
+        fn GetHandleInformation(handle: HANDLE, flags: *mut DWORD) -> BOOL;
+    }
+
+    const HANDLE_FLAG_INHERIT: DWORD = 1;
+    // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE.
+    const STD_HANDLES: [i32; 3] = [-10, -11, -12];
+
+    /// Make this process's stdin, stdout and stderr non-inheritable, once.
+    /// A child that should share them still can: `Stdio::inherit()` hands
+    /// the child its own inheritable duplicate.
+    pub fn keep_std_handles_private() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            for id in STD_HANDLES {
+                // SAFETY: plain Win32 calls on this process's own handles. A
+                // missing or invalid handle fails the call and is left alone.
+                unsafe {
+                    let handle = GetStdHandle(id as DWORD);
+                    if !handle.is_null() && handle as isize != -1 {
+                        SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
+                    }
+                }
+            }
+        });
+    }
+
+    /// Whether any of this process's standard handles is still inheritable.
+    #[cfg(test)]
+    pub fn a_std_handle_is_inheritable() -> bool {
+        STD_HANDLES.iter().any(|&id| {
+            let mut flags: DWORD = 0;
+            // SAFETY: as above; a failed query leaves `flags` at 0.
+            unsafe {
+                let handle = GetStdHandle(id as DWORD);
+                !handle.is_null()
+                    && handle as isize != -1
+                    && GetHandleInformation(handle, &mut flags) != 0
+                    && flags & HANDLE_FLAG_INHERIT != 0
+            }
+        })
     }
 
     pub fn close_handle(handle: *mut std::ffi::c_void) {
@@ -633,6 +687,21 @@ pub fn parse_memory(text: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn spawning_a_child_makes_the_std_handles_private() {
+        let mut cmd = std::process::Command::new("cmd");
+        cmd.args(["/C", "exit 0"]);
+        let limits = super::Limits {
+            wall: std::time::Duration::from_secs(20),
+            memory_bytes: None,
+            scrub_env: false,
+        };
+        let result = super::run_capture(cmd, &limits, b"").unwrap();
+        assert!(result.success());
+        assert!(!super::windows::a_std_handle_is_inheritable());
+    }
+
     use super::*;
 
     #[test]

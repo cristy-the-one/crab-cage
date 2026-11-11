@@ -111,6 +111,12 @@ struct EvalArgs {
     /// After a score, compile the same program with rustc and compare.
     #[arg(long)]
     oracle: bool,
+    /// Use lust's warm daemon. Needs --lust-bin and --work-dir: the daemon
+    /// is started in the work directory and stays warm for the next call
+    /// that names the same one. It exits when idle, or when
+    /// `.lust-daemon-*.sock` in that directory is deleted.
+    #[arg(long)]
+    lust_daemon: bool,
 }
 
 #[derive(Parser, Debug)]
@@ -401,10 +407,21 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
 fn eval_cmd(args: EvalArgs) -> Result<ExitCode> {
     let nugget = nugget::load(&args.nugget_dir)?;
     let candidate = read_candidate(&args.candidate)?;
-    let lust = match &args.lust_bin {
+    let mut lust = match &args.lust_bin {
         Some(path) => Some(lust::probe(path, Duration::from_secs(10))?),
         None => None,
     };
+    if args.lust_daemon {
+        let Some(tool) = lust.as_mut() else {
+            return Err(err("--lust-daemon needs --lust-bin"));
+        };
+        if args.work_dir.is_none() {
+            return Err(err(
+                "--lust-daemon needs --work-dir: the daemon is warm only for calls that share one",
+            ));
+        }
+        tool.daemon = true;
+    }
     let work_dir = match args.work_dir {
         Some(path) => path,
         None => fresh_work_dir(),
