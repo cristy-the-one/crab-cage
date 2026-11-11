@@ -268,7 +268,10 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
     hash
 }
 
-fn candidate_hash(candidate: &str) -> String {
+/// The `hash` of a verdict: FNV-1a 64 of the candidate text, as 16 hex
+/// digits. The journal is keyed by it, so a caller that asks the journal
+/// whether a candidate was seen must use this function.
+pub fn candidate_hash(candidate: &str) -> String {
     format!("{:016x}", fnv1a64(candidate.as_bytes()))
 }
 
