@@ -7,12 +7,13 @@
 //! `RLIMIT_AS` on Unix, a job object on Windows.
 
 use std::io::{Read, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::Command;
 use std::sync::mpsc::{self, Receiver};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{err, Result};
+use crate::spawn::{self, ChildIn, Exit, Piped, Proc};
 
 #[derive(Clone, Debug)]
 pub struct Limits {
@@ -50,23 +51,13 @@ impl ExecResult {
 /// place. Stdout and stderr are capped.
 pub fn run_capture(mut cmd: Command, limits: &Limits, input: &[u8]) -> Result<ExecResult> {
     prepare(&mut cmd, limits);
-    cmd.stdin(Stdio::piped());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-    let mut child = cmd.spawn()?;
+    let Piped {
+        proc: mut child,
+        mut stdin,
+        stdout,
+        stderr,
+    } = spawn::spawn_piped(cmd)?;
     let _job = apply_windows_job(&child, limits)?;
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| err("stdin was not piped"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| err("stdout was not piped"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| err("stderr was not piped"))?;
     let input = input.to_vec();
     // Not joined: a grandchild that inherited stdin can keep the write
     // blocked after the child is gone.
@@ -93,8 +84,8 @@ pub fn run_capture(mut cmd: Command, limits: &Limits, input: &[u8]) -> Result<Ex
 
 /// Interactive line protocol. One request line, one response line.
 pub struct Session {
-    child: Option<Child>,
-    stdin: Option<std::process::ChildStdin>,
+    child: Option<Proc>,
+    stdin: Option<ChildIn>,
     lines: Receiver<Option<String>>,
     stderr_rx: Option<Receiver<Vec<u8>>>,
     stderr: String,
@@ -108,23 +99,13 @@ pub struct Session {
 impl Session {
     pub fn spawn(mut cmd: Command, limits: &Limits) -> Result<Self> {
         prepare(&mut cmd, limits);
-        cmd.stdin(Stdio::piped());
-        cmd.stdout(Stdio::piped());
-        cmd.stderr(Stdio::piped());
-        let mut child = cmd.spawn()?;
+        let Piped {
+            proc: child,
+            stdin,
+            stdout,
+            stderr,
+        } = spawn::spawn_piped(cmd)?;
         let job = apply_windows_job(&child, limits)?;
-        let stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| err("stdin was not piped"))?;
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| err("stdout was not piped"))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| err("stderr was not piped"))?;
         let (tx, rx) = mpsc::channel();
         // Not joined, like the readers in `spawn_reader`.
         thread::spawn(move || {
@@ -244,8 +225,8 @@ impl Session {
         }
         if let Some(child) = self.child.as_mut() {
             let polled = child.try_wait()?;
-            if let Some(status) = polled {
-                self.finished = Some(status_kind(status, self.memory_limited));
+            if let Some(exit) = polled {
+                self.finished = Some(status_kind(exit, self.memory_limited));
             }
         }
         Ok(())
@@ -297,14 +278,6 @@ fn prepare(cmd: &mut Command, limits: &Limits) {
             });
         }
     }
-    // Every child here gets pipes for its three standard streams. On Windows
-    // it would also get a copy of every other inheritable handle of this
-    // process, this process's own stdin, stdout and stderr among them, and
-    // would pass them on to whatever it starts. A background process two
-    // levels down (lust's daemon) then keeps this process's stdout open, and
-    // a caller reading it never sees end-of-file.
-    #[cfg(windows)]
-    windows::keep_std_handles_private();
     let _ = limits;
 }
 
@@ -332,41 +305,36 @@ fn harden_env(cmd: &mut Command) {
     }
 }
 
-fn wait_child(child: &mut Child, limits: &Limits, start: Instant) -> Result<StopKind> {
+fn wait_child(child: &mut Proc, limits: &Limits, start: Instant) -> Result<StopKind> {
     loop {
         if start.elapsed() > limits.wall {
             kill_tree(child);
             let _ = child.wait();
             return Ok(StopKind::TimedOut);
         }
-        if let Some(status) = child.try_wait()? {
-            return Ok(status_kind(status, limits.memory_bytes.is_some()));
+        if let Some(exit) = child.try_wait()? {
+            return Ok(status_kind(exit, limits.memory_bytes.is_some()));
         }
         thread::sleep(Duration::from_millis(10));
     }
 }
 
-fn status_kind(status: std::process::ExitStatus, memory_limited: bool) -> StopKind {
-    if let Some(code) = status.code() {
+fn status_kind(exit: Exit, memory_limited: bool) -> StopKind {
+    if let Some(code) = exit.code {
         return StopKind::Exited(code);
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if memory_limited {
-            if let Some(signal) = status.signal() {
-                // SIGKILL, SIGSEGV, SIGABRT, SIGBUS: what a tight address cap produces.
-                if matches!(signal, 9 | 11 | 6 | 7) {
-                    return StopKind::MemorySignal;
-                }
+    if memory_limited {
+        if let Some(signal) = exit.signal {
+            // SIGKILL, SIGSEGV, SIGABRT, SIGBUS: what a tight address cap produces.
+            if matches!(signal, 9 | 11 | 6 | 7) {
+                return StopKind::MemorySignal;
             }
         }
     }
-    let _ = memory_limited;
     StopKind::Exited(1)
 }
 
-fn kill_tree(child: &mut Child) {
+fn kill_tree(child: &mut Proc) {
     #[cfg(unix)]
     {
         let pid = child.id() as i32;
@@ -502,24 +470,21 @@ impl Drop for JobGuard {
 }
 
 #[cfg(windows)]
-fn apply_windows_job(child: &Child, limits: &Limits) -> Result<Option<JobGuard>> {
+fn apply_windows_job(child: &Proc, limits: &Limits) -> Result<Option<JobGuard>> {
     let Some(bytes) = limits.memory_bytes else {
         return Ok(None);
     };
-    let raw = windows::assign_memory_job(child, bytes)?;
+    let raw = windows::assign_memory_job(child.raw_handle(), bytes)?;
     Ok(Some(JobGuard { raw }))
 }
 
 #[cfg(not(windows))]
-fn apply_windows_job(_child: &Child, _limits: &Limits) -> Result<Option<JobGuard>> {
+fn apply_windows_job(_child: &Proc, _limits: &Limits) -> Result<Option<JobGuard>> {
     Ok(None)
 }
 
 #[cfg(windows)]
 mod windows {
-    use std::os::windows::io::AsRawHandle;
-    use std::process::Child;
-
     use crate::error::{err, Result};
 
     type HANDLE = *mut std::ffi::c_void;
@@ -559,59 +524,13 @@ mod windows {
         fn SetInformationJobObject(job: HANDLE, class: i32, info: *const u8, len: DWORD) -> BOOL;
         fn AssignProcessToJobObject(job: HANDLE, process: HANDLE) -> BOOL;
         fn CloseHandle(handle: HANDLE) -> BOOL;
-        fn GetStdHandle(id: DWORD) -> HANDLE;
-        fn SetHandleInformation(handle: HANDLE, mask: DWORD, flags: DWORD) -> BOOL;
-    }
-
-    #[cfg(test)]
-    extern "system" {
-        fn GetHandleInformation(handle: HANDLE, flags: *mut DWORD) -> BOOL;
-    }
-
-    const HANDLE_FLAG_INHERIT: DWORD = 1;
-    // STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE.
-    const STD_HANDLES: [i32; 3] = [-10, -11, -12];
-
-    /// Make this process's stdin, stdout and stderr non-inheritable, once.
-    /// A child that should share them still can: `Stdio::inherit()` hands
-    /// the child its own inheritable duplicate.
-    pub fn keep_std_handles_private() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            for id in STD_HANDLES {
-                // SAFETY: plain Win32 calls on this process's own handles. A
-                // missing or invalid handle fails the call and is left alone.
-                unsafe {
-                    let handle = GetStdHandle(id as DWORD);
-                    if !handle.is_null() && handle as isize != -1 {
-                        SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0);
-                    }
-                }
-            }
-        });
-    }
-
-    /// Whether any of this process's standard handles is still inheritable.
-    #[cfg(test)]
-    pub fn a_std_handle_is_inheritable() -> bool {
-        STD_HANDLES.iter().any(|&id| {
-            let mut flags: DWORD = 0;
-            // SAFETY: as above; a failed query leaves `flags` at 0.
-            unsafe {
-                let handle = GetStdHandle(id as DWORD);
-                !handle.is_null()
-                    && handle as isize != -1
-                    && GetHandleInformation(handle, &mut flags) != 0
-                    && flags & HANDLE_FLAG_INHERIT != 0
-            }
-        })
     }
 
     pub fn close_handle(handle: *mut std::ffi::c_void) {
         unsafe { CloseHandle(handle) };
     }
 
-    pub fn assign_memory_job(child: &Child, bytes: u64) -> Result<*mut std::ffi::c_void> {
+    pub fn assign_memory_job(process: HANDLE, bytes: u64) -> Result<*mut std::ffi::c_void> {
         const _: () = assert!(std::mem::size_of::<BasicLimit>() == 64);
         const _: () = assert!(std::mem::size_of::<ExtendedLimit>() == 144);
         unsafe {
@@ -649,7 +568,7 @@ mod windows {
                 CloseHandle(job);
                 return Err(err("SetInformationJobObject failed"));
             }
-            let assigned = AssignProcessToJobObject(job, child.as_raw_handle() as HANDLE);
+            let assigned = AssignProcessToJobObject(job, process);
             if assigned == 0 {
                 CloseHandle(job);
                 return Err(err(
@@ -687,21 +606,6 @@ pub fn parse_memory(text: &str) -> Result<u64> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(windows)]
-    #[test]
-    fn spawning_a_child_makes_the_std_handles_private() {
-        let mut cmd = std::process::Command::new("cmd");
-        cmd.args(["/C", "exit 0"]);
-        let limits = super::Limits {
-            wall: std::time::Duration::from_secs(20),
-            memory_bytes: None,
-            scrub_env: false,
-        };
-        let result = super::run_capture(cmd, &limits, b"").unwrap();
-        assert!(result.success());
-        assert!(!super::windows::a_std_handle_is_inheritable());
-    }
-
     use super::*;
 
     #[test]

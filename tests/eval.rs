@@ -36,6 +36,7 @@ fn options(label: &str) -> EvalOptions {
         host_memory: 1024 * 1024 * 1024,
         compile_timeout: Duration::from_secs(120),
         oracle: false,
+        slot: 0,
     }
 }
 

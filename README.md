@@ -86,6 +86,8 @@ The daemon keeps running after `crab-cage` exits. It stops on its own after 30 m
 
 `crab-cage run` with `--lust-bin` uses the daemon without being asked: it starts lust in `<out>/work`, compiles every candidate as `slot.rs`, and removes the socket file when the run ends, so no daemon is left behind. `--no-lust-daemon` starts lust cold for every candidate instead. A run of 40 candidates on the demo nugget took 18 s with the daemon and 51 s without, measured back to back on the same laptop.
 
+`crab-cage run --jobs N` evaluates up to `N` candidates at the same time, each through its own slot file (`slot.rs`, `slot-1.rs`, …) in the one work directory, served by the one daemon. The journal keeps the order the candidates were proposed in, and a run with the folder proposer journals the same decisions for any `N`. Measured on the Windows laptop, 40 candidates: 11.1 s with one job, 7.5 s with two, 6.8 s with four. More than four did not help there: lust's builds slow down as they overlap. Without the daemon the same run went from 33.8 s to 15.2 s with four jobs.
+
 Use a lust built from lust-lang `next` at `f2dc9a8b` or later. An older lust lets its daemon keep the caller's output pipes; Crab Cage no longer hangs on that, but each lust call then waits an extra half second.
 
 ## A local model

@@ -19,6 +19,7 @@ pub mod proposer;
 pub mod report;
 pub mod rng;
 pub mod run;
+mod spawn;
 pub mod supervisor;
 
 pub use error::{Error, Result};

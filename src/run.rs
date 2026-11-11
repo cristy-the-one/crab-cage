@@ -37,6 +37,8 @@ pub struct RunOptions {
     pub nugget_dir: PathBuf,
     /// Journaled verdicts to record, including the seed. Zero records nothing.
     pub budget: usize,
+    /// Candidates evaluated at the same time. 0 and 1 both mean one.
+    pub jobs: usize,
     pub out_dir: PathBuf,
     pub lust_bin: Option<PathBuf>,
     /// Use lust's warm daemon for the length of the run. It is started in
@@ -180,11 +182,13 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
     let mut exhausted = vec![false; proposers.len()];
 
     if options.budget > 0 && !journal.seen(&candidate_hash(&nugget.seed)) {
-        let outcome = record(
+        let first = first_pass(&nugget, &nugget.seed, &tools, &work_dir, 0);
+        let outcome = settle(
             &nugget,
             &nugget.seed,
             "seed",
             true,
+            first,
             &tools,
             &work_dir,
             &options.out_dir,
@@ -201,45 +205,117 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
         }
     }
 
-    while evaluated < options.budget {
-        let next = {
-            let feedback = feedback_of(&best, &last);
-            next_candidate(proposers, &mut cursor, &mut exhausted, &nugget, &feedback)?
-        };
-        let Some((name, text)) = next else {
+    let jobs = options.jobs.max(1);
+    let mut done = false;
+    while !done && evaluated < options.budget {
+        // Gather a batch. Every proposal in it sees the same feedback: the
+        // best and the last verdict as they were before the batch.
+        let want = jobs.min(options.budget - evaluated);
+        let mut batch: Vec<(String, String)> = Vec::with_capacity(want);
+        while batch.len() < want {
+            let next = {
+                let feedback = feedback_of(&best, &last);
+                next_candidate(proposers, &mut cursor, &mut exhausted, &nugget, &feedback)?
+            };
+            let Some((name, text)) = next else {
+                done = true;
+                break;
+            };
+            let repeat = journal.seen(&candidate_hash(&text))
+                || batch.iter().any(|(_, other)| *other == text);
+            if repeat {
+                if note_unjournaled(&mut unjournaled) {
+                    done = true;
+                    break;
+                }
+                continue;
+            }
+            batch.push((name, text));
+        }
+        if batch.is_empty() {
             break;
-        };
-        if journal.seen(&candidate_hash(&text)) {
-            if note_unjournaled(&mut unjournaled) {
+        }
+
+        // The first pass (no oracle) runs one candidate per slot at the same
+        // time. Everything after it is in proposal order on this thread.
+        let firsts = first_passes(&nugget, &batch, &tools, &work_dir);
+        for ((name, text), first) in batch.iter().zip(firsts) {
+            let outcome = settle(
+                &nugget,
+                text,
+                name,
+                false,
+                first,
+                &tools,
+                &work_dir,
+                &options.out_dir,
+                &mut journal,
+                &journal_path,
+                &mut best,
+                &mut last,
+            )?;
+            if outcome.recorded {
+                evaluated += 1;
+                unjournaled = 0;
+            } else if note_unjournaled(&mut unjournaled) {
+                done = true;
+            }
+            if outcome.stop {
+                // Solved. The rest of the batch is dropped unjournaled, as
+                // if it had never been proposed.
+                done = true;
                 break;
             }
-            continue;
-        }
-        let outcome = record(
-            &nugget,
-            &text,
-            &name,
-            false,
-            &tools,
-            &work_dir,
-            &options.out_dir,
-            &mut journal,
-            &journal_path,
-            &mut best,
-            &mut last,
-        )?;
-        if outcome.recorded {
-            evaluated += 1;
-            unjournaled = 0;
-        } else if note_unjournaled(&mut unjournaled) {
-            break;
-        }
-        if outcome.stop {
-            break;
         }
     }
 
     finish(&journal_path, nugget.objective)
+}
+
+/// One candidate through the funnel without the oracle, on `slot`.
+fn first_pass(
+    nugget: &Nugget,
+    candidate: &str,
+    tools: &Toolchain,
+    work_dir: &Path,
+    slot: usize,
+) -> Result<Verdict> {
+    pipeline::evaluate(
+        nugget,
+        candidate,
+        tools,
+        &eval_options(work_dir, false, slot),
+    )
+}
+
+/// The first pass of every candidate in `batch`, each on its own slot and
+/// its own thread. The results are in batch order.
+fn first_passes(
+    nugget: &Nugget,
+    batch: &[(String, String)],
+    tools: &Toolchain,
+    work_dir: &Path,
+) -> Vec<Result<Verdict>> {
+    if batch.len() == 1 {
+        return vec![first_pass(nugget, &batch[0].1, tools, work_dir, 0)];
+    }
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = batch
+            .iter()
+            .enumerate()
+            .map(|(slot, (_, text))| {
+                scope.spawn(move || first_pass(nugget, text, tools, work_dir, slot))
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|_| Err(err("an evaluation thread panicked")))
+            })
+            .collect()
+    })
 }
 
 fn note_unjournaled(count: &mut usize) -> bool {
@@ -400,11 +476,15 @@ fn next_candidate(
     Ok(None)
 }
 
-fn record(
+/// Finish one candidate whose first pass is `first`: the oracle if it would
+/// be a new best, then the journal line, the printed line, and the best files.
+#[allow(clippy::too_many_arguments)]
+fn settle(
     nugget: &Nugget,
     candidate: &str,
     proposer: &str,
     seed: bool,
+    first: Result<Verdict>,
     tools: &Toolchain,
     work_dir: &Path,
     out_dir: &Path,
@@ -413,15 +493,14 @@ fn record(
     best: &mut Option<Best>,
     last: &mut Option<(String, Verdict)>,
 ) -> Result<Outcome> {
-    let verdict = match pipeline::evaluate(nugget, candidate, tools, &eval_options(work_dir, false))
-    {
+    let verdict = match first {
         Ok(verdict) => verdict,
         Err(error) => return unevaluated(seed, error),
     };
     // Oracle is the same `evaluate` call with the flag set. Journal the
     // verdict from that call only, never a scored line plus a second line.
     let verdict = if would_improve(&verdict, best) {
-        match pipeline::evaluate(nugget, candidate, tools, &eval_options(work_dir, true)) {
+        match pipeline::evaluate(nugget, candidate, tools, &eval_options(work_dir, true, 0)) {
             Ok(verdict) => verdict,
             Err(error) => return unevaluated(seed, error),
         }
@@ -451,12 +530,13 @@ fn unevaluated(seed: bool, error: crate::error::Error) -> Result<Outcome> {
     })
 }
 
-fn eval_options(work_dir: &Path, oracle: bool) -> EvalOptions {
+fn eval_options(work_dir: &Path, oracle: bool, slot: usize) -> EvalOptions {
     EvalOptions {
         work_dir: work_dir.to_path_buf(),
         host_memory: HOST_MEMORY,
         compile_timeout: COMPILE_TIMEOUT,
         oracle,
+        slot,
     }
 }
 

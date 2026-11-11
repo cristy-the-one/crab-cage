@@ -184,3 +184,62 @@ fn host_memory_cap_stops_a_large_allocation_and_allows_a_small_one() {
     );
     assert!(allowed.stdout.contains("32"));
 }
+
+/// Arguments with spaces, quotes and trailing backslashes, an added and a
+/// scrubbed environment variable, the working directory, stdin, stderr and
+/// the exit code all reach a child exactly. On Windows the supervisor builds
+/// the command line and the environment block itself.
+#[test]
+fn a_child_gets_its_arguments_environment_directory_and_streams_exactly() {
+    let probe = compile_probe("echo_args");
+    let dir = std::env::temp_dir().join(format!("crab-cage-echo dir-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let args = [
+        "plain",
+        "two words",
+        "",
+        r#"say "hi""#,
+        r"C:\trailing\",
+        r"C:\with space\",
+        r#"back\"slash"#,
+        "tab\there",
+        "ünï cödé",
+    ];
+    std::env::set_var("CRAB_PROBE_SECRET", "must not arrive");
+    std::env::set_var("CRAB_PROBE_KEPT", "kept");
+    let mut cmd = Command::new(&probe);
+    cmd.args(args)
+        .env("CRAB_PROBE_SET", "a b=c")
+        .current_dir(&dir);
+    let result = supervisor::run_capture(
+        cmd,
+        &Limits {
+            wall: Duration::from_secs(20),
+            memory_bytes: Some(512 * 1024 * 1024),
+            scrub_env: true,
+        },
+        b"from the host\n",
+    )
+    .unwrap();
+    assert_eq!(result.kind, StopKind::Exited(7), "{result:?}");
+    let lines: Vec<&str> = result.stdout.lines().collect();
+    for (index, arg) in args.iter().enumerate() {
+        assert_eq!(lines[index], format!("arg=[{arg}]"), "{:?}", result.stdout);
+    }
+    let rest = &lines[args.len()..];
+    // `scrub_env` removes names that look like secrets on Windows. On Unix it
+    // clears the whole environment, the variable set on `cmd` included.
+    assert_eq!(rest[1], "CRAB_PROBE_SECRET unset");
+    if cfg!(windows) {
+        assert_eq!(rest[0], "CRAB_PROBE_SET=[a b=c]");
+        assert_eq!(rest[2], "CRAB_PROBE_KEPT=[kept]");
+    }
+    assert_eq!(
+        rest[3],
+        format!("cwd={}", dir.file_name().unwrap().to_string_lossy())
+    );
+    assert_eq!(rest[4], "stdin=[from the host]");
+    assert_eq!(result.stderr.trim_end(), "to stderr");
+    let _ = fs::remove_dir_all(&dir);
+}

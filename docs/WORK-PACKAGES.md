@@ -44,8 +44,10 @@ Phase 3:  L-03 … L-11, any order
 | WP-10 to WP-14 | done | crab-cage #4, #6, #7, #8, #9 |
 | WP-15 | done | crab-cage [#10](https://github.com/cristy-the-one/crab-cage/pull/10) |
 | Warm lust daemon (`eval --lust-daemon`, default in `run`) | done, not in the original plan | crab-cage #11, #12 |
-| WP-16 | next | |
-| WP-17, WP-18, WP-19, WP-20 | open | WP-17 has new facts below |
+| WP-16 | done | crab-cage #14 |
+| WP-17 | done | see WP-17 for the numbers |
+| WP-17b | done | `src/spawn.rs`; numbers below WP-17 |
+| WP-18, WP-19, WP-20 | open | |
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
 | L-02 | done for literal bounds; variable bounds open | lust-lang #37 |
 | L-03 | done | lust-lang #36 |
@@ -419,6 +421,43 @@ After three rejected replies in a row, send the nugget seed as the base instead 
 **Done when.** With a real lust and zig installed, `crab-cage eval nuggets/fast-sum cand.rs --json` shows a non-zero `ms.opt` and an empty `note`; with zig absent, the note from step 4 appears and the exit code is still 0.
 
 ---
+
+**Result (40 candidates, demo nugget, Windows 11, daemon on, back to back).**
+
+| `--jobs` | Whole run | check | build | run 3 cases |
+|---:|---:|---:|---:|---:|
+| 1 | 11.7 s | 25 ms | 38 ms | 165 ms |
+| 2 | 10.0 s | 27 ms | 52 ms | 280 ms |
+| 4 | 9.8 s | 33 ms | 75 ms | 510 ms |
+| 8 | 11.4 s | 46 ms | 144 ms | 1012 ms |
+
+The journals hold the same decisions in the same order for all four. The run is not faster: the time to run the cases grows with the number of jobs. The cause is WP-17b.
+
+## WP-17b Start candidates without the standard library's process lock (T3, Windows)
+
+**Measured.** 24 starts of one program from Rust threads, Windows 11:
+
+| | 1 thread | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| a program that has run before | 297 ms | 128 ms | 99 ms | 99 ms |
+| 24 copies that have never run | 976 ms | 1001 ms | 1024 ms | 1023 ms |
+
+The first start of a new executable costs about 40 ms (the system inspects the file), and from Rust threads those starts do not overlap at all. `std::process::Command::spawn` on Windows holds one process-wide lock for the whole `CreateProcessW` call, so that a child cannot inherit a handle meant for another child. Every candidate is a new executable, so every candidate pays 40 ms under that lock, and every other spawn (lust, rustc) waits behind it. The same loop driven from Python, which has no such lock, went from 270 ms to 72 ms per candidate with four jobs.
+
+**Fix.** In `src/supervisor.rs`, on Windows, start children with a direct `CreateProcessW` call and `PROC_THREAD_ATTRIBUTE_HANDLE_LIST` naming only the three pipe ends for that child. With a handle list no lock is needed, because a child can only get the handles named for it. This also replaces `keep_std_handles_private`. It needs: pipe creation, the command line built with Windows quoting rules, the environment block (the parent's, minus what `harden_env` removes), a small type in place of `std::process::Child` (wait with a timeout, kill, exit code, the raw handle for the job object), and the same for `Session`. lust-lang's `protocol::spawn_daemon` is a working example of the call. Unix is untouched.
+
+**Done when.** The table above shows the run 3 cases column staying near its `--jobs 1` value, and the whole run at least 2× faster with `--jobs 4`. All of `tests/limits.rs` passes unchanged.
+
+**Result (same 40 candidates, same machine, after the change).**
+
+| `--jobs` | Whole run | check | build | run 3 cases |
+|---:|---:|---:|---:|---:|
+| 1 | 11.1 s | 27 ms | 50 ms | 137 ms |
+| 2 | 7.5 s | 28 ms | 63 ms | 134 ms |
+| 4 | 6.8 s | 32 ms | 93 ms | 136 ms |
+| 8 | 8.7 s | 59 ms | 156 ms | 141 ms |
+
+The run column is flat now: candidate starts overlap. The whole run is 1.6× faster with four jobs, not the 2× asked for. About 2.4 s of every run is fixed (the probe, the daemon's cold start, the seed and its oracle), and the time lust takes to build grows as builds overlap (50 ms alone, 93 ms with four, 156 ms with eight), which is on the lust side. Without the daemon the same run goes from 33.8 s to 15.2 s with four jobs (2.2×). Same decisions in the same order for 1, 2, 4 and 8. `tests/limits.rs` passes unchanged, with one test added.
 
 # Phase 3: lust-lang
 
