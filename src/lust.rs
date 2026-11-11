@@ -78,7 +78,7 @@ pub fn which(name: &str) -> Option<PathBuf> {
 }
 
 pub fn probe(bin: &Path, timeout: Duration) -> Result<LustTool> {
-    let version = tool_output(bin, &["--version"], timeout, &[])?;
+    let version = tool_output(bin, &["--version"], timeout, &[("LUST_NO_DAEMON", "1")])?;
     let version = first_line(&version.stdout, &version.stderr);
     if version.is_empty() {
         return Err(err(format!(
@@ -86,7 +86,13 @@ pub fn probe(bin: &Path, timeout: Duration) -> Result<LustTool> {
             bin.display()
         )));
     }
-    let help = tool_output(bin, &["build", "--help"], timeout, &[]).unwrap_or(ExecResult {
+    let help = tool_output(
+        bin,
+        &["build", "--help"],
+        timeout,
+        &[("LUST_NO_DAEMON", "1")],
+    )
+    .unwrap_or(ExecResult {
         kind: StopKind::Exited(0),
         stdout: String::new(),
         stderr: String::new(),
@@ -95,7 +101,13 @@ pub fn probe(bin: &Path, timeout: Duration) -> Result<LustTool> {
     // `lust build --help` is not a help page on a real binary: the client
     // treats `--help` as a file name. A limit flag with no value is a usage
     // error and prints the usage line, which names every flag.
-    let usage = tool_output(bin, &["build", "--time-limit"], timeout, &[]).unwrap_or(ExecResult {
+    let usage = tool_output(
+        bin,
+        &["build", "--time-limit"],
+        timeout,
+        &[("LUST_NO_DAEMON", "1")],
+    )
+    .unwrap_or(ExecResult {
         kind: StopKind::Exited(2),
         stdout: String::new(),
         stderr: String::new(),
@@ -135,7 +147,7 @@ pub fn check(tool: &LustTool, source: &Path, timeout: Duration) -> Result<CheckR
             &source.display().to_string(),
         ],
         timeout,
-        &[],
+        &[("LUST_NO_DAEMON", "1")],
     )?;
     let text = format!("{}{}", result.stdout, result.stderr);
     let diagnostics = parse_diagnostics(&text);
