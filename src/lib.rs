@@ -8,6 +8,7 @@ pub mod fitness;
 pub mod ga;
 pub mod genome;
 pub mod http;
+pub mod journal;
 pub mod llm;
 pub mod lust;
 pub mod models;
