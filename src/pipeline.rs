@@ -1,6 +1,8 @@
-//! One candidate through the funnel: prefilter, lust check, build, run.
+//! One candidate through the funnel: prefilter, lust check, build, run, oracle.
 //!
-//! `opts.oracle` stops the funnel after a score. WP-14 adds the oracle.
+//! When `opts.oracle` is set and the candidate scored, rustc is the oracle.
+//! With no lust binary the fast build already is rustc, so that step is
+//! `proven` without a second compile.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -11,14 +13,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::lust::{self, LustTool, RunClass};
 use crate::nugget::{Nugget, Objective};
-use crate::supervisor;
+use crate::supervisor::{self, StopKind};
 
 /// Where the fast gates run. `lust: None` compiles them with rustc.
 pub struct Toolchain {
     pub lust: Option<LustTool>,
 }
 
-/// Knobs for one evaluation. `oracle` is the stop point WP-14 extends.
+/// Knobs for one evaluation. `oracle` compares a scored fast build with rustc.
 pub struct EvalOptions {
     pub work_dir: PathBuf,
     pub host_memory: u64,
@@ -166,7 +168,9 @@ pub fn evaluate(
             opts.compile_timeout,
         )
     } else {
-        compile_rustc(&source, &binary, opts.compile_timeout)
+        lust::compile_rustc_any_edition(&source, &binary, opts.compile_timeout)
+            .map(|_| ())
+            .map_err(crate::error::Error::from)
     };
     verdict.ms.build = elapsed_ms(started);
     if let Err(problem) = built {
@@ -190,8 +194,19 @@ pub fn evaluate(
     verdict.status = Status::Scored;
     verdict.score = Some(outcome.score);
 
+    // Rejections returned above, so the status here is `scored`.
     if opts.oracle {
-        // WP-14 runs the oracle here and may set `proven` or `diverged`.
+        let started = Instant::now();
+        run_oracle(
+            &mut verdict,
+            nugget,
+            &source,
+            &binary,
+            &outcome.runs,
+            tools,
+            opts,
+        )?;
+        verdict.ms.oracle = elapsed_ms(started);
     }
     Ok(verdict)
 }
@@ -298,23 +313,9 @@ fn bin_name(stem: &str) -> String {
     }
 }
 
-/// Edition 2024, then 2021 only when rustc rejects the edition itself.
-/// The tank replay does this inside `evolve`, which is not part of this package.
-fn compile_rustc(source: &Path, output: &Path, timeout: Duration) -> crate::error::Result<()> {
-    match lust::compile_rustc(source, output, "2024", timeout) {
-        Ok(()) => Ok(()),
-        Err(problem) => {
-            let text = problem.message.to_lowercase();
-            let edition_problem = text.contains("edition")
-                && (text.contains("unknown")
-                    || text.contains("invalid")
-                    || text.contains("must be one of"));
-            if !edition_problem {
-                return Err(problem);
-            }
-            lust::compile_rustc(source, output, "2021", timeout)
-        }
-    }
+struct CaseCapture {
+    stdout: String,
+    kind: StopKind,
 }
 
 struct RunOutcome {
@@ -323,15 +324,217 @@ struct RunOutcome {
     /// Set when the candidate is rejected at `run`. The note is the class
     /// name, or why a `minimize` score could not be read.
     stop: Option<String>,
+    /// One entry per case that actually ran, in case order. A scored
+    /// candidate has one entry per nugget case; the oracle compares these
+    /// bytes and exit kinds with a fresh rustc run.
+    runs: Vec<CaseCapture>,
+}
+
+/// Lust's own `--time-limit` stays `nugget.timeout`. The host wall clock is
+/// 500 ms later, so an L0533 stop (stdout flushed, exit 101) is the normal
+/// case and the host kill is only the backstop.
+fn host_limits(nugget: &Nugget, opts: &EvalOptions) -> supervisor::Limits {
+    let wall = nugget.timeout.saturating_add(Duration::from_millis(500));
+    lust::candidate_limits(wall, opts.host_memory)
+}
+
+fn run_oracle(
+    verdict: &mut Verdict,
+    nugget: &Nugget,
+    source: &Path,
+    fast_bin: &Path,
+    runs: &[CaseCapture],
+    tools: &Toolchain,
+    opts: &EvalOptions,
+) -> crate::error::Result<()> {
+    verdict.gate = Gate::Oracle;
+    let Some(tool) = &tools.lust else {
+        verdict.status = Status::Proven;
+        return Ok(());
+    };
+    if runs.len() != nugget.cases.len() {
+        return Err(crate::error::err("oracle expected one fast run per case"));
+    }
+    let oracle_bin = opts
+        .work_dir
+        .join(bin_name(&format!("{}.oracle", verdict.hash)));
+    let edition = match lust::compile_rustc_any_edition(source, &oracle_bin, opts.compile_timeout) {
+        Ok(edition) => edition,
+        Err(lust::RustcError::Rejected { message }) => {
+            save_rustc_rejection(
+                verdict,
+                nugget,
+                tool,
+                source,
+                fast_bin,
+                &oracle_bin,
+                opts,
+                &message,
+            )?;
+            return Ok(());
+        }
+        Err(problem) => return Err(problem.into()),
+    };
+    if !oracle_bin.is_file() {
+        return Err(crate::error::err(format!(
+            "rustc exited 0 but did not write {}",
+            oracle_bin.display()
+        )));
+    }
+    let limits = host_limits(nugget, opts);
+    for (case, fast) in nugget.cases.iter().zip(runs.iter()) {
+        let result =
+            supervisor::run_capture(Command::new(&oracle_bin), &limits, case.input.as_bytes())?;
+        if result.stdout == fast.stdout && result.kind == fast.kind {
+            continue;
+        }
+        let again =
+            supervisor::run_capture(Command::new(&oracle_bin), &limits, case.input.as_bytes())?;
+        if again.stdout != result.stdout || again.kind != result.kind {
+            verdict.status = Status::Rejected;
+            verdict.note = "nondeterministic output".to_string();
+            return Ok(());
+        }
+        write_case_divergence(
+            opts,
+            &verdict.hash,
+            source,
+            &case.input,
+            &fast.stdout,
+            &result.stdout,
+            &divergence_readme(
+                tool,
+                nugget,
+                source,
+                fast_bin,
+                &oracle_bin,
+                &edition,
+                &case.id,
+                fast.kind,
+                result.kind,
+            ),
+        )?;
+        verdict.status = Status::Diverged;
+        return Ok(());
+    }
+    verdict.status = Status::Proven;
+    Ok(())
+}
+
+fn save_rustc_rejection(
+    verdict: &mut Verdict,
+    nugget: &Nugget,
+    tool: &LustTool,
+    source: &Path,
+    fast_bin: &Path,
+    oracle_bin: &Path,
+    opts: &EvalOptions,
+    message: &str,
+) -> crate::error::Result<()> {
+    let dir = divergence_dir(&opts.work_dir, &verdict.hash);
+    fs::create_dir_all(&dir)?;
+    let _ = fs::copy(source, dir.join("source.rs"))?;
+    fs::write(dir.join("rustc.stderr"), message)?;
+    let readme = format!(
+        "\
+lust version: {version}
+fast: {fast}
+oracle: {oracle}
+",
+        version = tool.version,
+        fast = fast_command(tool, nugget, source, fast_bin),
+        oracle = rustc_command("2024", oracle_bin, source),
+    );
+    fs::write(dir.join("README.txt"), readme)?;
+    verdict.status = Status::Diverged;
+    verdict.note = "lust accepted, rustc rejected".to_string();
+    Ok(())
+}
+
+fn write_case_divergence(
+    opts: &EvalOptions,
+    hash: &str,
+    source: &Path,
+    case_input: &str,
+    fast_stdout: &str,
+    oracle_stdout: &str,
+    readme: &str,
+) -> crate::error::Result<()> {
+    let dir = divergence_dir(&opts.work_dir, hash);
+    fs::create_dir_all(&dir)?;
+    let _ = fs::copy(source, dir.join("source.rs"))?;
+    fs::write(dir.join("case.in"), case_input)?;
+    fs::write(dir.join("fast.stdout"), fast_stdout)?;
+    fs::write(dir.join("oracle.stdout"), oracle_stdout)?;
+    fs::write(dir.join("README.txt"), readme)?;
+    Ok(())
+}
+
+fn divergence_dir(work_dir: &Path, hash: &str) -> PathBuf {
+    work_dir.join("divergences").join(hash)
+}
+
+fn fast_command(tool: &LustTool, nugget: &Nugget, source: &Path, fast_bin: &Path) -> String {
+    let mut cmd = format!("{} build --sandbox", tool.bin.display());
+    if tool.supports_max_memory {
+        cmd.push_str(" --max-memory ");
+        cmd.push_str(&nugget.max_memory.to_string());
+    }
+    if tool.supports_time_limit {
+        cmd.push_str(" --time-limit ");
+        cmd.push_str(&lust::format_time_limit(nugget.timeout));
+    }
+    cmd.push_str(" -o ");
+    cmd.push_str(&fast_bin.display().to_string());
+    cmd.push(' ');
+    cmd.push_str(&source.display().to_string());
+    cmd
+}
+
+fn divergence_readme(
+    tool: &LustTool,
+    nugget: &Nugget,
+    source: &Path,
+    fast_bin: &Path,
+    oracle_bin: &Path,
+    edition: &str,
+    case_id: &str,
+    fast_kind: StopKind,
+    oracle_kind: StopKind,
+) -> String {
+    format!(
+        "\
+lust version: {version}
+fast: {fast}
+oracle: {oracle}
+case: {case_id}
+fast exit: {fast_kind:?}
+oracle exit: {oracle_kind:?}
+",
+        version = tool.version,
+        fast = fast_command(tool, nugget, source, fast_bin),
+        oracle = rustc_command(edition, oracle_bin, source),
+    )
+}
+
+/// Same profile `lust::compile_rustc` passes: optimized, with the debug
+/// assertions and overflow checks lust leaves on.
+fn rustc_command(edition: &str, oracle_bin: &Path, source: &Path) -> String {
+    format!(
+        "rustc --edition {edition} -C opt-level=2 -C debuginfo=0 -C debug-assertions=on -C overflow-checks=on -o {} {}",
+        oracle_bin.display(),
+        source.display()
+    )
 }
 
 fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::Result<RunOutcome> {
-    let limits = lust::candidate_limits(nugget.timeout, opts.host_memory);
+    let limits = host_limits(nugget, opts);
     let mut passed = 0u32;
     let mut mismatches = 0u32;
     let mut sum = 0.0f64;
     let mut unclean: Option<RunClass> = None;
     let mut bad_score: Option<String> = None;
+    let mut runs = Vec::with_capacity(nugget.cases.len());
 
     for case in &nugget.cases {
         let result = supervisor::run_capture(Command::new(bin), &limits, case.input.as_bytes())?;
@@ -339,30 +542,37 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
         // A timeout or other unclean stop rejects the candidate. Later cases
         // would not change that, so they are not run. A Clean run with the
         // wrong output is still scored and the remaining cases still run.
-        if class != RunClass::Clean {
-            unclean = Some(class);
-            break;
-        }
-        match nugget.objective {
-            Objective::PassAll => {
-                let expected = case.expected.as_deref().unwrap_or("");
-                if result.stdout.trim_end() == expected.trim_end() {
-                    passed = passed.saturating_add(1);
-                } else {
-                    mismatches = mismatches.saturating_add(1);
-                }
-            }
-            Objective::Minimize => match parse_score(&result.stdout) {
-                Ok(value) => {
-                    sum += value;
-                    passed = passed.saturating_add(1);
-                }
-                Err(note) => {
-                    if bad_score.is_none() {
-                        bad_score = Some(note);
+        if class == RunClass::Clean {
+            match nugget.objective {
+                Objective::PassAll => {
+                    let expected = case.expected.as_deref().unwrap_or("");
+                    if result.stdout.trim_end() == expected.trim_end() {
+                        passed = passed.saturating_add(1);
+                    } else {
+                        mismatches = mismatches.saturating_add(1);
                     }
                 }
-            },
+                Objective::Minimize => match parse_score(&result.stdout) {
+                    Ok(value) => {
+                        sum += value;
+                        passed = passed.saturating_add(1);
+                    }
+                    Err(note) => {
+                        if bad_score.is_none() {
+                            bad_score = Some(note);
+                        }
+                    }
+                },
+            }
+        } else {
+            unclean = Some(class);
+        }
+        runs.push(CaseCapture {
+            stdout: result.stdout,
+            kind: result.kind,
+        });
+        if unclean.is_some() {
+            break;
         }
     }
 
@@ -371,6 +581,7 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
             passed,
             score: 0.0,
             stop: Some(class_name(class).to_string()),
+            runs,
         });
     }
     if let Some(note) = bad_score {
@@ -378,6 +589,7 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
             passed,
             score: 0.0,
             stop: Some(note),
+            runs,
         });
     }
     let score = match nugget.objective {
@@ -389,12 +601,14 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
             passed,
             score: 0.0,
             stop: Some("non-finite score".to_string()),
+            runs,
         });
     }
     Ok(RunOutcome {
         passed,
         score,
         stop: None,
+        runs,
     })
 }
 

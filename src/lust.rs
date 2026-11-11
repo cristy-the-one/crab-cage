@@ -7,6 +7,7 @@
 //! kills on the wall clock: a straight-line body is not probed, and a lust
 //! that predates the flag has no guest deadline.
 
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -233,8 +234,53 @@ pub fn build(
     Ok(())
 }
 
-pub fn compile_rustc(source: &Path, output: &Path, edition: &str, timeout: Duration) -> Result<()> {
-    let rustc = which("rustc").ok_or_else(|| err("rustc is not on PATH"))?;
+/// Why rustc did not produce a binary.
+///
+/// `Rejected` is a compile error: the oracle records a divergence.
+/// `NotOnPath`, `TimedOut`, and `Failed` are problems running the compiler,
+/// and the caller returns them as errors.
+#[derive(Debug)]
+pub enum RustcError {
+    Rejected { message: String },
+    NotOnPath { message: String },
+    TimedOut { message: String },
+    Failed { message: String },
+}
+
+impl RustcError {
+    pub fn message(&self) -> &str {
+        match self {
+            RustcError::Rejected { message }
+            | RustcError::NotOnPath { message }
+            | RustcError::TimedOut { message }
+            | RustcError::Failed { message } => message,
+        }
+    }
+}
+
+impl fmt::Display for RustcError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.message())
+    }
+}
+
+impl std::error::Error for RustcError {}
+
+impl From<RustcError> for crate::error::Error {
+    fn from(error: RustcError) -> Self {
+        err(error.message())
+    }
+}
+
+pub fn compile_rustc(
+    source: &Path,
+    output: &Path,
+    edition: &str,
+    timeout: Duration,
+) -> std::result::Result<(), RustcError> {
+    let rustc = which("rustc").ok_or_else(|| RustcError::NotOnPath {
+        message: "rustc is not on PATH".to_string(),
+    })?;
     let result = tool_output(
         &rustc,
         &[
@@ -244,20 +290,64 @@ pub fn compile_rustc(source: &Path, output: &Path, edition: &str, timeout: Durat
             "opt-level=2",
             "-C",
             "debuginfo=0",
+            "-C",
+            "debug-assertions=on",
+            "-C",
+            "overflow-checks=on",
             "-o",
             &output.display().to_string(),
             &source.display().to_string(),
         ],
         timeout,
         &[],
-    )?;
-    if !result.success() {
-        return Err(err(format!(
-            "rustc failed: {}",
-            tail(&format!("{}{}", result.stderr, result.stdout))
-        )));
+    )
+    .map_err(|error| RustcError::Failed {
+        message: error.message,
+    })?;
+    match result.kind {
+        StopKind::Exited(0) => Ok(()),
+        StopKind::TimedOut => Err(RustcError::TimedOut {
+            message: format!("rustc timed out after {}ms", timeout.as_millis()),
+        }),
+        StopKind::Exited(_) => Err(RustcError::Rejected {
+            message: format!(
+                "rustc failed: {}",
+                tail(&format!("{}{}", result.stderr, result.stdout))
+            ),
+        }),
+        StopKind::MemorySignal => Err(RustcError::Failed {
+            message: "rustc was killed by the host memory limit".to_string(),
+        }),
     }
-    Ok(())
+}
+
+/// Edition 2024, then 2021 only when rustc rejects the edition itself.
+/// Returns the edition that worked.
+pub fn compile_rustc_any_edition(
+    source: &Path,
+    output: &Path,
+    timeout: Duration,
+) -> std::result::Result<String, RustcError> {
+    match compile_rustc(source, output, "2024", timeout) {
+        Ok(()) => Ok("2024".to_string()),
+        Err(problem) => {
+            let edition_problem = match &problem {
+                RustcError::Rejected { message } => {
+                    let text = message.to_lowercase();
+                    text.contains("edition")
+                        && (text.contains("unknown")
+                            || text.contains("invalid")
+                            || text.contains("must be one of"))
+                }
+                _ => false,
+            };
+            if !edition_problem {
+                return Err(problem);
+            }
+            compile_rustc(source, output, "2021", timeout)?;
+            Ok("2021".to_string())
+        }
+    }
 }
 
 pub fn classify(result: &ExecResult) -> RunClass {

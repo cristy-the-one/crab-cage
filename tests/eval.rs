@@ -6,6 +6,7 @@ use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use crab_cage::lust;
 use crab_cage::nugget::{self, Case, Nugget, Objective};
 use crab_cage::pipeline::{
     evaluate, format_verdict, Diagnostic, EvalOptions, Gate, Ms, Status, Toolchain, Verdict,
@@ -183,9 +184,10 @@ fn a_panic_is_rejected_at_run_with_the_class_name() {
 
 #[test]
 fn an_endless_loop_stops_after_the_first_unclean_case() {
-    // The first case exits clean. The second loops. The third must not run:
-    // one timeout is well under two. Either the host wall clock (`TimedOut`)
-    // or lust's own deadline (`TimeLust`) is a reject at `run`.
+    // The first case exits clean. The second loops. The third must not run.
+    // The host wall clock is the nugget timeout plus 500 ms, and one of
+    // those limits is well under two. Either the host kill (`TimedOut`) or
+    // lust's own deadline (`TimeLust`) is a reject at `run`.
     let timeout_ms = 500u64;
     let mut nugget = tiny(Objective::PassAll, timeout_ms, Some("ok\n"));
     nugget.cases = vec![
@@ -225,9 +227,10 @@ print!(\"ok\\n\");
     assert!(verdict.score.is_none());
     assert_eq!(verdict.total, 3);
     assert_eq!(verdict.passed, 1);
+    let host_ms = timeout_ms + 500;
     assert!(
-        verdict.ms.run < 2 * timeout_ms,
-        "run ms {} is not under 2 x {timeout_ms}",
+        verdict.ms.run < 2 * host_ms,
+        "run ms {} is not under 2 x {host_ms}",
         verdict.ms.run
     );
 }
@@ -404,4 +407,392 @@ fn cli_json_exits_zero_only_when_scored_and_human_output_is_three_lines() {
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(stdout.contains("\"gate\":\"prefilter\""), "{stdout}");
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
+}
+
+fn options_oracle(label: &str) -> EvalOptions {
+    let mut opts = options(label);
+    opts.oracle = true;
+    opts
+}
+
+/// Stand-in lust whose `build` writes a copy of itself that prints one fixed
+/// wrong line. Built once: the tests in this file run in parallel.
+fn wrong_lust() -> PathBuf {
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT.get_or_init(build_wrong_lust).clone()
+}
+
+fn build_wrong_lust() -> PathBuf {
+    let dir =
+        std::env::temp_dir().join(format!("crab-cage-eval-wrong-lust-{}", std::process::id()));
+    if dir.exists() {
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("wrong_lust.rs");
+    fs::write(&source, WRONG_LUST).unwrap();
+    let output = dir.join(if cfg!(windows) {
+        "wrong_lust.exe"
+    } else {
+        "wrong_lust"
+    });
+    let status = Command::new("rustc")
+        .args([
+            "--edition",
+            "2021",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "debuginfo=0",
+            "-o",
+        ])
+        .arg(&output)
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success(), "fake lust failed to compile");
+    output
+}
+
+const WRONG_LUST: &str = r#"
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+use std::process;
+
+fn main() {
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("wrong-lust"));
+    let mode_path = PathBuf::from(format!("{}.crabmode", exe.display()));
+    if let Ok(mode) = fs::read_to_string(&mode_path) {
+        if mode.trim() == "wrong" {
+            println!("wrong");
+        }
+        return;
+    }
+    let args: Vec<String> = env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--version") => {
+            println!("lust 0.3.0-fake");
+        }
+        None => {
+            eprintln!("usage: lust <check|build|run> <file.rs> [--sandbox] [--max-memory <size>] [--time-limit <duration>]");
+            process::exit(2);
+        }
+        Some("check") => {
+            if !args.iter().any(|arg| arg == "--sandbox") {
+                eprintln!("expected --sandbox");
+                process::exit(3);
+            }
+            if args.iter().any(|arg| arg == "--json") {
+                println!("{{\"schema\":1,\"ok\":true}}");
+            }
+        }
+        Some("build") => cmd_build(&args, &exe),
+        _ => {
+            eprintln!("fake lust: unknown command");
+            process::exit(2);
+        }
+    }
+}
+
+fn cmd_build(args: &[String], exe: &std::path::Path) {
+    if !args.iter().any(|arg| arg == "--sandbox")
+        || !args.iter().any(|arg| arg == "--max-memory")
+        || !args.iter().any(|arg| arg == "--time-limit")
+    {
+        eprintln!("build requires --sandbox, --max-memory and --time-limit");
+        process::exit(3);
+    }
+    let out = match flag(args, "-o") {
+        Some(path) => path,
+        None => {
+            eprintln!("missing -o");
+            process::exit(3);
+        }
+    };
+    if let Err(err) = fs::copy(exe, &out) {
+        eprintln!("copy failed: {err}");
+        process::exit(4);
+    }
+    if let Err(err) = fs::write(format!("{out}.crabmode"), "wrong\n") {
+        eprintln!("mode failed: {err}");
+        process::exit(4);
+    }
+}
+
+fn flag(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == name)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+}
+"#;
+
+fn oracle_name(hash: &str) -> String {
+    if cfg!(windows) {
+        format!("{hash}.oracle.exe")
+    } else {
+        format!("{hash}.oracle")
+    }
+}
+
+#[test]
+fn oracle_without_lust_proves_a_correct_body() {
+    let nugget = demo();
+    let opts = options_oracle("oracle-proven");
+    let verdict = evaluate(
+        &nugget,
+        "    xs.iter().map(|x| x * x).sum()\n",
+        &no_lust(),
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(verdict.status, Status::Proven, "{}", verdict.note);
+    assert_eq!(verdict.gate, Gate::Oracle);
+    assert_eq!(verdict.score, Some(0.0));
+    assert_eq!(verdict.passed, 3);
+    assert_eq!(verdict.total, 3);
+    assert!(verdict.note.is_empty(), "{}", verdict.note);
+    assert!(!opts.work_dir.join("divergences").exists());
+    assert!(
+        !opts.work_dir.join(oracle_name(&verdict.hash)).exists(),
+        "no lust means the fast build is already rustc"
+    );
+}
+
+#[test]
+fn oracle_with_the_fake_lust_diverges_and_writes_the_case() {
+    let nugget = demo();
+    let tool = lust::probe(&wrong_lust(), Duration::from_secs(30)).unwrap();
+    let opts = options_oracle("oracle-diverged");
+    let verdict = evaluate(
+        &nugget,
+        "    xs.iter().map(|x| x * x).sum()\n",
+        &Toolchain { lust: Some(tool) },
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(verdict.status, Status::Diverged, "{}", verdict.note);
+    assert_eq!(verdict.gate, Gate::Oracle);
+    assert_eq!(verdict.score, Some(3.0));
+    assert_eq!(verdict.passed, 0);
+    assert_eq!(verdict.total, 3);
+    assert!(verdict.ms.oracle > 0, "oracle ms {}", verdict.ms.oracle);
+    let div = opts.work_dir.join("divergences").join(&verdict.hash);
+    assert!(div.is_dir(), "missing {}", div.display());
+    let source = fs::read_to_string(div.join("source.rs")).unwrap();
+    assert!(source.contains("x * x"), "{source}");
+    assert_eq!(
+        fs::read_to_string(div.join("case.in")).unwrap(),
+        nugget.cases[0].input
+    );
+    assert_eq!(
+        fs::read_to_string(div.join("fast.stdout")).unwrap(),
+        "wrong\n"
+    );
+    assert_eq!(
+        fs::read_to_string(div.join("oracle.stdout")).unwrap(),
+        nugget.cases[0].expected.as_deref().unwrap()
+    );
+    let readme = fs::read_to_string(div.join("README.txt")).unwrap();
+    assert!(readme.contains("lust version: lust 0.3.0-fake"), "{readme}");
+    assert!(readme.contains("build --sandbox"), "{readme}");
+    assert!(
+        readme.contains("rustc --edition 2024") || readme.contains("rustc --edition 2021"),
+        "{readme}"
+    );
+    assert!(readme.contains("-C debug-assertions=on"), "{readme}");
+    assert!(readme.contains("-C overflow-checks=on"), "{readme}");
+    assert!(
+        readme.contains(&format!("case: {}", nugget.cases[0].id)),
+        "{readme}"
+    );
+}
+
+#[test]
+fn oracle_diverges_when_rustc_rejects_what_lust_built() {
+    let tool = lust::probe(&wrong_lust(), Duration::from_secs(30)).unwrap();
+    let opts = options_oracle("oracle-rejected");
+    let verdict = evaluate(
+        &demo(),
+        "    this is not rust\n",
+        &Toolchain { lust: Some(tool) },
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(verdict.status, Status::Diverged);
+    assert_eq!(verdict.gate, Gate::Oracle);
+    assert_eq!(verdict.note, "lust accepted, rustc rejected");
+    let div = opts.work_dir.join("divergences").join(&verdict.hash);
+    assert!(div.is_dir(), "missing {}", div.display());
+    let stderr = fs::read_to_string(div.join("rustc.stderr")).unwrap();
+    assert!(stderr.contains("rustc"), "{stderr}");
+    let source = fs::read_to_string(div.join("source.rs")).unwrap();
+    assert!(source.contains("this is not rust"), "{source}");
+    let readme = fs::read_to_string(div.join("README.txt")).unwrap();
+    assert!(readme.contains("lust version: lust 0.3.0-fake"), "{readme}");
+    assert!(readme.contains("rustc --edition 2024"), "{readme}");
+    assert!(readme.contains("-C debug-assertions=on"), "{readme}");
+    assert!(readme.contains("-C overflow-checks=on"), "{readme}");
+    assert!(!div.join("case.in").exists());
+}
+
+#[test]
+fn rustc_keeps_debug_assertions_and_overflow_checks() {
+    let debug = "\
+    let base: i64 = xs.iter().map(|x| x * x).sum();
+    if cfg!(debug_assertions) { base } else { base + 1 }
+";
+    let verdict = evaluate(&demo(), debug, &no_lust(), &options_oracle("oracle-debug")).unwrap();
+    assert_eq!(verdict.status, Status::Proven, "{}", verdict.note);
+    assert_eq!(verdict.score, Some(0.0), "{}", verdict.note);
+    assert_eq!(verdict.passed, 3);
+
+    let overflow = "\
+    let value = std::hint::black_box(i64::MAX);
+    let _ = value + 1;
+    xs.iter().map(|x| x * x).sum()
+";
+    let verdict = evaluate(&demo(), overflow, &no_lust(), &options("oracle-overflow")).unwrap();
+    assert_eq!(verdict.status, Status::Rejected, "{}", verdict.note);
+    assert_eq!(verdict.gate, Gate::Run);
+    assert_eq!(verdict.note, "Panic");
+}
+
+#[test]
+fn oracle_rejects_output_that_changes_between_runs() {
+    let tool = lust::probe(&wrong_lust(), Duration::from_secs(30)).unwrap();
+    let opts = options_oracle("oracle-unstable");
+    let candidate = "\
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as i64)
+        .unwrap_or(0)
+";
+    let verdict = evaluate(&demo(), candidate, &Toolchain { lust: Some(tool) }, &opts).unwrap();
+    assert_eq!(verdict.status, Status::Rejected, "{}", verdict.note);
+    assert_eq!(verdict.gate, Gate::Oracle);
+    assert_eq!(verdict.note, "nondeterministic output");
+    assert!(!opts.work_dir.join("divergences").exists());
+}
+
+#[test]
+fn oracle_returns_an_error_when_rustc_is_missing_or_times_out() {
+    let source_dir = work("oracle-timeout-src");
+    fs::create_dir_all(&source_dir).unwrap();
+    let source = source_dir.join("slow.rs");
+    fs::write(&source, "fn main() {}\n").unwrap();
+    let output = source_dir.join(if cfg!(windows) { "slow.exe" } else { "slow" });
+    let timed_out = lust::compile_rustc_any_edition(&source, &output, Duration::from_millis(1));
+    match timed_out {
+        Err(lust::RustcError::TimedOut { message }) => {
+            assert!(message.contains("timed out"), "{message}");
+        }
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+
+    let exe = crab_exe();
+    let dir = work("oracle-no-rustc");
+    fs::create_dir_all(&dir).unwrap();
+    let good = dir.join("good.rs");
+    fs::write(&good, "    xs.iter().map(|x| x * x).sum()\n").unwrap();
+    let work_dir = dir.join("work");
+    let output = Command::new(&exe)
+        .arg("eval")
+        .arg(demo_dir())
+        .arg(&good)
+        .arg("--oracle")
+        .arg("--lust-bin")
+        .arg(wrong_lust())
+        .arg("--work-dir")
+        .arg(&work_dir)
+        .env("PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout {}\nstderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("rustc is not on PATH"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("diverged"), "{stdout}");
+    assert!(
+        !stdout.contains("lust accepted, rustc rejected"),
+        "{stdout}"
+    );
+    assert!(!work_dir.join("divergences").exists());
+}
+
+#[test]
+fn cli_oracle_proves_without_lust_and_diverges_with_the_fake() {
+    let exe = crab_exe();
+    assert!(exe.is_file(), "missing binary {}", exe.display());
+    let dir = work("cli-oracle");
+    fs::create_dir_all(&dir).unwrap();
+    let good = dir.join("good.rs");
+    fs::write(&good, "    xs.iter().map(|x| x * x).sum()\n").unwrap();
+
+    let good_work = dir.join("good-work");
+    let output = Command::new(&exe)
+        .arg("eval")
+        .arg(demo_dir())
+        .arg(&good)
+        .arg("--json")
+        .arg("--oracle")
+        .arg("--work-dir")
+        .arg(&good_work)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(stdout.lines().count(), 1, "{stdout}");
+    assert!(stdout.contains("\"status\":\"proven\""), "{stdout}");
+    assert!(stdout.contains("\"gate\":\"oracle\""), "{stdout}");
+    assert!(stdout.contains("\"score\":0.0"), "{stdout}");
+
+    let fake_work = dir.join("fake-work");
+    let output = Command::new(&exe)
+        .arg("eval")
+        .arg(demo_dir())
+        .arg(&good)
+        .arg("--json")
+        .arg("--oracle")
+        .arg("--lust-bin")
+        .arg(wrong_lust())
+        .arg("--work-dir")
+        .arg(&fake_work)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stderr {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("\"status\":\"diverged\""), "{stdout}");
+    assert!(stdout.contains("\"gate\":\"oracle\""), "{stdout}");
+    let hash = json_string_field(&stdout, "hash");
+    assert!(fake_work.join("divergences").join(hash).is_dir());
+}
+
+fn json_string_field(stdout: &str, key: &str) -> String {
+    let pattern = format!("\"{key}\":\"");
+    let start = stdout
+        .find(&pattern)
+        .unwrap_or_else(|| panic!("no {key} in {stdout}"))
+        + pattern.len();
+    let rest = &stdout[start..];
+    let end = rest
+        .find('"')
+        .unwrap_or_else(|| panic!("unterminated {key} in {stdout}"));
+    rest[..end].to_string()
 }

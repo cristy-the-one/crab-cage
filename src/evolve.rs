@@ -283,7 +283,7 @@ fn verify_winner(
     }
 
     let built = work.join(bin_name("rustc_candidate"));
-    let edition = compile_rustc_with_fallback(source_path, &built, options.compile_timeout)?;
+    let edition = lust::compile_rustc_any_edition(source_path, &built, options.compile_timeout)?;
     verification.rustc_edition = Some(edition.clone());
     let (error, lines) = replay(genome, &built, options)?;
     verification.rustc_replay_error = Some(error);
@@ -329,26 +329,6 @@ fn first_difference(lust_lines: &[String], rustc_lines: &[String]) -> String {
     "lust and rustc disagree; this is a lust bug".to_string()
 }
 
-/// Build with edition 2024, and retry with 2021 only when rustc says the
-/// edition itself is unknown or invalid. Returns the edition that worked.
-fn compile_rustc_with_fallback(source: &Path, output: &Path, timeout: Duration) -> Result<String> {
-    match lust::compile_rustc(source, output, "2024", timeout) {
-        Ok(()) => Ok("2024".to_string()),
-        Err(problem) => {
-            let text = problem.to_string().to_lowercase();
-            let edition_problem = text.contains("edition")
-                && (text.contains("unknown")
-                    || text.contains("invalid")
-                    || text.contains("must be one of"));
-            if !edition_problem {
-                return Err(problem);
-            }
-            lust::compile_rustc(source, output, "2021", timeout)?;
-            Ok("2021".to_string())
-        }
-    }
-}
-
 fn compile_candidate(source: &Path, work: &Path, options: &RunOptions) -> Result<PathBuf> {
     if let Some(path) = &options.lust_bin {
         let tool = lust::probe(path, Duration::from_secs(10))?;
@@ -380,7 +360,7 @@ fn compile_candidate(source: &Path, work: &Path, options: &RunOptions) -> Result
         }
     }
     let built = work.join(bin_name("rustc_candidate"));
-    compile_rustc_with_fallback(source, &built, options.compile_timeout)?;
+    lust::compile_rustc_any_edition(source, &built, options.compile_timeout)?;
     Ok(built)
 }
 

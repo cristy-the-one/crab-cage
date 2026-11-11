@@ -101,6 +101,9 @@ struct EvalArgs {
     /// Print the verdict as one JSON line.
     #[arg(long)]
     json: bool,
+    /// After a score, compile the same program with rustc and compare.
+    #[arg(long)]
+    oracle: bool,
 }
 
 fn main() -> ExitCode {
@@ -363,7 +366,7 @@ fn eval_cmd(args: EvalArgs) -> Result<ExitCode> {
             work_dir,
             host_memory: 1024 * 1024 * 1024,
             compile_timeout: Duration::from_secs(180),
-            oracle: false,
+            oracle: args.oracle,
         },
     )?;
     if args.json {
