@@ -17,6 +17,7 @@ These implement [STRATEGY.md](STRATEGY.md). Each package is one pull request. Gi
 6. Errors use `crate::error::err("message")`. No `unwrap()` outside tests.
 7. Code must build on Windows and Linux. Paths go through `std::path`. Executables get `.exe` on Windows (see `bin_name` in `src/evolve.rs`).
 8. Write nothing outside the directory the user named. No files in the current directory.
+9. Tests in one file run in parallel, so each test must use its own output path, or build shared helpers once (as `fake_lust()` in `tests/fake_lust.rs` does, with `std::sync::OnceLock`).
 
 ## Tiers
 
@@ -34,6 +35,8 @@ Phase 1:  WP-10 → WP-11 → WP-12 → WP-13 → WP-14
 Phase 2:  WP-15 → WP-16 → WP-17 → WP-18 → WP-19;  WP-20 any time after WP-14
 Phase 3:  L-03 … L-09, any order
 ```
+
+Phase 0 is done in [#2](https://github.com/cristy-the-one/crab-cage/pull/2), except WP-01 step B and L-01; next is WP-10.
 
 ---
 
@@ -69,7 +72,7 @@ Phase 3:  L-03 … L-09, any order
 
 **Unit tests to add in `src/lust.rs`.** A helper `fn flags_from_usage(text: &str) -> (bool, bool)` and two tests: the real 0.2.0 usage text (copy the first two lines from `lust` run with no arguments) gives `(false, false)`; the string `error: cannot read C:\x\--time-limit` gives `(false, false)`.
 
-**Done when.** `crab-cage lust-probe` against lust 0.2.0 prints `--time-limit: no`. Before merging, also check a 0.3.0 build prints `--max-memory: yes`; if 0.3.0's usage text does not name the flag, report that instead of working around it (it becomes part of L-04).
+**Done when.** `crab-cage lust-probe` against lust 0.2.0 prints `--time-limit: no`.
 
 ## WP-03 Stop emitting `f64::clamp` (T1)
 
