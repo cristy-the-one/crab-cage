@@ -99,8 +99,10 @@ fn read_candidate(path: &Path) -> Result<String> {
 ///
 /// The scan is a digit run, then an optional `.` and more digits, then an
 /// optional exponent. A digit run that follows a letter, a digit, `_`, or `.`
-/// is not a literal. Digits inside `"…"` and after `//` are not either. No
-/// literal means this proposer is finished.
+/// is not a literal. Digits inside `"…"` and after `//` are not either. A
+/// float is scaled by `1 + gaussian * 0.2`, except a zero (or any value
+/// whose product prints back unchanged), which takes an additive step of
+/// `gaussian * 0.1`. No literal means this proposer is finished.
 pub struct LiteralProposer {
     rng: Pcg64,
 }
@@ -131,7 +133,7 @@ impl Proposer for LiteralProposer {
         let Literal { start, end, kind } = literals[index];
         let replacement = match kind {
             LiteralKind::Int(value) => tweak_int(&mut self.rng, value),
-            LiteralKind::Float(value) => tweak_float(&mut self.rng, value),
+            LiteralKind::Float(value) => tweak_float(&mut self.rng, value, &text[start..end]),
         };
         Ok(Some(replace_span(text, start, end, &replacement)))
     }
@@ -295,9 +297,17 @@ fn apply_delta(value: u128, delta: i32) -> Option<u128> {
     }
 }
 
-fn tweak_float(rng: &mut Pcg64, value: f64) -> String {
-    let scaled = value * (1.0 + rng.gauss() * 0.2);
-    rust_f64(scaled)
+/// Multiply by `1 + gaussian * 0.2`. When that product is the same number, or
+/// it prints as the original token, add `gaussian * 0.1` instead. A literal
+/// `0.0` would otherwise stay `0.0`.
+fn tweak_float(rng: &mut Pcg64, value: f64, original: &str) -> String {
+    let gauss = rng.gauss();
+    let scaled = value * (1.0 + gauss * 0.2);
+    let printed = rust_f64(scaled);
+    if printed != original && scaled != value {
+        return printed;
+    }
+    rust_f64(value + gauss * 0.1)
 }
 
 fn replace_span(text: &str, start: usize, end: usize, replacement: &str) -> String {
@@ -445,6 +455,32 @@ mod tests {
         assert_eq!(middle, expected);
         assert_ne!(middle, "0.5");
         assert!(!got.contains("let n = 9"), "{got}");
+    }
+
+    #[test]
+    fn a_zero_float_takes_an_additive_step() {
+        let source = "let k = 0.0;";
+        let nugget = nugget_with_seed(source);
+        let mut proposer = LiteralProposer::new(1);
+        let got = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+
+        let spans = find_literals(source);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(&source[spans[0].start..spans[0].end], "0.0");
+        let suffix = &source[spans[0].end..];
+        assert_eq!(&got[..spans[0].start], &source[..spans[0].start]);
+        assert!(got.ends_with(suffix), "{got}");
+        let middle = &got[spans[0].start..got.len() - suffix.len()];
+
+        let mut rng = Pcg64::new(1, TWEAK_STREAM);
+        let _ = rng.gen_index(1);
+        let gauss = rng.gauss();
+        let scaled = 0.0 * (1.0 + gauss * 0.2);
+        assert_eq!(scaled, 0.0);
+        let expected = rust_f64(0.0 + gauss * 0.1);
+        assert_eq!(middle, expected);
+        assert_ne!(middle, "0.0");
+        assert_ne!(got, source);
     }
 
     #[test]
