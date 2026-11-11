@@ -222,6 +222,16 @@ crab-cage models                               # model notes for a 16 GB GPU
 
 Copy `crab-cage.toml.example` to `crab-cage.toml` to set `evolve`'s options without flags. A flag wins over the file, and the file wins over the built-in default.
 
+## Delta kernels
+
+`docs/delta-kernels.md` is the measured comparison of v0.03 firmware delta kernels. The nugget is `nuggets/delta-kernel`. The corpus is `corpus/pairs`: compiled images plus synthetic pairs. Drop `old.srec` and `new.srec` into a new directory and run `crab-cage delta sync-cases`. A kernel's byte count counts only after `crab-cage delta eval` packs the transcript and the reference decoder accepts it.
+
+```sh
+crab-cage delta eval nuggets/delta-kernel/candidates/06-optimal.rs
+crab-cage run nuggets/delta-kernel --candidates nuggets/delta-kernel/candidates
+crab-cage run nuggets/delta-kernel --backend local --model qwen2.5-coder:14b
+```
+
 ## Tests
 
 ```sh
@@ -253,7 +263,7 @@ src/supervisor.rs  wall clock, memory cap, output capture for a child
 src/spawn.rs       starting a child with three pipes (a direct call on Windows)
 src/llm.rs, http.rs    the loopback chat client
 src/evolve.rs, ga.rs, genome.rs, plant.rs, …   the controller search
-nuggets/           example nuggets
+nuggets/           example nuggets, including delta-kernel
 tests/             the suite; tests/probes/ are small programs the tests compile
-docs/              DESIGN.md, STRATEGY.md, WORK-PACKAGES.md, briefs/
+docs/              DESIGN.md, STRATEGY.md, WORK-PACKAGES.md, delta-kernels.md, briefs/
 ```

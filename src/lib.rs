@@ -1,6 +1,7 @@
 //! Crab Cage: evolve Rust process controllers offline and run them in lust's sandbox.
 
 pub mod control;
+pub mod delta;
 pub mod emit;
 pub mod error;
 pub mod evolve;

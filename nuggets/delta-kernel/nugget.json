@@ -1,0 +1,6 @@
+{
+  "name": "delta-kernel",
+  "objective": "minimize",
+  "timeout_ms": 20000,
+  "max_memory": "128M"
+}
