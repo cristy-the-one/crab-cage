@@ -120,6 +120,8 @@ Every candidate, at whatever gate it stops, is one line in `journal.jsonl`.
 
 ## 6. The plan
 
+As of 2026-11-11, Phases 0 and 1 and the first package of Phase 2 are done; the status table is at the top of [WORK-PACKAGES.md](WORK-PACKAGES.md).
+
 Four phases. Each phase leaves the repo working and more useful than before. Stop after any phase and nothing is half-built.
 
 | Phase | Goal | Packages | Done when |
@@ -127,7 +129,7 @@ Four phases. Each phase leaves the repo working and more useful than before. Sto
 | 0. Make it true | The existing tool works against a real lust on Windows | WP-01 … WP-06, L-01, L-02 | `crab-cage evolve --lust-bin <real lust>` finishes, lust and rustc both run on the winner, their outputs are compared |
 | 1. The primitive | One candidate through the funnel, as a CLI call any agent can use | WP-10 … WP-14 | `crab-cage eval nuggets/demo cand.rs --json` prints a verdict |
 | 2. The loop | Many candidates, journal, model in the loop, speed as an objective | WP-15 … WP-20 | `crab-cage run nuggets/demo` ends in a `PROVEN` candidate or says none was found |
-| 3. Feed lust | Close the gaps the loop exposes | L-03 … L-09 | Divergences and top reject codes turn into lust test cases |
+| 3. Feed lust | Close the gaps the loop exposes | L-03 … L-11 | Divergences and top reject codes turn into lust test cases |
 
 Phase 0 and the L-packages can run in parallel with Phase 1; they touch different files.
 
