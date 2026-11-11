@@ -5,6 +5,9 @@
 //! second time with `oracle: true` in the same work directory, and only that
 //! verdict is appended. Only a `proven` verdict becomes the best. `diverged`,
 //! and a reject whose note is `nondeterministic output`, do not.
+//!
+//! A resumed run keeps the lowest proven score already in the journal. The
+//! text comes from `best.region.rs` when that file hashes to the same line.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -20,6 +23,9 @@ use crate::proposer::{Feedback, Proposer};
 const HOST_MEMORY: u64 = 1024 * 1024 * 1024;
 const COMPILE_TIMEOUT: Duration = Duration::from_secs(180);
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
+/// Proposals that are already in the journal, or whose evaluation returns an
+/// error, do not append a line. This many in a row ends the run.
+const UNJOURNALED_LIMIT: usize = 50;
 
 /// Knobs for [`execute`]. The command line's default budget is 200.
 pub struct RunOptions {
@@ -30,13 +36,16 @@ pub struct RunOptions {
     pub lust_bin: Option<PathBuf>,
 }
 
-/// Whether the journal contains a proven candidate after the run.
+/// Whether this run's journal meets the objective's exit rule.
+///
+/// `pass_all` needs a proven score of 0. `minimize` needs any proven candidate.
 pub struct RunOutput {
-    pub proven: bool,
+    pub solved: bool,
 }
 
 struct Best {
-    text: String,
+    /// Present when `best.region.rs` is the text of `score`'s journal line.
+    text: Option<String>,
     score: f64,
 }
 
@@ -46,12 +55,17 @@ struct Outcome {
 }
 
 /// Evaluate the seed, then ask `proposers` in round-robin until the budget is
-/// spent, every proposer returns [`None`](Proposer::next), or a proven
-/// `pass_all` candidate scores 0.
+/// spent, every proposer returns [`None`](Proposer::next), a proven `pass_all`
+/// candidate scores 0, or [`UNJOURNALED_LIMIT`] proposals in a row leave no
+/// journal line.
 ///
 /// Writes `<out>/journal.jsonl`, and `<out>/best.rs` plus `<out>/best.region.rs`
 /// when a proven candidate becomes the best. Prints one line per journaled
-/// candidate and then the journal summary.
+/// candidate, a stop line when the unjournaled limit is hit, and then the
+/// journal summary.
+///
+/// [`RunOutput::solved`] is true for `pass_all` only when a proven score is 0,
+/// and for `minimize` when any candidate is proven.
 pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Result<RunOutput> {
     let nugget = nugget::load(&options.nugget_dir)?;
     let lust = match &options.lust_bin {
@@ -64,9 +78,10 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
     let mut journal = Journal::open(&journal_path)?;
     let work_dir = options.out_dir.join("work");
 
-    let mut best: Option<Best> = None;
+    let mut best = restored_best(&options.out_dir, &journal_path)?;
     let mut last: Option<(String, Verdict)> = None;
     let mut evaluated = 0usize;
+    let mut unjournaled = 0usize;
     let mut cursor = 0usize;
     let mut exhausted = vec![false; proposers.len()];
 
@@ -88,7 +103,7 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
             evaluated += 1;
         }
         if outcome.stop {
-            return finish(&journal_path);
+            return finish(&journal_path, nugget.objective);
         }
     }
 
@@ -101,6 +116,9 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
             break;
         };
         if journal.seen(&candidate_hash(&text)) {
+            if note_unjournaled(&mut unjournaled) {
+                break;
+            }
             continue;
         }
         let outcome = record(
@@ -118,41 +136,141 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
         )?;
         if outcome.recorded {
             evaluated += 1;
+            unjournaled = 0;
+        } else if note_unjournaled(&mut unjournaled) {
+            break;
         }
         if outcome.stop {
             break;
         }
     }
 
-    finish(&journal_path)
+    finish(&journal_path, nugget.objective)
 }
 
-fn finish(journal_path: &Path) -> Result<RunOutput> {
+fn note_unjournaled(count: &mut usize) -> bool {
+    *count += 1;
+    if *count >= UNJOURNALED_LIMIT {
+        println!("{}", unjournaled_stop_line());
+        true
+    } else {
+        false
+    }
+}
+
+fn unjournaled_stop_line() -> String {
+    format!("stopped: {UNJOURNALED_LIMIT} proposals in a row left no journal line")
+}
+
+fn finish(journal_path: &Path, objective: Objective) -> Result<RunOutput> {
     let summary = Journal::summary(journal_path)?;
     print!("{summary}");
+    let proven = scan_proven(journal_path)?;
     Ok(RunOutput {
-        proven: summary_has_proven(&summary),
+        solved: exit_solved(objective, &proven),
     })
 }
 
-/// True when the summary's status line reports a non-zero proven count.
-fn summary_has_proven(summary: &str) -> bool {
-    for line in summary.lines() {
-        let Some(rest) = line.strip_prefix("status ") else {
+fn exit_solved(objective: Objective, proven: &ProvenScan) -> bool {
+    match objective {
+        Objective::PassAll => proven.zero,
+        Objective::Minimize => proven.any,
+    }
+}
+
+struct ProvenScan {
+    lowest_score: Option<f64>,
+    lowest_hash: Option<String>,
+    any: bool,
+    zero: bool,
+}
+
+/// Lowest finite `proven` score in the journal. A tie keeps the earlier line.
+/// A truncated final line is ignored, matching [`Journal::open`].
+fn scan_proven(path: &Path) -> Result<ProvenScan> {
+    let text = if path.is_file() {
+        fs::read_to_string(path)?
+    } else {
+        String::new()
+    };
+    let ends_with_newline = text.ends_with('\n');
+    let segments: Vec<&str> = text.split('\n').collect();
+    let mut scan = ProvenScan {
+        lowest_score: None,
+        lowest_hash: None,
+        any: false,
+        zero: false,
+    };
+    for (index, raw) in segments.iter().enumerate() {
+        let line = raw.trim_end_matches('\r').trim();
+        if line.is_empty() {
+            continue;
+        }
+        let is_last = index + 1 == segments.len();
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) if is_last && !ends_with_newline => continue,
+            Err(error) => {
+                return Err(err(format!(
+                    "{}: journal line {}: {error}",
+                    path.display(),
+                    index + 1
+                )));
+            }
+        };
+        if value.get("status").and_then(|status| status.as_str()) != Some("proven") {
+            continue;
+        }
+        scan.any = true;
+        let Some(score) = value.get("score").and_then(serde_json::Value::as_f64) else {
             continue;
         };
-        for part in rest.split_whitespace() {
-            if let Some(count) = part.strip_prefix("proven=") {
-                return count != "0";
-            }
+        if !score.is_finite() {
+            continue;
+        }
+        if score == 0.0 {
+            scan.zero = true;
+        }
+        let Some(hash) = value.get("hash").and_then(|hash| hash.as_str()) else {
+            continue;
+        };
+        let take = match scan.lowest_score {
+            Some(best) => score < best,
+            None => true,
+        };
+        if take {
+            scan.lowest_score = Some(score);
+            scan.lowest_hash = Some(hash.to_string());
         }
     }
-    false
+    Ok(scan)
+}
+
+fn restored_best(out_dir: &Path, journal_path: &Path) -> Result<Option<Best>> {
+    let scan = scan_proven(journal_path)?;
+    let (Some(score), Some(hash)) = (scan.lowest_score, scan.lowest_hash) else {
+        return Ok(None);
+    };
+    let region = out_dir.join("best.region.rs");
+    let text = if region.is_file() {
+        let body = fs::read_to_string(&region)
+            .map_err(|error| err(format!("{}: {error}", region.display())))?;
+        if candidate_hash(&body) == hash {
+            Some(body)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    Ok(Some(Best { text, score }))
 }
 
 fn feedback_of<'a>(best: &'a Option<Best>, last: &'a Option<(String, Verdict)>) -> Feedback<'a> {
     Feedback {
-        best: best.as_ref().map(|best| (best.text.as_str(), best.score)),
+        best: best
+            .as_ref()
+            .and_then(|best| best.text.as_deref().map(|text| (text, best.score))),
         last: last
             .as_ref()
             .map(|(text, verdict)| (text.as_str(), verdict)),
@@ -279,7 +397,7 @@ fn remember(
                 fs::write(out_dir.join("best.rs"), nugget.splice(candidate))?;
                 fs::write(out_dir.join("best.region.rs"), candidate)?;
                 *best = Some(Best {
-                    text: candidate.to_string(),
+                    text: Some(candidate.to_string()),
                     score,
                 });
             }
@@ -412,7 +530,7 @@ mod tests {
     fn only_a_finite_scored_improvement_asks_for_the_oracle() {
         assert!(would_improve(&verdict(Status::Scored, Some(3.0)), &None));
         let best = Some(Best {
-            text: "old".to_string(),
+            text: Some("old".to_string()),
             score: 3.0,
         });
         assert!(would_improve(&verdict(Status::Scored, Some(1.0)), &best));
@@ -520,6 +638,84 @@ mod tests {
     fn a_missing_score_prints_a_dash() {
         let line = format_candidate_line(4, &verdict(Status::Rejected, None), "seed");
         assert_eq!(line, "4 rejected run - seed");
+    }
+
+    #[test]
+    fn exit_follows_the_objective() {
+        let none = ProvenScan {
+            lowest_score: None,
+            lowest_hash: None,
+            any: false,
+            zero: false,
+        };
+        let nonzero = ProvenScan {
+            lowest_score: Some(1.0),
+            lowest_hash: Some("h".to_string()),
+            any: true,
+            zero: false,
+        };
+        let zero = ProvenScan {
+            lowest_score: Some(0.0),
+            lowest_hash: Some("h".to_string()),
+            any: true,
+            zero: true,
+        };
+        assert!(!exit_solved(Objective::PassAll, &none));
+        assert!(!exit_solved(Objective::PassAll, &nonzero));
+        assert!(exit_solved(Objective::PassAll, &zero));
+        assert!(!exit_solved(Objective::Minimize, &none));
+        assert!(exit_solved(Objective::Minimize, &nonzero));
+        assert!(exit_solved(Objective::Minimize, &zero));
+    }
+
+    #[test]
+    fn a_resumed_best_keeps_its_score_when_the_region_file_matches() {
+        let dir =
+            std::env::temp_dir().join(format!("crab-cage-run-restore-{}", std::process::id()));
+        if dir.exists() {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        fs::create_dir_all(&dir).unwrap();
+        let kept = "keep\n";
+        let hash = candidate_hash(kept);
+        let body = format!(
+            "{}\n{}\n{}\n",
+            journal_line(&hash, "proven", "1"),
+            journal_line("bbbbbbbbbbbbbbbb", "proven", "4"),
+            journal_line("cccccccccccccccc", "diverged", "0")
+        );
+        let journal = dir.join("journal.jsonl");
+        fs::write(&journal, body).unwrap();
+        fs::write(dir.join("best.region.rs"), kept).unwrap();
+        fs::write(dir.join("best.rs"), "old\n").unwrap();
+
+        let best = restored_best(&dir, &journal).unwrap().unwrap();
+        assert_eq!(best.score, 1.0);
+        assert_eq!(best.text.as_deref(), Some(kept));
+
+        fs::write(dir.join("best.region.rs"), "other\n").unwrap();
+        let best = restored_best(&dir, &journal).unwrap().unwrap();
+        assert_eq!(best.score, 1.0);
+        assert_eq!(best.text, None);
+
+        let nugget = nugget(Objective::PassAll);
+        let mut stored = Some(best);
+        let mut last = None;
+        remember(
+            &nugget,
+            "worse\n",
+            &verdict(Status::Proven, Some(2.0)),
+            &mut stored,
+            &mut last,
+            &dir,
+        )
+        .unwrap();
+        assert_eq!(fs::read_to_string(dir.join("best.rs")).unwrap(), "old\n");
+        assert_eq!(stored.as_ref().map(|best| best.score), Some(1.0));
+    }
+
+    fn journal_line(hash: &str, status: &str, score: &str) -> String {
+        format!(r#"{{"hash":"{hash}","status":"{status}","score":{score}}}"#)
     }
 
     struct List {

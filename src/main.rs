@@ -43,6 +43,9 @@ enum Command {
     /// Evaluate one candidate against a nugget.
     Eval(EvalArgs),
     /// Evaluate the seed and folder snippets, and journal each verdict.
+    ///
+    /// `pass_all` exits 0 only when a proven candidate scores 0.
+    /// `minimize` exits 0 when any candidate is proven.
     Run(RunArgs),
 }
 
@@ -388,7 +391,7 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
         },
         &mut proposers,
     )?;
-    if output.proven {
+    if output.solved {
         Ok(ExitCode::SUCCESS)
     } else {
         Ok(ExitCode::from(1))

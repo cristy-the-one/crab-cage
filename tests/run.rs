@@ -149,10 +149,10 @@ fn budget_counts_the_seed_before_a_snippet() {
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        output.status.success(),
-        "exit {:?} stdout {stdout} stderr {stderr}",
-        output.status.code()
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a pass_all run without a proven zero exits 1\nstdout {stdout} stderr {stderr}"
     );
     assert!(
         stdout.lines().next().unwrap().ends_with(" seed"),
@@ -248,4 +248,199 @@ fn a_zero_budget_records_nothing() {
     assert!(stdout.contains("best none\n"), "{stdout}");
     assert_eq!(journal_records(&out).len(), 0);
     assert!(!out.join("best.rs").exists());
+}
+
+#[test]
+fn a_resumed_run_does_not_replace_the_best_with_a_worse_candidate() {
+    let out = scratch("resume");
+    let candidates = scratch("resume-cands");
+    let better = "    if xs.len() == 4 { 0 } else { xs.iter().map(|x| x * x).sum() }\n";
+    let worse = "    if xs.len() == 1 { 49 } else { 0 }\n";
+    fs::write(candidates.join("a-better.rs"), better).unwrap();
+
+    let first = run(
+        &out,
+        &[
+            "run",
+            demo_dir().to_str().unwrap(),
+            "--candidates",
+            candidates.to_str().unwrap(),
+            "--budget",
+            "20",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&first.stdout);
+    let stderr = String::from_utf8_lossy(&first.stderr);
+    assert_eq!(
+        first.status.code(),
+        Some(1),
+        "score 1 is not solved\nstdout {stdout} stderr {stderr}"
+    );
+    let region_before = fs::read_to_string(out.join("best.region.rs")).unwrap();
+    let best_before = fs::read_to_string(out.join("best.rs")).unwrap();
+    assert_eq!(region_before, better);
+    let before = journal_records(&out);
+    assert_eq!(before.len(), 2);
+    assert_eq!(before[1]["status"], "proven");
+    assert_eq!(before[1]["score"], 1.0);
+
+    fs::write(candidates.join("b-worse.rs"), worse).unwrap();
+    let second = run(
+        &out,
+        &[
+            "run",
+            demo_dir().to_str().unwrap(),
+            "--candidates",
+            candidates.to_str().unwrap(),
+            "--budget",
+            "20",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&second.stdout);
+    let stderr = String::from_utf8_lossy(&second.stderr);
+    assert_eq!(
+        second.status.code(),
+        Some(1),
+        "stdout {stdout} stderr {stderr}"
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("best.region.rs")).unwrap(),
+        region_before
+    );
+    assert_eq!(
+        fs::read_to_string(out.join("best.rs")).unwrap(),
+        best_before
+    );
+    let after = journal_records(&out);
+    assert_eq!(after.len(), 3);
+    assert_eq!(after[2]["status"], "scored");
+    assert_eq!(after[2]["score"], 2.0);
+    assert_eq!(after[2]["proposer"], "folder");
+    assert!(stdout.contains("best 1 "), "{stdout}");
+}
+
+#[test]
+fn fifty_seen_proposals_stop_the_run_before_another_file() {
+    let out = scratch("dry-stop");
+    let nugget_dir = scratch("dry-stop-nugget");
+    let candidates = scratch("dry-stop-cands");
+    let seed = "    std::fs::read(\"a\");\n";
+    write_probe(&nugget_dir, "pass_all", seed, Some("ok\n"));
+    for index in 0..50 {
+        fs::write(candidates.join(format!("{index:02}.rs")), seed).unwrap();
+    }
+    fs::write(candidates.join("50.rs"), "    std::env::var(\"X\");\n").unwrap();
+
+    let output = run_nugget(&out, &nugget_dir, Some(&candidates), "80");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout {stdout} stderr {stderr}"
+    );
+    assert!(
+        stdout.contains("stopped: 50 proposals in a row left no journal line"),
+        "{stdout}"
+    );
+    let records = journal_records(&out);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["proposer"], "seed");
+    assert!(
+        records[0]["note"].as_str().unwrap().contains("std::fs"),
+        "{records:?}"
+    );
+}
+
+#[test]
+fn forty_nine_seen_proposals_still_journal_the_next_new_candidate() {
+    let out = scratch("dry-continue");
+    let nugget_dir = scratch("dry-continue-nugget");
+    let candidates = scratch("dry-continue-cands");
+    let seed = "    std::fs::read(\"a\");\n";
+    write_probe(&nugget_dir, "pass_all", seed, Some("ok\n"));
+    for index in 0..49 {
+        fs::write(candidates.join(format!("{index:02}.rs")), seed).unwrap();
+    }
+    fs::write(candidates.join("49.rs"), "    std::env::var(\"X\");\n").unwrap();
+
+    let output = run_nugget(&out, &nugget_dir, Some(&candidates), "80");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout {stdout} stderr {stderr}"
+    );
+    assert!(!stdout.contains("stopped:"), "{stdout}");
+    let records = journal_records(&out);
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[1]["status"], "rejected");
+    assert_eq!(records[1]["gate"], "prefilter");
+    assert!(
+        records[1]["note"].as_str().unwrap().contains("std::env"),
+        "{records:?}"
+    );
+}
+
+#[test]
+fn minimize_exits_zero_when_any_candidate_is_proven() {
+    let out = scratch("minimize");
+    let nugget_dir = scratch("minimize-nugget");
+    write_probe(&nugget_dir, "minimize", "println!(\"score: 4\");\n", None);
+    let output = run_nugget(&out, &nugget_dir, None, "5");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "stdout {stdout} stderr {stderr}");
+    assert!(stdout.contains("proven"), "{stdout}");
+    let records = journal_records(&out);
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0]["status"], "proven");
+    assert_eq!(records[0]["score"], 4.0);
+    let region = fs::read_to_string(out.join("best.region.rs")).unwrap();
+    assert_eq!(region, "println!(\"score: 4\");\n");
+}
+
+fn write_probe(dir: &std::path::Path, objective: &str, seed: &str, expected: Option<&str>) {
+    fs::create_dir_all(dir.join("cases")).unwrap();
+    fs::write(
+        dir.join("nugget.json"),
+        format!(r#"{{"name":"probe","objective":"{objective}"}}"#),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("template.rs"),
+        format!("fn main() {{\n// CRAB:BEGIN\n{seed}// CRAB:END\n}}\n"),
+    )
+    .unwrap();
+    fs::write(dir.join("cases").join("only.in"), "").unwrap();
+    if let Some(expected) = expected {
+        fs::write(dir.join("cases").join("only.out"), expected).unwrap();
+    }
+}
+
+fn run_nugget(
+    out: &PathBuf,
+    nugget_dir: &PathBuf,
+    candidates: Option<&PathBuf>,
+    budget: &str,
+) -> std::process::Output {
+    let mut args = vec![
+        "run".to_string(),
+        nugget_dir.to_str().unwrap().to_string(),
+        "--budget".to_string(),
+        budget.to_string(),
+        "--out".to_string(),
+        out.to_str().unwrap().to_string(),
+    ];
+    if let Some(candidates) = candidates {
+        args.push("--candidates".to_string());
+        args.push(candidates.to_str().unwrap().to_string());
+    }
+    let borrowed: Vec<&str> = args.iter().map(String::as_str).collect();
+    run(out, &borrowed)
 }
