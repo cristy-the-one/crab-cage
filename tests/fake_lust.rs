@@ -6,7 +6,15 @@ use std::time::Duration;
 use crab_cage::lust::{self, RunClass};
 use crab_cage::supervisor::{self, Limits, StopKind};
 
+/// The tests in this file run on parallel threads. Compile the stand-in
+/// once: two `rustc` runs writing the same output file fail on Windows
+/// (LNK1104), and a test could start the binary while it is being rewritten.
 fn fake_lust() -> PathBuf {
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT.get_or_init(build_fake_lust).clone()
+}
+
+fn build_fake_lust() -> PathBuf {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = root.join("tests/probes/fake_lust.rs");
     let out_dir = root.join("target/probes");
