@@ -132,7 +132,7 @@ fn control_fn(genome: &Genome) -> String {
             || (raw > 1.0 && error < 0.0)
             || (raw < 0.0 && error > 0.0);
         if integrating {{
-            memory.integral = (memory.integral + error).clamp(-120.0, 120.0);
+            memory.integral = clamp_range(memory.integral + error, -120.0, 120.0);
         }}
     }}
     memory.prev_error = error;
@@ -264,6 +264,10 @@ fn clamp01(value: f64) -> f64 {
     } else {
         value
     }
+}
+
+fn clamp_range(x: f64, lo: f64, hi: f64) -> f64 {
+    if x < lo { lo } else if x > hi { hi } else { x }
 }
 
 "#;
