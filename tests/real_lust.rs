@@ -138,3 +138,65 @@ fn real_lust_daemon_gives_the_same_verdicts_from_one_slot_file() {
     std::thread::sleep(Duration::from_millis(500));
     let _ = std::fs::remove_dir_all(&work);
 }
+
+/// `crab-cage run` with the daemon: candidates go through `slot.rs`, the
+/// right one is proven, and no daemon socket is left when the run ends.
+#[test]
+fn real_lust_run_uses_the_daemon_and_stops_it() {
+    use crab_cage::pipeline::SLOT_FILE;
+    use crab_cage::proposer::{FolderProposer, Proposer};
+    use crab_cage::run;
+
+    let Some(bin) = real_lust() else { return };
+    let root = std::env::temp_dir().join(format!("crab-cage-real-run-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let candidates = root.join("candidates");
+    std::fs::create_dir_all(&candidates).unwrap();
+    std::fs::write(
+        candidates.join("a_wrong.rs"),
+        "    49
+",
+    )
+    .unwrap();
+    std::fs::write(
+        candidates.join("b_broken.rs"),
+        "    let v: i64 = \"no\";
+    v
+",
+    )
+    .unwrap();
+    std::fs::write(
+        candidates.join("c_right.rs"),
+        "    xs.iter().map(|x| x * x).sum()
+",
+    )
+    .unwrap();
+    let out = root.join("out");
+    let mut folder = FolderProposer::new(candidates.as_path());
+    let mut proposers: Vec<&mut dyn Proposer> = vec![&mut folder];
+    let output = run::execute(
+        &run::RunOptions {
+            nugget_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("nuggets/sum-squares"),
+            budget: 20,
+            out_dir: out.clone(),
+            lust_bin: Some(bin),
+            lust_daemon: true,
+        },
+        &mut proposers,
+    )
+    .expect("run with a real lust");
+    assert!(output.solved);
+    let work = out.join("work");
+    assert!(work.join(SLOT_FILE).is_file());
+    let region = std::fs::read_to_string(out.join("best.region.rs")).unwrap();
+    assert!(region.contains("x * x"), "{region}");
+    let sockets: Vec<_> = std::fs::read_dir(&work)
+        .unwrap()
+        .flatten()
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with(".lust-daemon-") && name.ends_with(".sock"))
+        .collect();
+    assert!(sockets.is_empty(), "daemon socket left behind: {sockets:?}");
+    std::thread::sleep(Duration::from_millis(500));
+    let _ = std::fs::remove_dir_all(&root);
+}
