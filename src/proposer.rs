@@ -6,15 +6,21 @@
 //!
 //! [`LiteralProposer`] rewrites one numeric literal of the best candidate, or
 //! of the nugget seed when the run has no best text yet.
+//!
+//! [`ModelProposer`] asks a loopback model for the next region. The prompt is
+//! the template with the current best region in place, plus the last rejected
+//! verdict this proposer itself produced.
 
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::error::{err, Result};
 use crate::genome::rust_f64;
-use crate::nugget::Nugget;
-use crate::pipeline::Verdict;
+use crate::llm;
+use crate::nugget::{Nugget, Objective};
+use crate::pipeline::{candidate_hash, Diagnostic, Status, Verdict};
 use crate::rng::Pcg64;
 
 /// PCG stream for [`LiteralProposer`]. A different stream keeps this sequence
@@ -318,6 +324,282 @@ fn replace_span(text: &str, start: usize, end: usize, replacement: &str) -> Stri
     out
 }
 
+const MODEL_TIMEOUT: Duration = Duration::from_secs(180);
+/// Rejected verdicts in a row before the next prompt is based on the seed.
+const REJECTS_BEFORE_RESET: usize = 3;
+/// Endpoint failures or unusable replies in a row before this proposer stops.
+const PROPOSAL_ERROR_LIMIT: usize = 3;
+const SYSTEM_PREFIX: &str = "\
+You write the body of one region of a Rust program. Reply with only the new region text, no markdown fence, no explanation. Stay inside this subset of Rust:";
+
+/// Asks a loopback chat model for the next region.
+///
+/// The capability summary is fixed at construction (empty when lust is
+/// absent). A reply that still contains a region marker, or an empty reply,
+/// or a chat error, is not returned to the run. Three of those in a row
+/// finish the proposer. `run::execute` treats `Err` from [`Proposer::next`]
+/// as fatal and this package does not change that loop, so the failure stays
+/// here and `next` returns [`None`](Option::None) after printing the reason.
+///
+/// Repeats are not filtered here. The run already stops after 50 proposals
+/// in a row that leave no journal line, and the hash it uses is
+/// [`candidate_hash`](crate::pipeline::candidate_hash).
+pub struct ModelProposer {
+    endpoint: String,
+    model: String,
+    capabilities: String,
+    timeout: Duration,
+    memory: ModelMemory,
+}
+
+impl ModelProposer {
+    pub fn new(
+        endpoint: impl AsRef<str>,
+        model: impl Into<String>,
+        capabilities: impl Into<String>,
+    ) -> Result<Self> {
+        Ok(Self {
+            endpoint: llm::normalize_endpoint(endpoint)?,
+            model: model.into(),
+            capabilities: capabilities.into(),
+            timeout: MODEL_TIMEOUT,
+            memory: ModelMemory::default(),
+        })
+    }
+}
+
+impl Proposer for ModelProposer {
+    fn name(&self) -> &str {
+        "local"
+    }
+
+    fn next(&mut self, nugget: &Nugget, feedback: &Feedback) -> Result<Option<String>> {
+        if self.memory.stopped.is_some() {
+            return Ok(None);
+        }
+        let (system, user) = prepare_prompt(&mut self.memory, &self.capabilities, nugget, feedback);
+        loop {
+            let raw = llm::chat(&self.endpoint, &self.model, &system, &user, self.timeout);
+            match take_attempt(&mut self.memory, raw) {
+                Attempt::Propose(text) => return Ok(Some(text)),
+                Attempt::Finished => return Ok(None),
+                Attempt::Again => {}
+            }
+        }
+    }
+}
+
+/// Test stand-in. Each call takes the next scripted reply. No network.
+pub struct MockModelProposer {
+    replies: Vec<String>,
+    capabilities: String,
+    memory: ModelMemory,
+    prompts: Vec<Asked>,
+}
+
+struct Asked {
+    // Read by the unit tests. The library build only records the prompt.
+    #[allow(dead_code)]
+    system: String,
+    #[allow(dead_code)]
+    user: String,
+}
+
+impl MockModelProposer {
+    pub fn new(replies: Vec<String>, capabilities: impl Into<String>) -> Self {
+        Self {
+            replies,
+            capabilities: capabilities.into(),
+            memory: ModelMemory::default(),
+            prompts: Vec::new(),
+        }
+    }
+}
+
+impl Proposer for MockModelProposer {
+    fn name(&self) -> &str {
+        "mock"
+    }
+
+    fn next(&mut self, nugget: &Nugget, feedback: &Feedback) -> Result<Option<String>> {
+        if self.memory.stopped.is_some() || self.replies.is_empty() {
+            return Ok(None);
+        }
+        let (system, user) = prepare_prompt(&mut self.memory, &self.capabilities, nugget, feedback);
+        self.prompts.push(Asked { system, user });
+        loop {
+            if self.replies.is_empty() {
+                return Ok(None);
+            }
+            let raw = self.replies.remove(0);
+            match take_attempt(&mut self.memory, Ok(raw)) {
+                Attempt::Propose(text) => return Ok(Some(text)),
+                Attempt::Finished => return Ok(None),
+                Attempt::Again => {}
+            }
+        }
+    }
+}
+
+#[derive(Default)]
+struct ModelMemory {
+    rejected_in_a_row: usize,
+    errors_in_a_row: usize,
+    /// [`candidate_hash`](crate::pipeline::candidate_hash) of the last region
+    /// this proposer returned. `feedback.last` counts only when it matches.
+    proposed_hash: Option<String>,
+    /// Hash already folded into `rejected_in_a_row`, so one verdict is one count.
+    accounted_hash: Option<String>,
+    own: Option<Verdict>,
+    stopped: Option<String>,
+}
+
+impl ModelMemory {
+    fn observe(&mut self, feedback: &Feedback) {
+        let Some((text, verdict)) = feedback.last else {
+            return;
+        };
+        let Some(proposed) = &self.proposed_hash else {
+            return;
+        };
+        let hash = candidate_hash(text);
+        if &hash != proposed || self.accounted_hash.as_ref() == Some(&hash) {
+            return;
+        }
+        self.accounted_hash = Some(hash);
+        if verdict.status == Status::Rejected {
+            self.rejected_in_a_row += 1;
+        } else {
+            self.rejected_in_a_row = 0;
+        }
+        self.own = Some(verdict.clone());
+    }
+
+    fn base_text(&mut self, nugget: &Nugget, feedback: &Feedback) -> String {
+        if self.rejected_in_a_row >= REJECTS_BEFORE_RESET {
+            self.rejected_in_a_row = 0;
+            return nugget.seed.clone();
+        }
+        match feedback.best {
+            Some((text, _)) => text.to_string(),
+            None => nugget.seed.clone(),
+        }
+    }
+}
+
+fn prepare_prompt(
+    memory: &mut ModelMemory,
+    capabilities: &str,
+    nugget: &Nugget,
+    feedback: &Feedback,
+) -> (String, String) {
+    memory.observe(feedback);
+    let base = memory.base_text(nugget, feedback);
+    let system = system_prompt(capabilities);
+    let user = user_prompt(nugget, &base, memory.own.as_ref());
+    (system, user)
+}
+
+fn system_prompt(capabilities: &str) -> String {
+    let mut out = String::from(SYSTEM_PREFIX);
+    if !capabilities.is_empty() {
+        out.push('\n');
+        out.push_str(capabilities);
+    }
+    out
+}
+
+fn user_prompt(nugget: &Nugget, base: &str, own: Option<&Verdict>) -> String {
+    let mut out = nugget.splice(base);
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push('\n');
+    out.push_str(objective_sentence(nugget.objective));
+    out.push('\n');
+    if let Some(verdict) = own {
+        if verdict.status == Status::Rejected {
+            append_rejection(&mut out, verdict);
+        }
+    }
+    out
+}
+
+fn objective_sentence(objective: Objective) -> &'static str {
+    match objective {
+        Objective::PassAll => {
+            "Objective: pass_all. The score is the number of failed cases, and 0 is perfect. Lower is better."
+        }
+        Objective::Minimize => {
+            "Objective: minimize. Each case's last stdout line must be `score: <number>`, and the score is their sum. Lower is better."
+        }
+    }
+}
+
+fn append_rejection(out: &mut String, verdict: &Verdict) {
+    if verdict.diagnostics.is_empty() {
+        if !verdict.note.is_empty() {
+            out.push_str(&verdict.note);
+            out.push('\n');
+        }
+        return;
+    }
+    for diagnostic in verdict.diagnostics.iter().take(10) {
+        out.push_str(&format_diagnostic(diagnostic));
+        out.push('\n');
+    }
+}
+
+fn format_diagnostic(diagnostic: &Diagnostic) -> String {
+    format!(
+        "line {}, col {}: {} {}. Hint: {}",
+        diagnostic.line, diagnostic.col, diagnostic.code, diagnostic.message, diagnostic.fix
+    )
+}
+
+fn accept_region(raw: &str) -> Result<String> {
+    let text = llm::strip_fences(raw);
+    if text.trim().is_empty() {
+        return Err(err("the local model returned an empty region"));
+    }
+    if text.contains("// CRAB:BEGIN") || text.contains("// CRAB:END") {
+        return Err(err(
+            "the local model returned // CRAB:BEGIN or // CRAB:END; the reply must be the region text only",
+        ));
+    }
+    Ok(text)
+}
+
+enum Attempt {
+    Propose(String),
+    Again,
+    Finished,
+}
+
+fn take_attempt(memory: &mut ModelMemory, raw: Result<String>) -> Attempt {
+    match raw.and_then(|text| accept_region(&text)) {
+        Ok(text) => {
+            memory.errors_in_a_row = 0;
+            memory.proposed_hash = Some(candidate_hash(&text));
+            Attempt::Propose(text)
+        }
+        Err(error) => {
+            memory.errors_in_a_row += 1;
+            if memory.errors_in_a_row >= PROPOSAL_ERROR_LIMIT {
+                let line = format!(
+                    "local proposer finished: {PROPOSAL_ERROR_LIMIT} proposal errors in a row: {}",
+                    error.message
+                );
+                println!("{line}");
+                memory.stopped = Some(line);
+                Attempt::Finished
+            } else {
+                Attempt::Again
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -325,6 +607,7 @@ mod tests {
 
     use super::*;
     use crate::nugget;
+    use crate::pipeline::{Gate, Ms};
 
     fn scratch(label: &str) -> PathBuf {
         let dir =
@@ -555,5 +838,225 @@ mod tests {
             .iter()
             .map(|literal| &source[literal.start..literal.end])
             .collect()
+    }
+
+    fn region_nugget(objective: nugget::Objective) -> Nugget {
+        Nugget {
+            name: "region".to_string(),
+            objective,
+            timeout: std::time::Duration::from_millis(1),
+            max_memory: 1,
+            prefix: "HEAD\n// CRAB:BEGIN\n".to_string(),
+            seed: "SEED_REGION\n".to_string(),
+            suffix: "// CRAB:END\n".to_string(),
+            region_first_line: 3,
+            cases: Vec::new(),
+        }
+    }
+
+    fn rejected(code: &str, line: u32, note: &str) -> Verdict {
+        Verdict {
+            hash: "bbbbbbbbbbbbbbbb".to_string(),
+            gate: Gate::Check,
+            status: Status::Rejected,
+            score: None,
+            passed: 0,
+            total: 1,
+            diagnostics: if code.is_empty() {
+                Vec::new()
+            } else {
+                vec![Diagnostic {
+                    code: code.to_string(),
+                    message: "expected a semicolon".to_string(),
+                    line,
+                    col: 9,
+                    fix: "add a semicolon".to_string(),
+                }]
+            },
+            ms: Ms::default(),
+            note: note.to_string(),
+        }
+    }
+
+    #[test]
+    fn the_second_prompt_contains_the_first_verdicts_code_and_region_line() {
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let mut proposer = MockModelProposer::new(
+            vec!["let a = 1;\n".to_string(), "let b = 2;\n".to_string()],
+            "no unsafe",
+        );
+        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        assert_eq!(first, "let a = 1;");
+        assert!(proposer.prompts[0].user.contains("SEED_REGION"));
+        assert!(proposer.prompts[0].user.contains("Objective: pass_all."));
+        assert!(!proposer.prompts[0].user.contains("L0110"));
+        assert!(proposer.prompts[0].system.contains("no unsafe"));
+        assert!(proposer.prompts[0].system.starts_with(
+            "You write the body of one region of a Rust program. Reply with only the new region text, no markdown fence, no explanation. Stay inside this subset of Rust:"
+        ));
+
+        // Line 4 is already region-relative. region_first_line is 3, so a
+        // mistaken shift would print line 6.
+        let verdict = rejected("L0110", 4, "SECRET_NOTE");
+        let feedback = Feedback {
+            best: Some(("BEST_REGION\n", 2.0)),
+            last: Some((first.as_str(), &verdict)),
+        };
+        let second = proposer.next(&nugget, &feedback).unwrap().unwrap();
+        assert_eq!(second, "let b = 2;");
+        let prompt = &proposer.prompts[1].user;
+        assert!(prompt.contains("L0110"), "{prompt}");
+        assert!(prompt.contains("line 4"), "{prompt}");
+        assert!(prompt.contains("col 9"), "{prompt}");
+        assert!(prompt.contains("Hint: add a semicolon"), "{prompt}");
+        assert!(prompt.contains("BEST_REGION"), "{prompt}");
+        assert!(!prompt.contains("line 6"), "{prompt}");
+        assert!(!prompt.contains("SECRET_NOTE"), "{prompt}");
+    }
+
+    #[test]
+    fn a_verdict_for_someone_else_is_not_fed_back() {
+        let nugget = region_nugget(nugget::Objective::Minimize);
+        let mut proposer =
+            MockModelProposer::new(vec!["one\n".to_string(), "two\n".to_string()], "");
+        proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let verdict = rejected("L0999", 8, "");
+        let feedback = Feedback {
+            best: Some(("BEST_REGION\n", 1.0)),
+            last: Some(("not-ours\n", &verdict)),
+        };
+        proposer.next(&nugget, &feedback).unwrap().unwrap();
+        let prompt = &proposer.prompts[1].user;
+        assert!(!prompt.contains("L0999"), "{prompt}");
+        assert!(prompt.contains("BEST_REGION"), "{prompt}");
+        assert!(prompt.contains("Objective: minimize."), "{prompt}");
+        assert!(prompt.contains("score: <number>"), "{prompt}");
+        assert_eq!(
+            proposer.prompts[0].system,
+            "You write the body of one region of a Rust program. Reply with only the new region text, no markdown fence, no explanation. Stay inside this subset of Rust:"
+        );
+    }
+
+    #[test]
+    fn a_rejected_note_is_used_when_there_are_no_diagnostics() {
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let mut proposer =
+            MockModelProposer::new(vec!["one\n".to_string(), "two\n".to_string()], "");
+        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let verdict = rejected("", 0, "lust check failed");
+        let feedback = Feedback {
+            best: None,
+            last: Some((first.as_str(), &verdict)),
+        };
+        proposer.next(&nugget, &feedback).unwrap().unwrap();
+        assert!(proposer.prompts[1].user.contains("lust check failed"));
+    }
+
+    #[test]
+    fn three_rejects_in_a_row_send_the_seed_instead_of_the_best() {
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let replies = (0..4).map(|i| format!("body {i}\n")).collect();
+        let mut proposer = MockModelProposer::new(replies, "");
+        let mut previous = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let verdict = rejected("L0110", 1, "");
+        for round in 0..3 {
+            let feedback = Feedback {
+                best: Some(("BEST_REGION\n", 1.0)),
+                last: Some((previous.as_str(), &verdict)),
+            };
+            previous = proposer.next(&nugget, &feedback).unwrap().unwrap();
+            let prompt = &proposer.prompts.last().unwrap().user;
+            if round < 2 {
+                assert!(prompt.contains("BEST_REGION"), "round {round}: {prompt}");
+                assert!(!prompt.contains("SEED_REGION"), "round {round}: {prompt}");
+            } else {
+                assert!(prompt.contains("SEED_REGION"), "reset: {prompt}");
+                assert!(!prompt.contains("BEST_REGION"), "reset: {prompt}");
+            }
+        }
+    }
+
+    #[test]
+    fn fences_are_stripped_and_three_bad_replies_finish_without_an_error() {
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let mut fenced = MockModelProposer::new(
+            vec!["```rust\n    xs.iter().map(|x| x * x).sum()\n```\n".to_string()],
+            "",
+        );
+        assert_eq!(
+            fenced.next(&nugget, &quiet()).unwrap().as_deref(),
+            Some("    xs.iter().map(|x| x * x).sum()")
+        );
+
+        let mut retried = MockModelProposer::new(
+            vec![
+                "// CRAB:BEGIN\nwhole\n// CRAB:END\n".to_string(),
+                "let n = 1;\n".to_string(),
+            ],
+            "",
+        );
+        assert_eq!(
+            retried.next(&nugget, &quiet()).unwrap().as_deref(),
+            Some("let n = 1;")
+        );
+        assert!(retried.memory.stopped.is_none());
+        assert_eq!(retried.memory.errors_in_a_row, 0);
+
+        let mut proposer = MockModelProposer::new(
+            vec![
+                "// CRAB:BEGIN\n".to_string(),
+                "```\n// CRAB:END\n```".to_string(),
+                "   \n".to_string(),
+                "unused\n".to_string(),
+            ],
+            "",
+        );
+        assert_eq!(proposer.next(&nugget, &quiet()).unwrap(), None);
+        let reason = proposer.memory.stopped.clone().unwrap();
+        assert!(reason.contains("3 proposal errors in a row"), "{reason}");
+        assert!(
+            reason.contains("empty region") || reason.contains("CRAB"),
+            "{reason}"
+        );
+        assert_eq!(proposer.replies, vec!["unused\n".to_string()]);
+        assert_eq!(proposer.next(&nugget, &quiet()).unwrap(), None);
+        assert_eq!(proposer.replies, vec!["unused\n".to_string()]);
+    }
+
+    #[test]
+    fn at_most_ten_diagnostics_are_quoted() {
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let mut proposer =
+            MockModelProposer::new(vec!["one\n".to_string(), "two\n".to_string()], "");
+        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let mut verdict = rejected("D0", 1, "");
+        verdict.diagnostics = (0..11)
+            .map(|index| Diagnostic {
+                code: format!("D{index}"),
+                message: "m".to_string(),
+                line: index,
+                col: 1,
+                fix: "f".to_string(),
+            })
+            .collect();
+        let feedback = Feedback {
+            best: Some(("BEST_REGION\n", 1.0)),
+            last: Some((first.as_str(), &verdict)),
+        };
+        proposer.next(&nugget, &feedback).unwrap().unwrap();
+        let prompt = &proposer.prompts[1].user;
+        assert!(prompt.contains("D0"), "{prompt}");
+        assert!(prompt.contains("D9"), "{prompt}");
+        assert!(!prompt.contains("D10"), "{prompt}");
+    }
+
+    #[test]
+    fn the_model_endpoint_stays_loopback_http() {
+        let refused = ModelProposer::new("http://8.8.8.8:11434", "m", "");
+        assert!(refused.is_err());
+        let proposer = ModelProposer::new("http://127.0.0.1:11434", "qwen", "caps").unwrap();
+        assert_eq!(proposer.endpoint, "http://127.0.0.1:11434/v1");
+        assert_eq!(proposer.name(), "local");
+        assert_eq!(proposer.capabilities, "caps");
     }
 }
