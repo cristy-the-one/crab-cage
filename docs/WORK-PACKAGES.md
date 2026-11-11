@@ -31,8 +31,8 @@ These implement [STRATEGY.md](STRATEGY.md). Each package is one pull request. Gi
 ```text
 Phase 0:  WP-01 → WP-02 → WP-03 → WP-04 → WP-05, WP-06      (L-01, L-02 any time)
 Phase 1:  WP-10 → WP-11 → WP-12 → WP-13 → WP-14
-Phase 2:  WP-15 → WP-16 → WP-17 → WP-18 → WP-19
-Phase 3:  L-03 … L-08, any order
+Phase 2:  WP-15 → WP-16 → WP-17 → WP-18 → WP-19;  WP-20 any time after WP-14
+Phase 3:  L-03 … L-09, any order
 ```
 
 ---
@@ -366,6 +366,28 @@ After three rejected replies in a row, send the nugget seed as the base instead 
 
 **Port (T3, optional).** Add an "interactive" case kind where the host drives the candidate line by line (the existing `Session` and `fitness::evaluate_exchange`), then express the tank as `nuggets/tank/`. Only worth doing once someone needs a second closed-loop problem.
 
+## WP-20 Speed as an objective, scored with the zig build (T2)
+
+**Why.** lust's normal build uses TinyCC, which does not optimise, so its run times say little about how the rustc build will perform. lust already has `--opt`, which compiles the same generated C with `zig cc -O2` (or `cc`) and accepts `--sandbox`. Use it to score candidates whose goal is to run faster.
+
+**Needs.** `zig` on `PATH` (or `cc`, or `LUST_CC`). Without it this package degrades as described in step 4; it never fails the run.
+
+**Files.** `src/nugget.rs`, `src/lust.rs`, `src/pipeline.rs`, `tests/eval.rs`, new `nuggets/fast-sum/`.
+
+**Steps.**
+1. `nugget.json` accepts a third objective, `"fastest"`. Every case needs a `.out` file, as for `pass_all`.
+2. `lust::build` takes one more argument, `opt: bool`. When true, add `--opt` to the arguments.
+3. In `evaluate`, for `fastest`: first do the normal fast build and run every case once. If any case fails, the verdict is as for `pass_all` (`scored`, score = 1e9 + number of failed cases, so a wrong candidate never beats a correct one). If all pass: build again with `opt: true` to `<work_dir>/<hash>.opt[.exe]`, run every case three times, and score = the sum over cases of the **median** elapsed milliseconds. Outputs of the opt build must also match `.out`; if one does not, the status is `diverged`.
+4. If the opt build fails because no C compiler was found (lust's error text names `zig` or `cc`), time the fast build instead and put `opt build unavailable, timed the tcc build` in `note`. With `Toolchain { lust: None }`, time the rustc build (`opt-level=2`, already what `compile_rustc` passes).
+5. Add `"opt"` to the verdict's `ms` object.
+6. The oracle (WP-14) is unchanged: it compares outputs, never times.
+
+**Demo nugget.** `nuggets/fast-sum/`: sums the squares of 1…N for N read from stdin; the seed uses a deliberately slow double loop; a closed-form body is the intended win.
+
+**Tests (no lust needed).** The seed scores higher (slower) than the closed-form body; a wrong body scores at least 1e9.
+
+**Done when.** With a real lust and zig installed, `crab-cage eval nuggets/fast-sum cand.rs --json` shows a non-zero `ms.opt` and an empty `note`; with zig absent, the note from step 4 appears and the exit code is still 0.
+
 ---
 
 # Phase 3: lust-lang
@@ -409,3 +431,12 @@ On Windows a warm `lust check` of a 9-line file cost tens of milliseconds end to
 A script `scripts/crab-intake.py <crab-out-dir>`:
 - for each `divergences/<hash>/`: copy `source.rs` to `tests/crab/diverged/<hash>.rs` and print the lust and rustc outputs side by side. Each one is a rule-zero bug to fix or to turn into a reject.
 - from `journal.jsonl`: print the L-codes ranked by how many candidates each one rejected, with one example source per code. This is the "what should lust support next" list, measured on what models actually write.
+
+## L-09 Make the zig path a first-class, visible option (T2)
+
+`--opt` already uses `zig cc` when it is on `PATH`. A host cannot tell in advance whether it will work, and there are no Windows numbers for it.
+
+1. `lust capabilities --json` (the object from L-04) gains `"opt": {"available": true, "compiler": "zig cc", "version": "…"}`; `available` is false when neither `zig`, `cc` nor `LUST_CC` resolves.
+2. When `--opt` is asked for and no compiler is found, the error names what was looked for and in what order, with its own L-code, so a host can match the code instead of the text (WP-20 step 4 then switches to it).
+3. Measure on Windows and add to `docs/opt.md`: build time and run time of the same program under tcc, `--opt` with zig, and `rustc -O`, for the 80-hex bench the doc already uses.
+4. Out of scope: replacing TinyCC as the dev backend. TinyCC is linked in and compiles in-process; that is where the millisecond edit loop comes from.

@@ -60,6 +60,7 @@ Ordered by how much each one blocks the mission. F1 to F3 were observed by runni
 | Genetic algorithm as the core | Demote. It is one proposer among several, useful for numeric literals. |
 | In-process scoring | Wrong for the mission (it is why lust is not in the loop). Scoring must come from running the compiled candidate. |
 | Hand-rolled HTTP client, loopback only | Keep. An outside model (Grok, Claude, anything) does not need network access from Crab Cage: it can call `crab-cage eval` as a tool or drop files in a folder (WP-12, WP-15). |
+| TinyCC as lust's dev backend, zig for `--opt` | Keep both, and use the second. TinyCC gives the millisecond check-and-build loop; its binaries are slow, so they are a poor basis for scoring speed. `lust build --opt` (zig cc `-O2`) is the scoring build when the objective is run time (WP-20, L-09). |
 | Hand-rolled TOML-like config | Keep the format, fix the merge (WP-05). Use JSON for the new nugget manifest so no new parser is written. |
 
 ### Speed on this machine (context for the funnel)
@@ -125,8 +126,8 @@ Four phases. Each phase leaves the repo working and more useful than before. Sto
 |---|---|---|---|
 | 0. Make it true | The existing tool works against a real lust on Windows | WP-01 … WP-06, L-01, L-02 | `crab-cage evolve --lust-bin <real lust>` finishes, lust and rustc both run on the winner, their outputs are compared |
 | 1. The primitive | One candidate through the funnel, as a CLI call any agent can use | WP-10 … WP-14 | `crab-cage eval nuggets/demo cand.rs --json` prints a verdict |
-| 2. The loop | Many candidates, journal, model in the loop | WP-15 … WP-19 | `crab-cage run nuggets/demo` ends in a `PROVEN` candidate or says none was found |
-| 3. Feed lust | Close the gaps the loop exposes | L-03 … L-08 | Divergences and top reject codes turn into lust test cases |
+| 2. The loop | Many candidates, journal, model in the loop, speed as an objective | WP-15 … WP-20 | `crab-cage run nuggets/demo` ends in a `PROVEN` candidate or says none was found |
+| 3. Feed lust | Close the gaps the loop exposes | L-03 … L-09 | Divergences and top reject codes turn into lust test cases |
 
 Phase 0 and the L-packages can run in parallel with Phase 1; they touch different files.
 
