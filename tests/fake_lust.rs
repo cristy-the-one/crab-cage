@@ -112,3 +112,37 @@ fn runner_passes_sandbox_and_max_memory_and_classifies_the_guest_stop() {
     assert!(matches!(ran.kind, StopKind::Exited(101)));
     let _ = fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn evolve_runs_rustc_and_reports_a_lust_disagreement() {
+    use crab_cage::evolve::{execute, BackendChoice, EvalMode, RunOptions};
+
+    // The fake lust build echoes one fixed reply, so it cannot print the same
+    // lines as the rustc build of the winner. The oracle comparison must
+    // catch that instead of returning early after the lust build.
+    let bin = fake_lust();
+    let dir = std::env::temp_dir().join(format!("crab-cage-oracle-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let result = execute(&RunOptions {
+        seed: 1,
+        population: 8,
+        generations: 2,
+        backend: BackendChoice::Mock,
+        eval: EvalMode::Auto,
+        verify: true,
+        lust_bin: Some(bin),
+        out_dir: dir.join("run"),
+        run_timeout: Duration::from_secs(30),
+        ..RunOptions::default()
+    });
+    let message = match result {
+        Ok(_) => panic!("a stand-in lust must not agree with rustc"),
+        Err(problem) => problem.to_string(),
+    };
+    assert!(
+        message.contains("lust and rustc disagree; this is a lust bug"),
+        "{message}"
+    );
+    let _ = fs::remove_dir_all(&dir);
+}

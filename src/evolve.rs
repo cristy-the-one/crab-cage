@@ -109,6 +109,10 @@ pub fn execute(options: &RunOptions) -> Result<RunOutput> {
         lust_max_memory: false,
         lust_time_limit: false,
         lust_check: "skipped".into(),
+        rustc_edition: None,
+        lust_replay_error: None,
+        rustc_replay_error: None,
+        oracle_agrees: None,
     };
 
     if options.verify && options.eval != EvalMode::Native {
@@ -220,6 +224,7 @@ fn verify_winner(
         },
     };
 
+    let mut lust_run: Option<(f64, Vec<String>)> = None;
     if let Some(tool) = &lust_tool {
         verification.lust_version = Some(tool.version.clone());
         verification.lust_max_memory = tool.supports_max_memory;
@@ -270,27 +275,34 @@ fn verify_winner(
                 Some(options.run_timeout),
                 options.compile_timeout,
             )?;
-            let error = replay(genome, &built, options)?;
+            let (error, lines) = replay(genome, &built, options)?;
+            verification.lust_replay_error = Some(error);
             verification.max_abs_error = Some(error);
-            verification.rustc =
-                format!("lust build --sandbox --max-memory, replay max abs error {error:.3e}");
-            if error > 1e-6 {
-                return Err(err(format!(
-                    "lust-built controller diverged from the genome (max abs error {error})"
-                )));
-            }
-            return Ok(());
+            lust_run = Some((error, lines));
         }
     }
 
     let built = work.join(bin_name("rustc_candidate"));
-    lust::compile_rustc(source_path, &built, options.compile_timeout)?;
-    let error = replay(genome, &built, options)?;
-    verification.max_abs_error = Some(error);
-    if verification.rustc == "skipped" || verification.rustc.is_empty() {
-        verification.rustc = format!("pass, replay max abs error {error:.3e}");
+    let edition = compile_rustc_with_fallback(source_path, &built, options.compile_timeout)?;
+    verification.rustc_edition = Some(edition.clone());
+    let (error, lines) = replay(genome, &built, options)?;
+    verification.rustc_replay_error = Some(error);
+    verification.rustc = format!("pass (edition {edition}), replay max abs error {error:.3e}");
+
+    if let Some((lust_error, lust_lines)) = lust_run {
+        verification.max_abs_error = Some(lust_error.max(error));
+        let agrees = lust_lines == lines;
+        verification.oracle_agrees = Some(agrees);
+        if !agrees {
+            return Err(err(first_difference(&lust_lines, &lines)));
+        }
+        if lust_error > 1e-6 {
+            return Err(err(format!(
+                "lust-built controller diverged from the genome (max abs error {lust_error})"
+            )));
+        }
     } else {
-        verification.rustc = format!("pass, replay max abs error {error:.3e}");
+        verification.max_abs_error = Some(error);
     }
     if error > 1e-6 {
         return Err(err(format!(
@@ -298,6 +310,43 @@ fn verify_winner(
         )));
     }
     Ok(())
+}
+
+fn first_difference(lust_lines: &[String], rustc_lines: &[String]) -> String {
+    let count = lust_lines.len().max(rustc_lines.len());
+    for index in 0..count {
+        let left = lust_lines.get(index);
+        let right = rustc_lines.get(index);
+        if left != right {
+            return format!(
+                "lust and rustc disagree; this is a lust bug. First differing line {}: lust printed {:?}, rustc printed {:?}",
+                index + 1,
+                left.map(String::as_str).unwrap_or("<no line>"),
+                right.map(String::as_str).unwrap_or("<no line>"),
+            );
+        }
+    }
+    "lust and rustc disagree; this is a lust bug".to_string()
+}
+
+/// Build with edition 2024, and retry with 2021 only when rustc says the
+/// edition itself is unknown or invalid. Returns the edition that worked.
+fn compile_rustc_with_fallback(source: &Path, output: &Path, timeout: Duration) -> Result<String> {
+    match lust::compile_rustc(source, output, "2024", timeout) {
+        Ok(()) => Ok("2024".to_string()),
+        Err(problem) => {
+            let text = problem.to_string().to_lowercase();
+            let edition_problem = text.contains("edition")
+                && (text.contains("unknown")
+                    || text.contains("invalid")
+                    || text.contains("must be one of"));
+            if !edition_problem {
+                return Err(problem);
+            }
+            lust::compile_rustc(source, output, "2021", timeout)?;
+            Ok("2021".to_string())
+        }
+    }
 }
 
 fn compile_candidate(source: &Path, work: &Path, options: &RunOptions) -> Result<PathBuf> {
@@ -331,11 +380,11 @@ fn compile_candidate(source: &Path, work: &Path, options: &RunOptions) -> Result
         }
     }
     let built = work.join(bin_name("rustc_candidate"));
-    lust::compile_rustc(source, &built, options.compile_timeout)?;
+    compile_rustc_with_fallback(source, &built, options.compile_timeout)?;
     Ok(built)
 }
 
-fn replay(genome: &Genome, bin: &Path, options: &RunOptions) -> Result<f64> {
+fn replay(genome: &Genome, bin: &Path, options: &RunOptions) -> Result<(f64, Vec<String>)> {
     let pairs = recorded_pairs(genome, ScenarioKind::Nominal);
     let limits = lust::candidate_limits(
         options.run_timeout.max(Duration::from_secs(10)),
@@ -343,6 +392,7 @@ fn replay(genome: &Genome, bin: &Path, options: &RunOptions) -> Result<f64> {
     );
     let mut session = lust::run_session(bin, &limits)?;
     let mut max_error: f64 = 0.0;
+    let mut lines: Vec<String> = Vec::with_capacity(pairs.len());
     for pair in &pairs {
         let response = match session.exchange(&pair.input) {
             Ok(line) => line,
@@ -351,6 +401,7 @@ fn replay(genome: &Genome, bin: &Path, options: &RunOptions) -> Result<f64> {
                 return Err(err(format!("replay stopped ({class:?}): {problem}")));
             }
         };
+        lines.push(response.trim().to_string());
         let got = parse_output_line(response.trim()).ok_or_else(|| {
             err(format!(
                 "controller reply was not three numbers: {response}"
@@ -381,7 +432,7 @@ fn replay(genome: &Genome, bin: &Path, options: &RunOptions) -> Result<f64> {
             )));
         }
     }
-    Ok(max_error)
+    Ok((max_error, lines))
 }
 
 fn finish_class(session: Session) -> RunClass {

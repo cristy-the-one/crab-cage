@@ -228,13 +228,13 @@ pub fn build(
     Ok(())
 }
 
-pub fn compile_rustc(source: &Path, output: &Path, timeout: Duration) -> Result<()> {
+pub fn compile_rustc(source: &Path, output: &Path, edition: &str, timeout: Duration) -> Result<()> {
     let rustc = which("rustc").ok_or_else(|| err("rustc is not on PATH"))?;
     let result = tool_output(
         &rustc,
         &[
             "--edition",
-            "2021",
+            edition,
             "-C",
             "opt-level=2",
             "-C",
