@@ -56,7 +56,7 @@ crab-cage models                                    # the 16 GB model notes
 crab-cage lust-probe                                # version, path, and whether --max-memory and --time-limit exist
 ```
 
-Copy `crab-cage.toml.example` to `crab-cage.toml` to set the lust path and the model endpoint without flags. A flag that differs from the built-in default wins over the file.
+Copy `crab-cage.toml.example` to `crab-cage.toml` to set the lust path and the model endpoint without flags. A flag on the command line wins over the file, and the file wins over the built-in default.
 
 ## Lust
 

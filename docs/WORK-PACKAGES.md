@@ -124,10 +124,10 @@ Phase 3:  L-03 … L-09, any order
 
 **Problem.** When lust builds the winner, rustc never runs. Nothing compares the two builds.
 
-**Files.** `src/evolve.rs`, `src/lust.rs`, `src/report.rs`, `tests/fake_lust.rs`.
+**Files.** `src/evolve.rs`, `src/lust.rs`, `src/report.rs`, `tests/fake_lust.rs`, `tests/replay.rs` (one call site only).
 
 **Steps.**
-1. `lust::compile_rustc`: take the edition as a parameter. Call it with `"2024"`; if rustc says the edition is unknown, retry with `"2021"` and record which was used.
+1. `lust::compile_rustc`: add an `edition: &str` parameter, placed after `output`. In `src/evolve.rs` call it with `"2024"`; if rustc's stderr says the edition is unknown or invalid, retry with `"2021"`. Record the edition that worked in a new field `Verification.rustc_edition: Option<String>`. In `tests/replay.rs` line 31, change the existing call to pass `"2021"` and change nothing else in that file.
 2. In `verify_winner`, remove the early `return Ok(())` after the lust build. Always continue to the rustc build and replay.
 3. Record three results in `Verification`: `lust_replay_error: Option<f64>`, `rustc_replay_error: Option<f64>`, `oracle_agrees: Option<bool>`. `oracle_agrees` is true when both replays ran and the two binaries printed identical lines for the same input trace. Capture each binary's reply lines in `replay` and compare the strings, not the parsed floats.
 4. If they differ, return an error that names the first differing line and says "lust and rustc disagree; this is a lust bug".
