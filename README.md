@@ -24,6 +24,8 @@ cargo test --locked
 
 The binary is `target/release/crab-cage` (`crab-cage.exe` on Windows).
 
+The tests use a fake lust, so they cannot see how a real lust behaves. `tests/real_lust.rs` runs the default evolution and the probe against a real binary. It does nothing unless `CRAB_LUST_BIN` is set. Set `LUST_NO_DAEMON=1` too, so lust leaves no background daemon: `CRAB_LUST_BIN=/path/to/lust cargo test --test real_lust` (PowerShell: `$env:CRAB_LUST_BIN = "C:\path\to\lust.exe"; $env:LUST_NO_DAEMON = "1"; cargo test --test real_lust`).
+
 ## Run the demo
 
 ```sh
