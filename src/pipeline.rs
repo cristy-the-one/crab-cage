@@ -168,7 +168,9 @@ pub fn evaluate(
             opts.compile_timeout,
         )
     } else {
-        lust::compile_rustc_any_edition(&source, &binary, opts.compile_timeout).map(|_| ())
+        lust::compile_rustc_any_edition(&source, &binary, opts.compile_timeout)
+            .map(|_| ())
+            .map_err(crate::error::Error::from)
     };
     verdict.ms.build = elapsed_ms(started);
     if let Err(problem) = built {
@@ -358,7 +360,7 @@ fn run_oracle(
         .join(bin_name(&format!("{}.oracle", verdict.hash)));
     let edition = match lust::compile_rustc_any_edition(source, &oracle_bin, opts.compile_timeout) {
         Ok(edition) => edition,
-        Err(problem) => {
+        Err(lust::RustcError::Rejected { message }) => {
             save_rustc_rejection(
                 verdict,
                 nugget,
@@ -367,10 +369,11 @@ fn run_oracle(
                 fast_bin,
                 &oracle_bin,
                 opts,
-                &problem,
+                &message,
             )?;
             return Ok(());
         }
+        Err(problem) => return Err(problem.into()),
     };
     if !oracle_bin.is_file() {
         return Err(crate::error::err(format!(
@@ -379,12 +382,18 @@ fn run_oracle(
         )));
     }
     let limits = host_limits(nugget, opts);
-    let mut diverged = false;
     for (case, fast) in nugget.cases.iter().zip(runs.iter()) {
         let result =
             supervisor::run_capture(Command::new(&oracle_bin), &limits, case.input.as_bytes())?;
-        if diverged || (result.stdout == fast.stdout && result.kind == fast.kind) {
+        if result.stdout == fast.stdout && result.kind == fast.kind {
             continue;
+        }
+        let again =
+            supervisor::run_capture(Command::new(&oracle_bin), &limits, case.input.as_bytes())?;
+        if again.stdout != result.stdout || again.kind != result.kind {
+            verdict.status = Status::Rejected;
+            verdict.note = "nondeterministic output".to_string();
+            return Ok(());
         }
         write_case_divergence(
             opts,
@@ -405,13 +414,10 @@ fn run_oracle(
                 result.kind,
             ),
         )?;
-        diverged = true;
+        verdict.status = Status::Diverged;
+        return Ok(());
     }
-    verdict.status = if diverged {
-        Status::Diverged
-    } else {
-        Status::Proven
-    };
+    verdict.status = Status::Proven;
     Ok(())
 }
 
@@ -423,22 +429,21 @@ fn save_rustc_rejection(
     fast_bin: &Path,
     oracle_bin: &Path,
     opts: &EvalOptions,
-    problem: &crate::error::Error,
+    message: &str,
 ) -> crate::error::Result<()> {
     let dir = divergence_dir(&opts.work_dir, &verdict.hash);
     fs::create_dir_all(&dir)?;
     let _ = fs::copy(source, dir.join("source.rs"))?;
-    fs::write(dir.join("rustc.stderr"), &problem.message)?;
+    fs::write(dir.join("rustc.stderr"), message)?;
     let readme = format!(
         "\
 lust version: {version}
 fast: {fast}
-oracle: rustc --edition 2024 -C opt-level=2 -C debuginfo=0 -o {oracle} {source}
+oracle: {oracle}
 ",
         version = tool.version,
         fast = fast_command(tool, nugget, source, fast_bin),
-        oracle = oracle_bin.display(),
-        source = source.display(),
+        oracle = rustc_command("2024", oracle_bin, source),
     );
     fs::write(dir.join("README.txt"), readme)?;
     verdict.status = Status::Diverged;
@@ -501,15 +506,24 @@ fn divergence_readme(
         "\
 lust version: {version}
 fast: {fast}
-oracle: rustc --edition {edition} -C opt-level=2 -C debuginfo=0 -o {oracle} {source}
+oracle: {oracle}
 case: {case_id}
 fast exit: {fast_kind:?}
 oracle exit: {oracle_kind:?}
 ",
         version = tool.version,
         fast = fast_command(tool, nugget, source, fast_bin),
-        oracle = oracle_bin.display(),
-        source = source.display(),
+        oracle = rustc_command(edition, oracle_bin, source),
+    )
+}
+
+/// Same profile `lust::compile_rustc` passes: optimized, with the debug
+/// assertions and overflow checks lust leaves on.
+fn rustc_command(edition: &str, oracle_bin: &Path, source: &Path) -> String {
+    format!(
+        "rustc --edition {edition} -C opt-level=2 -C debuginfo=0 -C debug-assertions=on -C overflow-checks=on -o {} {}",
+        oracle_bin.display(),
+        source.display()
     )
 }
 

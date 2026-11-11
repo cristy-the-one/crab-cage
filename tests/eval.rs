@@ -601,6 +601,8 @@ fn oracle_with_the_fake_lust_diverges_and_writes_the_case() {
         readme.contains("rustc --edition 2024") || readme.contains("rustc --edition 2021"),
         "{readme}"
     );
+    assert!(readme.contains("-C debug-assertions=on"), "{readme}");
+    assert!(readme.contains("-C overflow-checks=on"), "{readme}");
     assert!(
         readme.contains(&format!("case: {}", nugget.cases[0].id)),
         "{readme}"
@@ -630,7 +632,99 @@ fn oracle_diverges_when_rustc_rejects_what_lust_built() {
     let readme = fs::read_to_string(div.join("README.txt")).unwrap();
     assert!(readme.contains("lust version: lust 0.3.0-fake"), "{readme}");
     assert!(readme.contains("rustc --edition 2024"), "{readme}");
+    assert!(readme.contains("-C debug-assertions=on"), "{readme}");
+    assert!(readme.contains("-C overflow-checks=on"), "{readme}");
     assert!(!div.join("case.in").exists());
+}
+
+#[test]
+fn rustc_keeps_debug_assertions_and_overflow_checks() {
+    let debug = "\
+    let base: i64 = xs.iter().map(|x| x * x).sum();
+    if cfg!(debug_assertions) { base } else { base + 1 }
+";
+    let verdict = evaluate(&demo(), debug, &no_lust(), &options_oracle("oracle-debug")).unwrap();
+    assert_eq!(verdict.status, Status::Proven, "{}", verdict.note);
+    assert_eq!(verdict.score, Some(0.0), "{}", verdict.note);
+    assert_eq!(verdict.passed, 3);
+
+    let overflow = "\
+    let value = std::hint::black_box(i64::MAX);
+    let _ = value + 1;
+    xs.iter().map(|x| x * x).sum()
+";
+    let verdict = evaluate(&demo(), overflow, &no_lust(), &options("oracle-overflow")).unwrap();
+    assert_eq!(verdict.status, Status::Rejected, "{}", verdict.note);
+    assert_eq!(verdict.gate, Gate::Run);
+    assert_eq!(verdict.note, "Panic");
+}
+
+#[test]
+fn oracle_rejects_output_that_changes_between_runs() {
+    let tool = lust::probe(&wrong_lust(), Duration::from_secs(30)).unwrap();
+    let opts = options_oracle("oracle-unstable");
+    let candidate = "\
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_nanos() as i64)
+        .unwrap_or(0)
+";
+    let verdict = evaluate(&demo(), candidate, &Toolchain { lust: Some(tool) }, &opts).unwrap();
+    assert_eq!(verdict.status, Status::Rejected, "{}", verdict.note);
+    assert_eq!(verdict.gate, Gate::Oracle);
+    assert_eq!(verdict.note, "nondeterministic output");
+    assert!(!opts.work_dir.join("divergences").exists());
+}
+
+#[test]
+fn oracle_returns_an_error_when_rustc_is_missing_or_times_out() {
+    let source_dir = work("oracle-timeout-src");
+    fs::create_dir_all(&source_dir).unwrap();
+    let source = source_dir.join("slow.rs");
+    fs::write(&source, "fn main() {}\n").unwrap();
+    let output = source_dir.join(if cfg!(windows) { "slow.exe" } else { "slow" });
+    let timed_out = lust::compile_rustc_any_edition(&source, &output, Duration::from_millis(1));
+    match timed_out {
+        Err(lust::RustcError::TimedOut { message }) => {
+            assert!(message.contains("timed out"), "{message}");
+        }
+        other => panic!("expected a timeout, got {other:?}"),
+    }
+
+    let exe = crab_exe();
+    let dir = work("oracle-no-rustc");
+    fs::create_dir_all(&dir).unwrap();
+    let good = dir.join("good.rs");
+    fs::write(&good, "    xs.iter().map(|x| x * x).sum()\n").unwrap();
+    let work_dir = dir.join("work");
+    let output = Command::new(&exe)
+        .arg("eval")
+        .arg(demo_dir())
+        .arg(&good)
+        .arg("--oracle")
+        .arg("--lust-bin")
+        .arg(wrong_lust())
+        .arg("--work-dir")
+        .arg(&work_dir)
+        .env("PATH", &dir)
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "stdout {}\nstderr {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("rustc is not on PATH"), "{stderr}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(!stdout.contains("diverged"), "{stdout}");
+    assert!(
+        !stdout.contains("lust accepted, rustc rejected"),
+        "{stdout}"
+    );
+    assert!(!work_dir.join("divergences").exists());
 }
 
 #[test]
