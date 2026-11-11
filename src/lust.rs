@@ -260,6 +260,30 @@ pub fn compile_rustc(source: &Path, output: &Path, edition: &str, timeout: Durat
     Ok(())
 }
 
+/// Edition 2024, then 2021 only when rustc rejects the edition itself.
+/// Returns the edition that worked.
+pub fn compile_rustc_any_edition(
+    source: &Path,
+    output: &Path,
+    timeout: Duration,
+) -> Result<String> {
+    match compile_rustc(source, output, "2024", timeout) {
+        Ok(()) => Ok("2024".to_string()),
+        Err(problem) => {
+            let text = problem.to_string().to_lowercase();
+            let edition_problem = text.contains("edition")
+                && (text.contains("unknown")
+                    || text.contains("invalid")
+                    || text.contains("must be one of"));
+            if !edition_problem {
+                return Err(problem);
+            }
+            compile_rustc(source, output, "2021", timeout)?;
+            Ok("2021".to_string())
+        }
+    }
+}
+
 pub fn classify(result: &ExecResult) -> RunClass {
     if matches!(result.kind, StopKind::TimedOut) {
         return RunClass::TimedOut;
