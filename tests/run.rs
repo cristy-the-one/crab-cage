@@ -468,6 +468,109 @@ fn tweak_on_one_literal_stops_after_fifty_repeats() {
     );
 }
 
+/// The journal without the times: what was decided, in what order.
+fn decisions(out: &PathBuf) -> Vec<String> {
+    journal_records(out)
+        .iter()
+        .map(|record| {
+            format!(
+                "{} {} {} {} {} {}",
+                record["n"],
+                record["hash"],
+                record["status"],
+                record["gate"],
+                record["score"],
+                record["proposer"]
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn four_jobs_journal_the_same_decisions_in_the_same_order_as_one() {
+    let candidates = scratch("jobs-cands");
+    fs::write(candidates.join("a.rs"), "    0\n").unwrap();
+    fs::write(candidates.join("b.rs"), "    1\n").unwrap();
+    // The same text as b.rs under another name: one journal line, not two.
+    fs::write(candidates.join("c.rs"), "    1\n").unwrap();
+    fs::write(candidates.join("d.rs"), "    let v: i64 = \"no\";\n    v\n").unwrap();
+    fs::write(candidates.join("e.rs"), "    49\n").unwrap();
+    fs::write(
+        candidates.join("f.rs"),
+        "    xs.iter().map(|x| x * x).sum()\n",
+    )
+    .unwrap();
+    // After the right one. A solved run must not journal it, with any --jobs.
+    fs::write(candidates.join("g.rs"), "    2\n").unwrap();
+
+    let mut journals = Vec::new();
+    for jobs in ["1", "4"] {
+        let out = scratch(&format!("jobs-{jobs}"));
+        let output = run(
+            &out,
+            &[
+                "run",
+                demo_dir().to_str().unwrap(),
+                "--candidates",
+                candidates.to_str().unwrap(),
+                "--budget",
+                "20",
+                "--jobs",
+                jobs,
+                "--out",
+                out.to_str().unwrap(),
+            ],
+        );
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success(),
+            "jobs {jobs}: exit {:?} stdout {stdout} stderr {stderr}",
+            output.status.code()
+        );
+        let region = fs::read_to_string(out.join("best.region.rs")).unwrap();
+        assert_eq!(region, "    xs.iter().map(|x| x * x).sum()\n");
+        journals.push(decisions(&out));
+    }
+    // seed, a, b, d, e, f. c repeats b and g comes after the solution.
+    assert_eq!(journals[0].len(), 6, "{:#?}", journals[0]);
+    assert_eq!(journals[0], journals[1]);
+}
+
+#[test]
+fn jobs_do_not_spend_more_than_the_budget() {
+    let candidates = scratch("jobs-budget-cands");
+    for (name, body) in [
+        ("a.rs", "    0\n"),
+        ("b.rs", "    1\n"),
+        ("c.rs", "    2\n"),
+        ("d.rs", "    3\n"),
+    ] {
+        fs::write(candidates.join(name), body).unwrap();
+    }
+    let out = scratch("jobs-budget");
+    let output = run(
+        &out,
+        &[
+            "run",
+            demo_dir().to_str().unwrap(),
+            "--candidates",
+            candidates.to_str().unwrap(),
+            "--budget",
+            "3",
+            "--jobs",
+            "4",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    // Unsolved pass_all: exit 1. The seed and two snippets, no more.
+    assert_eq!(output.status.code(), Some(1));
+    let records = journal_records(&out);
+    assert_eq!(records.len(), 3);
+    assert_eq!(records[0]["proposer"], "seed");
+}
+
 fn write_probe(dir: &std::path::Path, objective: &str, seed: &str, expected: Option<&str>) {
     fs::create_dir_all(dir.join("cases")).unwrap();
     fs::write(

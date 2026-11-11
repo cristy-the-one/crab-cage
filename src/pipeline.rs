@@ -19,6 +19,16 @@ use crate::supervisor::{self, StopKind};
 /// candidate keeps the daemon's session warm.
 pub const SLOT_FILE: &str = "slot.rs";
 
+/// The slot file for `slot`: `slot.rs` for 0, then `slot-1.rs`, `slot-2.rs`.
+/// One daemon serves them all, with one warm session each.
+pub fn slot_file(slot: usize) -> String {
+    if slot == 0 {
+        SLOT_FILE.to_string()
+    } else {
+        format!("slot-{slot}.rs")
+    }
+}
+
 /// Where the fast gates run. `lust: None` compiles them with rustc.
 pub struct Toolchain {
     pub lust: Option<LustTool>,
@@ -30,6 +40,10 @@ pub struct EvalOptions {
     pub host_memory: u64,
     pub compile_timeout: Duration,
     pub oracle: bool,
+    /// Which slot file lust compiles when its daemon is on (see
+    /// [`slot_file`]). Evaluations that run at the same time must use
+    /// different slots. 0 for a caller that runs one at a time.
+    pub slot: usize,
 }
 
 /// Last gate the candidate reached.
@@ -150,7 +164,7 @@ pub fn evaluate(
     // candidate; `<hash>.rs` stays as the record and is what rustc compiles.
     let fast_source = match &tools.lust {
         Some(tool) if tool.daemon => {
-            let slot = opts.work_dir.join(SLOT_FILE);
+            let slot = opts.work_dir.join(slot_file(opts.slot));
             fs::write(&slot, &spliced)?;
             slot
         }
@@ -684,6 +698,14 @@ fn one_line(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slot_zero_keeps_the_old_name_and_the_others_are_numbered() {
+        assert_eq!(slot_file(0), "slot.rs");
+        assert_eq!(slot_file(0), SLOT_FILE);
+        assert_eq!(slot_file(1), "slot-1.rs");
+        assert_eq!(slot_file(12), "slot-12.rs");
+    }
 
     #[test]
     fn fnv1a64_matches_the_known_vectors() {

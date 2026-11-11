@@ -83,6 +83,7 @@ fn real_lust_daemon_gives_the_same_verdicts_from_one_slot_file() {
         host_memory: 1024 * 1024 * 1024,
         compile_timeout: Duration::from_secs(120),
         oracle: false,
+        slot: 0,
     };
 
     let good = evaluate(
@@ -178,6 +179,9 @@ fn real_lust_run_uses_the_daemon_and_stops_it() {
         &run::RunOptions {
             nugget_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("nuggets/sum-squares"),
             budget: 20,
+            // Three jobs: the three candidates go through three slot files
+            // at the same time, served by one daemon.
+            jobs: 3,
             out_dir: out.clone(),
             lust_bin: Some(bin),
             lust_daemon: true,
@@ -188,6 +192,8 @@ fn real_lust_run_uses_the_daemon_and_stops_it() {
     assert!(output.solved);
     let work = out.join("work");
     assert!(work.join(SLOT_FILE).is_file());
+    assert!(work.join(crab_cage::pipeline::slot_file(1)).is_file());
+    assert!(work.join(crab_cage::pipeline::slot_file(2)).is_file());
     let region = std::fs::read_to_string(out.join("best.region.rs")).unwrap();
     assert!(region.contains("x * x"), "{region}");
     let sockets: Vec<_> = std::fs::read_dir(&work)

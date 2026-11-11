@@ -133,6 +133,10 @@ struct RunArgs {
     /// Maximum number of candidates to evaluate, including the seed.
     #[arg(long, default_value_t = 200)]
     budget: usize,
+    /// Candidates evaluated at the same time. Each one gets its own slot
+    /// file; the journal keeps the order the candidates were proposed in.
+    #[arg(long, default_value_t = 1)]
+    jobs: usize,
     /// Journal, work files, and the best candidate.
     #[arg(long, default_value = "crab-out")]
     out: PathBuf,
@@ -403,6 +407,7 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
         &run::RunOptions {
             nugget_dir: args.nugget_dir,
             budget: args.budget,
+            jobs: args.jobs,
             out_dir: args.out,
             lust_daemon: args.lust_bin.is_some() && !args.no_lust_daemon,
             lust_bin: args.lust_bin,
@@ -447,6 +452,7 @@ fn eval_cmd(args: EvalArgs) -> Result<ExitCode> {
             host_memory: 1024 * 1024 * 1024,
             compile_timeout: Duration::from_secs(180),
             oracle: args.oracle,
+            slot: 0,
         },
     )?;
     if args.json {
