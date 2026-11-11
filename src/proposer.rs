@@ -352,10 +352,11 @@ You write the body of one region of a Rust program. Reply with only the new regi
 /// as fatal and this package does not change that loop, so the failure stays
 /// here and `next` returns [`None`](Option::None) after printing the reason.
 ///
-/// A reply whose [`candidate_hash`] is one of the last [`TRIED_LIMIT`] regions
-/// this proposer already has an outcome for is not returned. The same prompt
-/// is asked once more at temperature [`REPEAT_TEMPERATURE`]. A second repeat
-/// counts as a proposal error.
+/// A reply whose [`candidate_hash`] matches a region already proposed — one of
+/// the last [`TRIED_LIMIT`] with an outcome, or one still awaiting its
+/// verdict — is not returned. The same prompt is asked once more at
+/// temperature [`REPEAT_TEMPERATURE`]. A second repeat counts as a proposal
+/// error.
 pub struct ModelProposer {
     endpoint: String,
     model: String,
@@ -545,7 +546,7 @@ impl ModelMemory {
         match raw.and_then(|text| accept_region(&text)) {
             Ok(text) => {
                 let hash = candidate_hash(&text);
-                if self.tried.iter().any(|item| item.hash == hash) {
+                if self.is_repeat(&hash) {
                     if self.retrying {
                         self.retrying = false;
                         self.next_temperature = llm::DEFAULT_TEMPERATURE;
@@ -575,6 +576,14 @@ impl ModelMemory {
                 }
             }
         }
+    }
+
+    /// A region already proposed, whether or not its verdict has come back.
+    /// With `--jobs` above 1 the batch is filled before any of it settles,
+    /// so a pending region has to count or the same reply is returned again.
+    fn is_repeat(&self, hash: &str) -> bool {
+        self.tried.iter().any(|item| item.hash == hash)
+            || self.pending.iter().any(|(pending, _)| pending == hash)
     }
 
     fn fail(&mut self, error: crate::error::Error) -> bool {
@@ -609,6 +618,7 @@ fn prepare_prompt(
         memory.own.as_ref(),
         best_score,
         &memory.tried,
+        &memory.pending,
     );
     (system, user)
 }
@@ -628,6 +638,7 @@ fn user_prompt(
     own: Option<&Verdict>,
     best_score: Option<f64>,
     tried: &[Tried],
+    pending: &[(String, String)],
 ) -> String {
     let mut out = nugget.splice(base);
     if !out.ends_with('\n') {
@@ -640,11 +651,13 @@ fn user_prompt(
     if let Some(verdict) = own {
         if verdict.status == Status::Rejected {
             append_rejection(&mut out, verdict);
-        } else if verdict.status == Status::Scored {
+        } else if matches!(verdict.status, Status::Scored | Status::Proven)
+            && verdict.passed < verdict.total
+        {
             append_scored(&mut out, verdict, best_score);
         }
     }
-    append_tried(&mut out, tried);
+    append_tried(&mut out, tried, pending);
     out
 }
 
@@ -692,21 +705,28 @@ fn append_labeled(out: &mut String, label: &str, text: &str) {
     }
 }
 
-fn append_tried(out: &mut String, tried: &[Tried]) {
-    if tried.is_empty() {
+fn append_tried(out: &mut String, tried: &[Tried], pending: &[(String, String)]) {
+    if tried.is_empty() && pending.is_empty() {
         return;
     }
     out.push('\n');
     out.push_str("Already tried, do not repeat:\n");
     for item in tried {
-        let region = clip_chars(&item.text, TEXT_CLIP);
-        out.push_str(&region);
-        if !region.ends_with('\n') {
-            out.push('\n');
-        }
-        out.push_str(&item.outcome);
+        append_region_line(out, &item.text, &item.outcome);
+    }
+    for (_, text) in pending {
+        append_region_line(out, text, "proposed, awaiting result");
+    }
+}
+
+fn append_region_line(out: &mut String, text: &str, outcome: &str) {
+    let region = clip_chars(text, TEXT_CLIP);
+    out.push_str(&region);
+    if !region.ends_with('\n') {
         out.push('\n');
     }
+    out.push_str(outcome);
+    out.push('\n');
 }
 
 fn outcome_of(verdict: &Verdict) -> String {
@@ -764,7 +784,7 @@ fn format_diagnostic(diagnostic: &Diagnostic) -> String {
 }
 
 fn accept_region(raw: &str) -> Result<String> {
-    let text = llm::strip_fences(raw);
+    let text = region_text(raw);
     if text.trim().is_empty() {
         return Err(err("the local model returned an empty region"));
     }
@@ -774,6 +794,17 @@ fn accept_region(raw: &str) -> Result<String> {
         ));
     }
     Ok(text)
+}
+
+/// Fences are stripped. An unfenced reply keeps the indent on its first
+/// line; only trailing whitespace is dropped. [`llm::strip_fences`] trims
+/// both ends, which the mutation parser wants and a region does not.
+fn region_text(raw: &str) -> String {
+    if raw.trim_start().starts_with("```") {
+        llm::strip_fences(raw)
+    } else {
+        raw.trim_end().to_string()
+    }
 }
 
 enum Step {
@@ -1496,6 +1527,107 @@ mod tests {
         assert!(prompt.contains("region 1\n"), "{prompt}");
         assert!(prompt.contains("region 8\n"), "{prompt}");
         assert!(!prompt.contains("region 9\n"), "{prompt}");
+    }
+
+    #[test]
+    fn a_region_awaiting_its_result_is_not_proposed_again_and_keeps_its_indent() {
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let region = "    let total: i64 = \"no\";\n    total\n";
+        let mut proposer = MockModelProposer::new(vec![region.to_string(); 8], "");
+        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        assert_eq!(first, "    let total: i64 = \"no\";\n    total");
+        assert_eq!(proposer.next(&nugget, &quiet()).unwrap(), None);
+        assert!(proposer.memory.stopped.is_some());
+        assert_eq!(proposer.replies.len(), 1);
+        assert!(proposer.asked_temperatures.contains(&0.8));
+        let prompt = &proposer.prompts[1].user;
+        assert!(prompt.contains("proposed, awaiting result"), "{prompt}");
+        assert!(prompt.contains("    let total: i64 = \"no\";"), "{prompt}");
+        assert!(prompt.contains("\n    total\n"), "{prompt}");
+    }
+
+    #[test]
+    fn jobs_do_not_ask_a_repeated_region_fifty_times() {
+        let out = std::env::temp_dir().join(format!(
+            "crab-cage-proposer-jobs-repeat-{}",
+            std::process::id()
+        ));
+        if out.exists() {
+            fs::remove_dir_all(&out).unwrap();
+        }
+        fs::create_dir_all(&out).unwrap();
+        let mut model =
+            MockModelProposer::new(vec!["    std::fs::read(\"a\");\n".to_string(); 40], "");
+        let mut proposers: Vec<&mut dyn crate::proposer::Proposer> = vec![&mut model];
+        crate::run::execute(
+            &crate::run::RunOptions {
+                nugget_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("nuggets")
+                    .join("sum-squares"),
+                budget: 8,
+                jobs: 3,
+                out_dir: out,
+                lust_bin: None,
+                lust_daemon: false,
+            },
+            &mut proposers,
+        )
+        .unwrap();
+        assert!(
+            model.asked_temperatures.len() <= 8,
+            "asked {} times: {:?}",
+            model.asked_temperatures.len(),
+            model.asked_temperatures
+        );
+        assert!(model.replies.len() >= 30, "left {}", model.replies.len());
+        assert!(model.asked_temperatures.contains(&0.8));
+        assert!(model.prompts[1].user.contains("proposed, awaiting result"));
+        assert!(model.prompts[1].user.contains("    std::fs::read"));
+    }
+
+    #[test]
+    fn a_proven_verdict_that_still_fails_cases_names_the_failure() {
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let mut proposer =
+            MockModelProposer::new(vec!["body\n".to_string(), "next\n".to_string()], "");
+        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let mut verdict = scored(
+            2,
+            3,
+            1.0,
+            Some(CaseFailure {
+                id: "negatives".to_string(),
+                input: "-4\n5\n".to_string(),
+                expected: "41".to_string(),
+                actual: "49".to_string(),
+            }),
+        );
+        verdict.status = Status::Proven;
+        verdict.gate = Gate::Oracle;
+        let recent = [(first.as_str(), &verdict)];
+        let feedback = Feedback {
+            best: Some(("BEST_REGION\n", 1.0)),
+            last: None,
+            recent: &recent,
+        };
+        proposer.next(&nugget, &feedback).unwrap().unwrap();
+        let prompt = &proposer.prompts[1].user;
+        assert!(
+            prompt.contains(
+                "Your last region ran and failed 1 of 3 cases. The best so far has score 1."
+            ),
+            "{prompt}"
+        );
+        let line = prompt
+            .find("Your last region ran and failed 1 of 3 cases.")
+            .unwrap_or_else(|| panic!("{prompt}"));
+        let expected = prompt
+            .find("expected:\n41")
+            .unwrap_or_else(|| panic!("{prompt}"));
+        let actual = prompt
+            .find("actual:\n49")
+            .unwrap_or_else(|| panic!("{prompt}"));
+        assert!(line < expected && expected < actual, "{prompt}");
     }
 
     #[test]

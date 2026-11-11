@@ -232,11 +232,17 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
                 done = true;
                 break;
             };
-            let repeat = journal.seen(&candidate_hash(&text))
-                || batch.iter().any(|(_, other)| *other == text);
-            if repeat {
+            let in_batch = batch.iter().any(|(_, other)| *other == text);
+            let seen = journal.seen(&candidate_hash(&text));
+            if in_batch || seen {
                 if note_unjournaled(&mut unjournaled) {
                     done = true;
+                    break;
+                }
+                // The same region is already waiting in this batch. Asking
+                // again repeats the prompt, and a model at temperature 0.2
+                // answers it the same way. Evaluate what we have.
+                if in_batch {
                     break;
                 }
                 continue;
@@ -1084,5 +1090,61 @@ mod tests {
         assert_eq!(feedback.recent[0].0, "c1");
         assert_eq!(feedback.recent[31].0, "c32");
         assert!(feedback.last.is_none());
+    }
+
+    /// Returns one fixed region. `third_saw_own` is set when the third call
+    /// already sees that region in [`Feedback::recent`], which is only true
+    /// if the duplicate ended the batch and the region was settled.
+    struct SameRegion {
+        calls: usize,
+        third_saw_own: bool,
+    }
+
+    impl Proposer for SameRegion {
+        fn name(&self) -> &str {
+            "same"
+        }
+
+        fn next(&mut self, _nugget: &Nugget, feedback: &Feedback) -> Result<Option<String>> {
+            self.calls += 1;
+            if self.calls == 3 {
+                self.third_saw_own = feedback
+                    .recent
+                    .iter()
+                    .any(|(text, _)| text.contains("std::fs"));
+            }
+            Ok(Some("    std::fs::read(\"a\");\n".to_string()))
+        }
+    }
+
+    #[test]
+    fn a_duplicate_in_the_batch_is_settled_before_the_next_ask() {
+        let out =
+            std::env::temp_dir().join(format!("crab-cage-run-batch-dup-{}", std::process::id()));
+        if out.exists() {
+            fs::remove_dir_all(&out).unwrap();
+        }
+        fs::create_dir_all(&out).unwrap();
+        let mut same = SameRegion {
+            calls: 0,
+            third_saw_own: false,
+        };
+        let mut proposers: Vec<&mut dyn Proposer> = vec![&mut same];
+        execute(
+            &RunOptions {
+                nugget_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("nuggets")
+                    .join("sum-squares"),
+                budget: 8,
+                jobs: 3,
+                out_dir: out,
+                lust_bin: None,
+                lust_daemon: false,
+            },
+            &mut proposers,
+        )
+        .unwrap();
+        assert!(same.third_saw_own, "calls {}", same.calls);
+        assert!(same.calls < 60, "calls {}", same.calls);
     }
 }
