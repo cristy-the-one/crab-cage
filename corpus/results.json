@@ -1,0 +1,114 @@
+{
+  "pairs": [
+    {
+      "name": "01-bugfix",
+      "new_bytes": 30,
+      "span": 30,
+      "add_only": 54,
+      "strategy_a": 29,
+      "strategy_b": 33,
+      "reference": 29,
+      "optimal": 29,
+      "cross_sector": 29
+    },
+    {
+      "name": "02-table",
+      "new_bytes": 292,
+      "span": 292,
+      "add_only": 316,
+      "strategy_a": 74,
+      "strategy_b": 149,
+      "reference": 74,
+      "optimal": 74,
+      "cross_sector": 74
+    },
+    {
+      "name": "03-gaps",
+      "new_bytes": 64,
+      "span": 2080,
+      "add_only": 56,
+      "strategy_a": 29,
+      "strategy_b": 33,
+      "reference": 29,
+      "optimal": 29,
+      "cross_sector": 29
+    },
+    {
+      "name": "04-insert",
+      "new_bytes": 72,
+      "span": 72,
+      "add_only": 96,
+      "strategy_a": 84,
+      "strategy_b": 62,
+      "reference": 62,
+      "optimal": 61,
+      "cross_sector": 61
+    },
+    {
+      "name": "05-shift-inside",
+      "new_bytes": 128,
+      "span": 128,
+      "add_only": 152,
+      "strategy_a": 109,
+      "strategy_b": 36,
+      "reference": 36,
+      "optimal": 36,
+      "cross_sector": 36
+    },
+    {
+      "name": "06-scattered",
+      "new_bytes": 512,
+      "span": 512,
+      "add_only": 536,
+      "strategy_a": 119,
+      "strategy_b": 265,
+      "reference": 119,
+      "optimal": 119,
+      "cross_sector": 119
+    },
+    {
+      "name": "07-move-earlier",
+      "new_bytes": 212,
+      "span": 2228,
+      "add_only": 248,
+      "strategy_a": 258,
+      "strategy_b": 248,
+      "reference": 248,
+      "optimal": 248,
+      "cross_sector": 70
+    },
+    {
+      "name": "08-unaligned",
+      "new_bytes": 48,
+      "span": 48,
+      "add_only": 72,
+      "strategy_a": 29,
+      "strategy_b": 34,
+      "reference": 29,
+      "optimal": 29,
+      "cross_sector": 29
+    }
+  ],
+  "family": {
+    "window": 8,
+    "stride": 1,
+    "min_match": 3,
+    "multi_probe": false,
+    "cap": 64,
+    "merge_gap": false,
+    "demote": true,
+    "suppress_ff": true,
+    "skip_ff": false
+  },
+  "family_bytes": [
+    33,
+    149,
+    33,
+    62,
+    36,
+    265,
+    248,
+    34
+  ],
+  "family_total": 860
+}

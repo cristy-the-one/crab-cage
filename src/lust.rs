@@ -388,7 +388,9 @@ pub fn compile_rustc_any_edition(
                     text.contains("edition")
                         && (text.contains("unknown")
                             || text.contains("invalid")
-                            || text.contains("must be one of"))
+                            || text.contains("must be one of")
+                            || text.contains("requires edition")
+                            || text.contains("latest edition supported"))
                 }
                 _ => false,
             };

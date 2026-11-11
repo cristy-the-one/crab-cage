@@ -47,6 +47,8 @@ enum Command {
     /// `pass_all` exits 0 only when a proven candidate scores 0.
     /// `minimize` exits 0 when any candidate is proven.
     Run(RunArgs),
+    /// Firmware delta kernels: the v0.03 oracle, the corpus, and a search.
+    Delta(DeltaArgs),
 }
 
 #[derive(Parser, Clone, Debug, Default)]
@@ -159,6 +161,46 @@ struct RunArgs {
     no_lust_daemon: bool,
 }
 
+#[derive(Parser, Debug)]
+struct DeltaArgs {
+    #[command(subcommand)]
+    command: DeltaCommand,
+}
+
+#[derive(Subcommand, Debug)]
+enum DeltaCommand {
+    /// Write `nuggets/delta-kernel/cases` from every `old.srec`/`new.srec` pair.
+    SyncCases {
+        #[arg(long, default_value = "corpus/pairs")]
+        corpus: PathBuf,
+        #[arg(long, default_value = "nuggets/delta-kernel")]
+        nugget: PathBuf,
+    },
+    /// Score the host encoders and print JSON.
+    Measure {
+        #[arg(long, default_value = "corpus/pairs")]
+        corpus: PathBuf,
+    },
+    /// Write the synthetic SREC pairs into the corpus directory.
+    GenSynthetic {
+        #[arg(long, default_value = "corpus/pairs")]
+        corpus: PathBuf,
+    },
+    /// Run one kernel through the cage, then the reference decoder.
+    Eval {
+        #[arg(long, default_value = "nuggets/delta-kernel")]
+        nugget: PathBuf,
+        /// Candidate file. The seed is `nuggets/delta-kernel/template.rs`'s region;
+        /// pass a file of replacement lines, as with `crab-cage eval`.
+        candidate: PathBuf,
+    },
+    /// Search the greedy parameter grid and print the winner.
+    Search {
+        #[arg(long, default_value = "corpus/pairs")]
+        corpus: PathBuf,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -170,6 +212,7 @@ fn main() -> ExitCode {
         Some(Command::Evolve(args)) => evolve(args).map(|()| ExitCode::SUCCESS),
         Some(Command::Eval(args)) => eval_cmd(args),
         Some(Command::Run(args)) => run_cmd(args),
+        Some(Command::Delta(args)) => delta_cmd(args).map(|()| ExitCode::SUCCESS),
         None => evolve(cli.evolve).map(|()| ExitCode::SUCCESS),
     };
     match result {
@@ -399,6 +442,46 @@ fn read_config(path: &std::path::Path) -> Result<FileConfig> {
             .map_err(|e| err(format!("{}: {}", path.display(), e.message)))?;
     }
     Ok(file)
+}
+
+fn delta_cmd(args: DeltaArgs) -> Result<()> {
+    match args.command {
+        DeltaCommand::SyncCases { corpus, nugget } => {
+            crab_cage::delta::sync_cases(&corpus, &nugget)?;
+            println!("wrote cases in {}", nugget.display());
+        }
+        DeltaCommand::GenSynthetic { corpus } => {
+            crab_cage::delta::write_synthetic(&corpus)?;
+            println!("wrote synthetic pairs in {}", corpus.display());
+        }
+        DeltaCommand::Measure { corpus } => {
+            let pairs = crab_cage::delta::load_pairs(&corpus)?;
+            let measured = crab_cage::delta::measure(&pairs)?;
+            println!("{}", serde_json::to_string_pretty(&measured)?);
+        }
+        DeltaCommand::Search { corpus } => {
+            let pairs = crab_cage::delta::load_pairs(&corpus)?;
+            let images: Vec<_> = pairs
+                .iter()
+                .map(|pair| (pair.old.clone(), pair.new.clone()))
+                .collect();
+            let (params, total) = crab_cage::delta::search_family(&images)?;
+            println!("bytes {total}");
+            println!("{params:?}");
+        }
+        DeltaCommand::Eval { nugget, candidate } => {
+            let report = crab_cage::delta::eval_candidate(&nugget, &candidate)?;
+            println!("{}", serde_json::to_string_pretty(&report)?);
+            if !report.ok {
+                return Err(crab_cage::error::err(if report.note.is_empty() {
+                    "kernel has no score".to_string()
+                } else {
+                    report.note
+                }));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn run_cmd(args: RunArgs) -> Result<ExitCode> {
