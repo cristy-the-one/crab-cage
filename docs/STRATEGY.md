@@ -120,7 +120,7 @@ Every candidate, at whatever gate it stops, is one line in `journal.jsonl`.
 
 ## 6. The plan
 
-As of 2026-11-11, Phases 0 and 1 and the first package of Phase 2 are done; the status table is at the top of [WORK-PACKAGES.md](WORK-PACKAGES.md).
+As of 2026-11-11, Phases 0, 1 and 2 are done except the speed objective (WP-20); the status table is at the top of [WORK-PACKAGES.md](WORK-PACKAGES.md).
 
 Four phases. Each phase leaves the repo working and more useful than before. Stop after any phase and nothing is half-built.
 

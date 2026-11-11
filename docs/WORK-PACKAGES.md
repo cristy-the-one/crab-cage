@@ -45,15 +45,19 @@ Phase 3:  L-03 … L-11, any order
 | WP-15 | done | crab-cage [#10](https://github.com/cristy-the-one/crab-cage/pull/10) |
 | Warm lust daemon (`eval --lust-daemon`, default in `run`) | done, not in the original plan | crab-cage #11, #12 |
 | WP-16 | done | crab-cage #14 |
-| WP-17 | done | see WP-17 for the numbers |
-| WP-17b | done | `src/spawn.rs`; numbers below WP-17 |
-| WP-18, WP-19, WP-20 | open | |
+| WP-17 | done | crab-cage #16; see WP-17 for the numbers |
+| WP-17b | done | crab-cage #16, `src/spawn.rs`; numbers below WP-17 |
+| WP-18 | done | crab-cage #15; the proposer has run against a mock and a scripted stand-in server, not yet a real model |
+| WP-18b | in progress | the model proposer's feedback: an "already tried" list, the failing case, verdicts by hash |
+| WP-19 | docs done; the tank port is not planned | README and DESIGN.md |
+| WP-20 | open | needs zig |
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
 | L-02 | done for literal bounds; variable bounds open | lust-lang #37 |
 | L-03 | done | lust-lang #36 |
 | L-04, L-05, L-06, L-08, L-09 | open | |
 | L-07 | measured; see the package | |
-| L-10, L-11 | new, below | |
+| L-10 | in review | lust-lang [#39](https://github.com/cristy-the-one/lust-lang/pull/39); it also closes the same leak for file descriptors on Unix |
+| L-11 | new, open | below |
 
 Decisions made while building, which later packages must keep:
 
