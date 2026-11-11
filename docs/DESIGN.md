@@ -1,25 +1,69 @@
 # Crab Cage
 
-Crab Cage is an offline workbench that searches for process controllers. A local model proposes a control law. A genetic algorithm tunes its numbers. Each candidate is valid Rust. When a `lust` binary is on `PATH`, that Rust is type-checked and built inside lust's sandbox, then run under a host wall-clock limit. The search result is one standalone `.rs` file plus a report.
+Crab Cage tries many small changes to one marked region of a Rust program, filters them with lust, and proves the survivors with `rustc`. lust is the fast gate: it checks and builds a subset of Rust in milliseconds, and a program it accepts is valid Rust with the same output. `rustc` is the oracle: slow, and always right.
 
-The product belongs to Marius, who maintains [lust-lang](https://github.com/cristy-the-one/lust-lang). Crab Cage does not vendor lust and does not patch it. Anything lust cannot do yet is listed at the end as a proposed lust change.
+The product belongs to Marius, who maintains [lust-lang](https://github.com/cristy-the-one/lust-lang). Crab Cage does not vendor lust and does not patch it.
+
+How to use it is in the [README](../README.md). Why it has this shape is in [STRATEGY.md](STRATEGY.md). What is built and what is left is in [WORK-PACKAGES.md](WORK-PACKAGES.md).
 
 ## The job
 
-A process has many measured signals and a few things worth driving or predicting. The mapping depends on time: disturbances repeat, and operating points drift. The user describes
-
-- the measured inputs,
-- the actuator outputs and the predicted outputs,
-- the objective and the constraints,
-- a time series, or a simulator that stands in for one.
+The user states a problem as a **nugget**: a complete Rust program with one marked region, a set of inputs, and either the outputs those inputs must produce or a number the program prints to be made small. A **candidate** is replacement text for the region.
 
 Crab Cage then
 
-1. Asks a local model for a candidate controller written as Rust that lust can accept.
-2. Evolves a population. Numeric parameters move by mutation and crossover. The model is the structural mutation operator: it changes which terms of the law are live.
-3. Scores a candidate by running it against the simulator or the series, inside the sandbox, with a memory cap and a host timeout.
-4. Feeds lust diagnostics back so a broken candidate can be repaired (`lust check`, `lust fix`, then the model).
-5. Writes the best controller as a file `rustc` compiles on its own, and a report: the fitness curve, the Pareto archive, prediction against the plant, and the trend-shift scenario.
+1. Gets candidates from proposers: files in a folder, small changes to the numbers in the best candidate, or a local model.
+2. Throws most of them away cheaply. A prefilter refuses the words the sandbox forbids. `lust check` refuses what does not type-check or borrow-check, and its diagnostics go back to the proposer with line numbers counted from the first line of the candidate.
+3. Builds the rest with lust in its sandbox, runs each case under a memory cap and a time limit, and scores the output.
+4. Asks the oracle about a candidate that beats the best so far: `rustc` builds the same file with the same checks on, and the two programs must print the same bytes and stop the same way. Equal is `proven`. Different is `diverged`, and the source, the input and both outputs are saved as a lust bug report.
+5. Writes every verdict to a journal, and the best proven candidate as a file `rustc` compiles on its own.
+
+The loop serves two readers. The user gets a proven candidate. lust gets every case where it disagreed with `rustc`, and a count of which of its error codes rejected the most candidates.
+
+## The funnel
+
+```text
+crab-cage
+  CLI  ── eval (one candidate)   run (a search)   evolve (the controller example)
+    │
+    ├─ nugget        template.rs with // CRAB:BEGIN and // CRAB:END, cases/, nugget.json
+    │
+    ├─ proposers     folder │ literal tweak │ local model (loopback HTTP only)
+    │
+    ├─ pipeline      prefilter → lust check → lust build → run cases → rustc oracle
+    │                one Verdict per candidate: gate, status, score, diagnostics, times
+    │
+    ├─ run           batches of --jobs candidates; the first pass in parallel, one
+    │                slot file each; the oracle, the journal and the best in
+    │                proposal order; resume from the journal
+    │
+    ├─ lust runner   probe by usage text; check and build; the warm daemon on one
+    │                slot file per job; rustc with the same profile as the oracle
+    │
+    └─ supervisor    wall-clock kill; RLIMIT_AS (Unix) or a job-object commit cap
+                     (Windows); environment scrubbed; a child gets three pipes and
+                     no other handle of this process
+```
+
+Decisions that hold across the code:
+
+- **Only `proven` is a result.** `diverged`, and a candidate whose `rustc` build disagrees with itself between two runs (`nondeterministic output`), never become the best.
+- **The oracle matches lust's profile.** `rustc` runs with `-C debug-assertions=on -C overflow-checks=on`, as lust builds do. Without that, a difference in profile reads as a lust bug.
+- **A reported lust bug must be one.** A missing `rustc` or a compile that timed out is an error, not a divergence.
+- **The region is text.** There is no parser. A candidate is spliced between two marker lines.
+- **One slot file per job.** lust's daemon keeps one warm session per source path. Writing each candidate to its own file is slower with the daemon than without it; rewriting one file is about ten times faster.
+- **A run can be repeated.** The journal is in proposal order whatever `--jobs` is, and the proposers draw from seeded generators.
+
+The rest of this document describes the controller search, which was built first and is still in the tree as `crab-cage evolve`. It does not go through the funnel above: its candidate is a typed genome that Crab Cage lowers to Rust, and lust and `rustc` see only the winner.
+
+## The controller search
+
+A process has many measured signals and a few things worth driving or predicting. The mapping depends on time: disturbances repeat, and operating points drift. `evolve` searches for a controller for one built-in simulator:
+
+1. A model, or a fixed schedule standing in for one, picks a control law.
+2. A genetic algorithm tunes the law's numbers by mutation and crossover.
+3. Each candidate is scored in-process against the simulator.
+4. The winner is emitted as one Rust file, built by `rustc` and by lust when it is given, and replayed; the report says whether the two builds printed identical lines.
 
 ## What lust is, here
 
@@ -114,10 +158,7 @@ There is one crate. No network service, no account, no telemetry, no database. T
 
 ### LLM backend
 
-`LlmBackend` has two methods.
-
-- `mutate` looks at the current law, the genes, the fitness, the emitted source, and any diagnostics. It returns a new law and a list of gene edits.
-- `repair` looks at source plus diagnostics and may return replacement source.
+`LlmBackend` has one method. `mutate` looks at the current law, the genes, the fitness and the emitted source, and returns a new law and a list of gene edits. (The model that writes code is the local-model proposer of `crab-cage run`, in `src/proposer.rs`.)
 
 The mock backend is a fixed schedule, so a seed repeats on Linux and Windows:
 
@@ -127,7 +168,7 @@ The mock backend is a fixed schedule, so a seed repeats on Linux and Windows:
 | generation ≥ 5 and the elite is PI | switch to PI + feedforward, with gains near `loss/heat`, `flow/heat`, and `−leak/heat`, plus a coolant valve |
 | generation ≥ 8 and the elite is feedforward | switch on the one-step predictor; `mix` stays 0 so feedback is unchanged |
 
-The local backend posts to `{endpoint}/chat/completions` with `temperature` 0.2. The body is the OpenAI chat shape that Ollama and `llama-server` both speak. The URL must be `http` (not `https`) and the host must be loopback. Redirects are not followed. The response is capped at 1 MiB. The model is asked for one JSON object (`law`, `genes`, `note`). A fenced block is stripped. A repair request asks for Rust source and is rejected by the host prefilter if it contains `unsafe`, `async`, `std::fs`, `std::net`, `std::env`, `std::process`, `std::thread`, or `include!`.
+The local backend posts to `{endpoint}/chat/completions` with `temperature` 0.2. The body is the OpenAI chat shape that Ollama and `llama-server` both speak. The URL must be `http` (not `https`) and the host must be loopback. Redirects are not followed. The response is capped at 1 MiB. The model is asked for one JSON object (`law`, `genes`, `note`). A fenced block is stripped.
 
 The model never sees a path to the open internet from Crab Cage. Downloading weights is a separate step the user does once, with the model's own tool, before disconnecting.
 
@@ -162,7 +203,7 @@ The genome is a law plus seventeen finite numbers. The law decides which numbers
 
 The integral is clamped to ±120 and is frozen while the heater command is saturated against the error (anti-windup). The window is 2 to 16 samples. The Fourier bin is period 30, the nominal flow cycle. Slope is `(newest − oldest) / (n − 1)`.
 
-This is a typed genome, not a free AST. The model proposes a law and numbers; Crab Cage lowers them to Rust. A free-form source replacement exists on the repair path and is not what the demo search evaluates. Letting the model edit statements inside `fn control`, with lust as the constraint, is a later phase. The trait already has a place for that (`repair` returns source).
+This is a typed genome, not a free AST. The model proposes a law and numbers; Crab Cage lowers them to Rust. Letting a model write the body itself, with lust as the constraint, is what nuggets and `crab-cage run` do.
 
 ### What is emitted
 
@@ -217,9 +258,9 @@ Stdout and stderr captured from a run are capped at 2 MiB.
 
 `crab-out/report.json` (schema 1) and `crab-out/report.md` contain the scalar, the per-scenario breakdown, the per-generation curve, the Pareto archive, a sliced nominal trace (temperature, setpoint, heater, prediction, next true temperature), and what the verifier did: `rustc` replay error, lust version, whether `--max-memory` exists, and the check result.
 
-## Models for this laptop
+## Models for a 16 GB GPU
 
-RTX 5080 Laptop, 16 GB VRAM, 64 GB RAM. One resident GGUF. No second copy, no cloud fallback.
+Sized for an RTX 5080 Laptop: 16 GB VRAM, 64 GB RAM. One resident GGUF. No second copy, no cloud fallback. On a machine with no discrete GPU the model runs on the processor, and the 7B build is the place to start; that has not been measured.
 
 | Role | Model | Why |
 |---|---|---|
@@ -246,7 +287,7 @@ Context 8192 covers the plant description, the current controller, and the genom
 
 ## Desktop UI
 
-Not in this tree. The report is the contract a UI would read. A later UI is a Tauri shell (MIT / Apache-2.0, already used on other projects here) with a TypeScript front end:
+Not in this tree, and not planned. What follows is the sketch from the first design. The report is the contract a UI would read. A later UI is a Tauri shell (MIT / Apache-2.0, already used on other projects here) with a TypeScript front end:
 
 - the fitness curve and the Pareto archive from `report.json`,
 - the nominal and trend-shift traces,
@@ -266,26 +307,29 @@ The shell starts the same `crab-cage` library. It does not grow a second search 
 
 ## Roadmap
 
-Sizes are the amount of code and the surface that changes. They are not a schedule.
+The plan and its status are in [WORK-PACKAGES.md](WORK-PACKAGES.md). In short:
 
-| Phase | Size | What it adds |
+| Phase | What it added | State |
 |---|---|---|
-| 0, this tree | one crate, about twenty modules, one demo | Typed genome, mock and local backends, native search, lust runner, host limits, report, Linux and Windows CI |
-| 1 | the runner plus a warm work directory | Every offspring built by lust, body-patch checks, diagnostics fed back into `mutate` on failures. Sandbox becomes the default search when lust 0.3.0 is on `PATH` |
-| 2 | a statement-level genome inside `fn control` | The model edits the body. Crossover swaps statement blocks. `lust check --sandbox` is the constraint. `syn` (Apache-2.0 / MIT) or a smaller parser |
-| 3 | a Tauri crate beside this one | Curves, traces, diagnostics, loopback backend picker. Reads `report.json` |
-| 4 | a CSV reader and a second simulator | User series replace the tank. The protocol stays the line protocol. A split the fitness function does not see |
-| 5 | one optimizer module | Full-covariance CMA-ES on the numeric genes. The structural operator stays the model |
+| 0 | The first tree worked against a real lust on Windows, and `rustc` always runs on the winner | done |
+| 1 | `crab-cage eval`: one candidate through the funnel, with the oracle | done |
+| 2 | `crab-cage run`: the journal, three proposers, parallel jobs, the warm daemon | done, except the speed objective (WP-20) |
+| 3 | Changes in lust that the loop exposed | float `clamp`, `--time-limit` and the daemon's handles are done; the rest is open |
+
+Not planned: a parser for candidates, a desktop UI, a second simulator, CMA-ES. They were in the first roadmap and none of them serves the funnel.
 
 ## What this tree implements
 
-- `crab-cage evolve` runs the tank demo with the mock backend, prints the curve and the best fitness, and writes `best_controller.rs`, `report.md`, and `report.json`.
-- `--backend local` talks to a loopback model server and refuses anything else.
-- With lust 0.3.0 on `PATH` or `--lust-bin`, the winner is `lust check --sandbox` and, when the flags are advertised, `lust build --sandbox --max-memory --time-limit`.
-- Without lust, the winner is compiled with `rustc` and replayed under the host memory cap and the wall clock. The report says lust was absent.
-- Tests cover: the search improves fitness on several seeds and repeats bit-for-bit; a hand PI beats a weak proportional; the emitted file compiles with `rustc` and matches the genome; the host kills a sleeper; the host memory cap stops a large allocation and allows a small one; a fake lust is invoked with `--sandbox`, `--max-memory` and `--time-limit`, and `L0532` / `L0533` lines are classified as a guest memory stop and a guest time stop.
+- `crab-cage eval <nugget> <candidate>` prints one verdict, as JSON with `--json`, and compares with `rustc` with `--oracle`.
+- `crab-cage run <nugget>` searches with `--candidates DIR`, `--tweak` and `--backend local`, in batches of `--jobs`, writes `journal.jsonl`, `best.rs` and `best.region.rs`, and resumes from the journal.
+- With `--lust-bin`, candidates are checked and built by lust in its sandbox with the nugget's memory and time limits, through its warm daemon in a run. Without it, `rustc` does the fast gates.
+- `crab-cage evolve` runs the controller search on the tank and writes `best_controller.rs`, `report.md` and `report.json`.
+- A model endpoint must be loopback HTTP. Anything else is refused.
+- The tests need no lust and no model. `tests/real_lust.rs` runs against a real lust when `CRAB_LUST_BIN` is set.
 
 ## Gaps in lust
+
+This list was written with the first tree, and part of it has landed since: `--time-limit` is in lust (lust-lang #36), so item 1 and the patch file it mentions are history; float `clamp` with literal bounds is in (#37); and the daemon no longer keeps a caller's pipes (#38, #39). The open items, with new ones the loop found, are tracked under "Phase 3: lust-lang" in [WORK-PACKAGES.md](WORK-PACKAGES.md).
 
 These are proposals for lust. Crab Cage works around the ones that are still open. The time limit is the exception: the implementation is `docs/lust-time-limit.patch`, against lust-lang v0.3.0 / main at `cbc913832b6f`. Apply it there with `git am`. This environment has no credentials for `github.com/cristy-the-one/lust-lang`, so the patch is the copy of that commit. Crab Cage passes the flag when the binary advertises it.
 
