@@ -9,7 +9,7 @@
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc::{self, Receiver};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::error::{err, Result};
@@ -68,17 +68,21 @@ pub fn run_capture(mut cmd: Command, limits: &Limits, input: &[u8]) -> Result<Ex
         .take()
         .ok_or_else(|| err("stderr was not piped"))?;
     let input = input.to_vec();
-    let writer = thread::spawn(move || {
+    // Not joined: a grandchild that inherited stdin can keep the write
+    // blocked after the child is gone.
+    thread::spawn(move || {
         let _ = stdin.write_all(&input);
         let _ = stdin.flush();
     });
-    let stdout_thread = spawn_reader(stdout);
-    let stderr_thread = spawn_reader(stderr);
+    let stdout_rx = spawn_reader(stdout);
+    let stderr_rx = spawn_reader(stderr);
     let start = Instant::now();
     let kind = wait_child(&mut child, limits, start)?;
-    let _ = writer.join();
-    let stdout = join_text(stdout_thread);
-    let stderr = join_text(stderr_thread);
+    // The child is gone. A grandchild may still hold the pipes, so the
+    // readers get a short grace period and are never joined.
+    let deadline = Instant::now() + DRAIN_GRACE;
+    let stdout = bytes_to_string(&collect(&stdout_rx, deadline));
+    let stderr = bytes_to_string(&collect(&stderr_rx, deadline));
     Ok(ExecResult {
         kind,
         stdout,
@@ -92,8 +96,7 @@ pub struct Session {
     child: Option<Child>,
     stdin: Option<std::process::ChildStdin>,
     lines: Receiver<Option<String>>,
-    reader: Option<JoinHandle<()>>,
-    stderr_thread: Option<JoinHandle<Vec<u8>>>,
+    stderr_rx: Option<Receiver<Vec<u8>>>,
     stderr: String,
     start: Instant,
     wall: Duration,
@@ -123,7 +126,8 @@ impl Session {
             .take()
             .ok_or_else(|| err("stderr was not piped"))?;
         let (tx, rx) = mpsc::channel();
-        let reader = thread::spawn(move || {
+        // Not joined, like the readers in `spawn_reader`.
+        thread::spawn(move || {
             let mut reader = std::io::BufReader::new(stdout);
             loop {
                 let mut line = String::new();
@@ -144,13 +148,12 @@ impl Session {
                 }
             }
         });
-        let stderr_thread = spawn_reader(stderr);
+        let stderr_rx = spawn_reader(stderr);
         Ok(Self {
             child: Some(child),
             stdin: Some(stdin),
             lines: rx,
-            reader: Some(reader),
-            stderr_thread: Some(stderr_thread),
+            stderr_rx: Some(stderr_rx),
             stderr: String::new(),
             start: Instant::now(),
             wall: limits.wall,
@@ -257,11 +260,9 @@ impl Session {
     }
 
     fn take_stderr(&mut self) -> String {
-        if let Some(handle) = self.stderr_thread.take() {
-            self.stderr = bytes_to_string(&join_bytes(handle));
-        }
-        if let Some(handle) = self.reader.take() {
-            let _ = handle.join();
+        // The child has stopped; a grandchild may still hold the pipe.
+        if let Some(rx) = self.stderr_rx.take() {
+            self.stderr = bytes_to_string(&collect(&rx, Instant::now() + DRAIN_GRACE));
         }
         self.stderr.clone()
     }
@@ -273,12 +274,8 @@ impl Drop for Session {
             kill_tree(child);
             let _ = child.wait();
         }
-        if let Some(handle) = self.stderr_thread.take() {
-            let _ = handle.join();
-        }
-        if let Some(handle) = self.reader.take() {
-            let _ = handle.join();
-        }
+        // The reader threads are detached; dropping the receivers lets them
+        // stop at their next chunk or at end-of-file.
     }
 }
 
@@ -376,38 +373,59 @@ fn kill_tree(child: &mut Child) {
     let _ = child.kill();
 }
 
-fn spawn_reader<R>(mut reader: R) -> JoinHandle<Vec<u8>>
+/// How long the readers may keep draining after the child has stopped.
+const DRAIN_GRACE: Duration = Duration::from_millis(500);
+
+/// Read `reader` on a detached thread and send each chunk as it arrives.
+/// The channel disconnects at end-of-file, on error, or at the 2 MiB cap.
+/// The thread is never joined, so a pipe held open by a grandchild cannot
+/// block the caller.
+fn spawn_reader<R>(mut reader: R) -> Receiver<Vec<u8>>
 where
     R: Read + Send + 'static,
 {
+    let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
-        let mut buf = Vec::new();
         let mut chunk = [0u8; 8 * 1024];
         let cap: usize = 2 * 1024 * 1024;
+        let mut total = 0usize;
         loop {
             match reader.read(&mut chunk) {
                 Ok(0) => break,
                 Ok(n) => {
-                    let room = cap.saturating_sub(buf.len());
+                    let room = cap.saturating_sub(total);
                     if room == 0 {
                         break;
                     }
                     let take = n.min(room);
-                    buf.extend_from_slice(&chunk[..take]);
+                    total += take;
+                    if tx.send(chunk[..take].to_vec()).is_err() {
+                        break;
+                    }
                 }
                 Err(_) => break,
             }
         }
-        buf
-    })
+    });
+    rx
 }
 
-fn join_text(handle: JoinHandle<Vec<u8>>) -> String {
-    bytes_to_string(&join_bytes(handle))
-}
-
-fn join_bytes(handle: JoinHandle<Vec<u8>>) -> Vec<u8> {
-    handle.join().unwrap_or_default()
+/// Gather what a reader has sent, until it disconnects or `deadline` passes.
+/// Anything already queued at the deadline is still taken.
+fn collect(rx: &Receiver<Vec<u8>>, deadline: Instant) -> Vec<u8> {
+    let mut buf = Vec::new();
+    loop {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left) {
+            Ok(chunk) => buf.extend_from_slice(&chunk),
+            Err(mpsc::RecvTimeoutError::Disconnected) => return buf,
+            Err(mpsc::RecvTimeoutError::Timeout) => break,
+        }
+    }
+    while let Ok(chunk) = rx.try_recv() {
+        buf.extend_from_slice(&chunk);
+    }
+    buf
 }
 
 fn bytes_to_string(bytes: &[u8]) -> String {
@@ -469,7 +487,7 @@ impl Drop for JobGuard {
         #[cfg(windows)]
         {
             if !self.raw.is_null() {
-                unsafe { windows::close_handle(self.raw) };
+                windows::close_handle(self.raw);
             }
         }
     }
