@@ -33,10 +33,33 @@ These implement [STRATEGY.md](STRATEGY.md). Each package is one pull request. Gi
 Phase 0:  WP-01 → WP-02 → WP-03 → WP-04 → WP-05, WP-06      (L-01, L-02 any time)
 Phase 1:  WP-10 → WP-11 → WP-12 → WP-13 → WP-14
 Phase 2:  WP-15 → WP-16 → WP-17 → WP-18 → WP-19;  WP-20 any time after WP-14
-Phase 3:  L-03 … L-09, any order
+Phase 3:  L-03 … L-11, any order
 ```
 
-Phase 0 is done in [#2](https://github.com/cristy-the-one/crab-cage/pull/2), except WP-01 step B and L-01; next is WP-10.
+## Status (2026-11-11)
+
+| Item | State | Where |
+|---|---|---|
+| WP-01 to WP-06 | done | crab-cage [#2](https://github.com/cristy-the-one/crab-cage/pull/2); WP-01 step B in [#5](https://github.com/cristy-the-one/crab-cage/pull/5) |
+| WP-10 to WP-14 | done | crab-cage #4, #6, #7, #8, #9 |
+| WP-15 | done | crab-cage [#10](https://github.com/cristy-the-one/crab-cage/pull/10) |
+| Warm lust daemon (`eval --lust-daemon`, default in `run`) | done, not in the original plan | crab-cage #11, #12 |
+| WP-16 | next | |
+| WP-17, WP-18, WP-19, WP-20 | open | WP-17 has new facts below |
+| L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
+| L-02 | done for literal bounds; variable bounds open | lust-lang #37 |
+| L-03 | done | lust-lang #36 |
+| L-04, L-05, L-06, L-08, L-09 | open | |
+| L-07 | measured; see the package | |
+| L-10, L-11 | new, below | |
+
+Decisions made while building, which later packages must keep:
+
+- **Exit code of `crab-cage run`.** A `pass_all` nugget exits 0 only when a proven candidate has score 0. A `minimize` nugget exits 0 when any candidate is proven.
+- **Only `proven` is a result.** `diverged`, and `rejected` with the note `nondeterministic output`, never become the best.
+- **The oracle matches lust's profile.** rustc is run with `-C debug-assertions=on -C overflow-checks=on`.
+- **The daemon needs one file.** With lust's daemon on, lust always compiles `<work>/slot.rs`. A new file name per candidate is slower than no daemon at all.
+- **The hash.** `pipeline::candidate_hash` is the only hash function. Do not copy it.
 
 ---
 
@@ -336,13 +359,17 @@ pub trait Proposer {
 
 Add `--tweak` to `crab-cage run` to enable it.
 
+**Since WP-15.** This is the first proposer that can repeat a candidate. `run::execute` stops after 50 proposals in a row that leave no journal line. Add a test on a nugget with one literal: the run must end with that stop line, not spin.
+
 ## WP-17 Parallel slots (T2)
 
 **Files.** `src/run.rs`.
 
-**Steps.** Add `--jobs N` (default 1). Create `N` work directories `<out>/slot-<i>/`. Gather up to `N` unseen candidates from the proposers, evaluate them on `N` `std::thread::scope` threads (one slot each), then append the verdicts to the journal **in the order the candidates were proposed** so a run is reproducible. Best-tracking and the oracle stay on the main thread.
+**Steps.** Add `--jobs N` (default 1). Gather up to `N` unseen candidates from the proposers, evaluate them on `N` `std::thread::scope` threads, then append the verdicts to the journal **in the order the candidates were proposed** so a run is reproducible. Best-tracking and the oracle stay on the main thread.
 
-**First, measure.** Before writing code, time 40 evaluations of the demo nugget with `--jobs 1`. Record check / build / run milliseconds from the journal in the pull request. After: the same with `--jobs 4`. If the speed-up is under 1.5×, say so; the bottleneck is then in lust (see L-07).
+**Slots, given the daemon.** lust starts one daemon per directory it is started in, and keeps one warm session per source path. So use **one** work directory and `N` slot files in it (`slot-0.rs` … `slot-<N-1>.rs`), one per thread: one daemon, `N` warm sessions. `N` directories would mean `N` daemons of about 120 MB each. `pipeline::evaluate` takes the slot file name from its options instead of the constant `SLOT_FILE`.
+
+**Measured before this package (40 candidates, demo nugget, Windows, daemon on).** Median per candidate: check 38 ms, build 73 ms, running the three cases 256 ms. Running the cases is the largest part, and it is plain process start-up, so that is what `--jobs` has to spread. Record the same three numbers with `--jobs 4` in the pull request. If the whole run is not at least 1.5× faster, say so.
 
 ## WP-18 Local-model proposer (T2)
 
@@ -405,6 +432,8 @@ Work in the lust-lang checkout. Its own rules apply (`AGENTS.md`): trunk is `nex
 
 **Test.** Add the piped-reader repro to `scripts/test-client.sh` with a 10 s limit.
 
+**Done in lust-lang #38**, for the client's own stdin, stdout and stderr. Confirmed cause: a child gets a copy of every inheritable handle of its parent. What #38 does not cover is L-10.
+
 ## L-02 `f64::clamp` and `f32::clamp` (T2)
 
 lust rejects `x.clamp(0.0, 1.0)` on floats with L0104; integers and `Ord::clamp` already work. Add `clamp` to the float method table (`FLOAT_METHODS` and its lowering in `src/check/mod.rs`; follow how `max`/`min` are done). rustc panics when `min > max` or either bound is NaN; match that message byte for byte, or keep rejecting the cases you cannot match. Add `tests/pass` cases: in range, below, above, NaN input, and a `should panic` case for `min > max`.
@@ -429,6 +458,16 @@ Opt-in flag on `build`/`run` (name it `--report-stop`): when the program stops, 
 
 On Windows a warm `lust check` of a 9-line file cost tens of milliseconds end to end in a shell loop, against 7.5 ms documented on Linux. Step 1: measure properly. A small Rust program that calls `lust check --json --timings` 200 times on alternating edits, reporting client wall time and the daemon's own time. Step 2, only if the client side dominates: add `lust check --batch`, which reads file paths from stdin, one per line, and writes one JSON result line per path, over one daemon connection. Publish the Windows numbers in `docs/speed.md` either way.
 
+**Measured (Windows 11, lust `next` at `f2dc9a8b`, demo nugget, medians).**
+
+| Setup | `lust check` | `lust build` |
+|---|---:|---:|
+| daemon off | 108 ms | 378 ms |
+| daemon on, a new file per candidate | 97 ms | 630 ms |
+| daemon on, one file rewritten | 18 ms | 35 ms |
+
+So step 2 (`--batch`) is not needed for now: a host that rewrites one file gets most of the gain, and Crab Cage does. What is left of the 18 ms is mostly starting the client process. Still open: publish Windows numbers in lust's `docs/speed.md`, and say in lust's docs that a host should reuse one source path.
+
 ## L-08 Turn Crab Cage journals into lust cases (T1 script, T2 triage)
 
 A script `scripts/crab-intake.py <crab-out-dir>`:
@@ -443,3 +482,20 @@ A script `scripts/crab-intake.py <crab-out-dir>`:
 2. When `--opt` is asked for and no compiler is found, the error names what was looked for and in what order, with its own L-code, so a host can match the code instead of the text (WP-20 step 4 then switches to it).
 3. Measure on Windows and add to `docs/opt.md`: build time and run time of the same program under tcc, `--opt` with zig, and `rustc -O`, for the 80-hex bench the doc already uses.
 4. Out of scope: replacing TinyCC as the dev backend. TinyCC is linked in and compiles in-process; that is where the millisecond edit loop comes from.
+
+## L-10 The daemon inherits only the handles it is given (T3)
+
+**Symptom.** With lust's daemon on, `crab-cage eval … | reader` finished and the reader never saw end-of-file. Crab Cage's own stdout was an inheritable handle; lust inherited it as an extra handle and passed it to the daemon. #38 makes only lust's own three standard handles private while the daemon starts, so any other inheritable handle of the caller still reaches the daemon.
+
+**Fix.** Start the daemon with `PROC_THREAD_ATTRIBUTE_HANDLE_LIST`, naming exactly its stdin (NUL), stdout and stderr (the log, or NUL) and the lock handle. std has that only behind an unstable feature (`windows_process_extensions_raw_attribute`), so it is a direct `CreateProcessW` call in `src/protocol.rs`.
+
+**Test.** In `scripts/test-client.sh`: a caller that holds an extra inheritable pipe, starts `lust check` with handle inheritance on, closes its own write end, and must then read end-of-file from the pipe within a bound.
+
+Crab Cage does not depend on this: since crab-cage #11 it keeps its own standard handles out of its children. Another host that embeds lust does.
+
+## L-11 Decide what `HashMap` iteration order means under rule zero (T2 to document, T3 to change)
+
+A program that folds over `HashMap::iter()` printed three different results in three runs of the same rustc binary, and the same result every time from the lust build. rustc randomises the hash seed per process; lust does not. No single output can match a randomised one, so this is not a miscompile, but a lust program can come to depend on an order that the rustc release build will not keep.
+
+Options: say so in lust's docs and keep it; or randomise the seed as rustc does; or reject order-dependent uses (hard). Crab Cage's oracle already handles the candidate side: it runs the rustc binary twice on a mismatch and rejects the candidate as nondeterministic instead of filing a divergence.
+
