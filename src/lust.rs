@@ -29,6 +29,11 @@ pub struct LustTool {
 pub struct Diagnostic {
     pub code: String,
     pub message: String,
+    pub severity: String,
+    pub line: u32,
+    pub col: u32,
+    pub fix: String,
+    pub auto_edits: usize,
     pub raw: String,
 }
 
@@ -328,9 +333,18 @@ fn parse_diagnostics(text: &str) -> Vec<Diagnostic> {
             if value.message.is_none() && value.code.is_none() && value.ok == Some(true) {
                 continue;
             }
+            // `line` and `col` live under `span`. A missing field, or JSON
+            // null, becomes an empty string or 0. `span.file` (the old fake
+            // lust shape) is ignored; real lust puts the path at the top.
+            let span = value.span.unwrap_or_default();
             out.push(Diagnostic {
                 code: value.code.unwrap_or_default(),
                 message: value.message.unwrap_or_default(),
+                severity: value.severity.unwrap_or_default(),
+                line: span.line.unwrap_or(0),
+                col: span.col.unwrap_or(0),
+                fix: value.fix.unwrap_or_default(),
+                auto_edits: value.edits.unwrap_or_default().len(),
                 raw: line.to_string(),
             });
         }
@@ -346,6 +360,22 @@ struct DiagLine {
     message: Option<String>,
     #[serde(default)]
     ok: Option<bool>,
+    #[serde(default)]
+    severity: Option<String>,
+    #[serde(default)]
+    span: Option<DiagSpan>,
+    #[serde(default)]
+    fix: Option<String>,
+    #[serde(default)]
+    edits: Option<Vec<serde_json::Value>>,
+}
+
+#[derive(Default, Deserialize)]
+struct DiagSpan {
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    col: Option<u32>,
 }
 
 fn first_line(stdout: &str, stderr: &str) -> String {
@@ -449,5 +479,36 @@ mod tests {
         let diags = parse_diagnostics(text);
         assert_eq!(diags.len(), 1);
         assert_eq!(diags[0].code, "L0102");
+        assert_eq!(diags[0].severity, "");
+        assert_eq!(diags[0].line, 0);
+        assert_eq!(diags[0].col, 0);
+        assert_eq!(diags[0].fix, "");
+        assert_eq!(diags[0].auto_edits, 0);
+    }
+
+    #[test]
+    fn parses_a_real_lust_diagnostic() {
+        let text = r#"{"schema":1,"kind":"diagnostic","code":"L0110","severity":"error","message":"mismatched types: expected `u32`, found `&str`","file":"C:\\t\\bad.rs","span":{"start":29,"end":32,"line":2,"col":18,"end_line":2,"end_col":21},"labels":[],"fix":"Change the value to type `u32`, or change the expected type.","edits":[]}"#;
+        let diags = parse_diagnostics(text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "L0110");
+        assert_eq!(diags[0].line, 2);
+        assert_eq!(diags[0].col, 18);
+        assert!(diags[0].fix.starts_with("Change"));
+    }
+
+    #[test]
+    fn parses_the_old_fake_lust_shape() {
+        // `span.file`, no `severity`. The path is a JSON string, so a Windows
+        // backslash arrives as `\\`.
+        let text = r#"{"code":"L0102","message":"cannot find value `BROKEN_TOKEN` in this scope","span":{"file":"C:\\t\\broken.rs","line":1,"col":1},"fix":"replace BROKEN_TOKEN","edits":[{},{"kind":"replace"}]}"#;
+        let diags = parse_diagnostics(text);
+        assert_eq!(diags.len(), 1);
+        assert_eq!(diags[0].code, "L0102");
+        assert_eq!(diags[0].severity, "");
+        assert_eq!(diags[0].line, 1);
+        assert_eq!(diags[0].col, 1);
+        assert_eq!(diags[0].fix, "replace BROKEN_TOKEN");
+        assert_eq!(diags[0].auto_edits, 2);
     }
 }
