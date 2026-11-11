@@ -71,6 +71,76 @@ fn host_kills_a_candidate_that_overruns_the_wall_clock() {
 }
 
 #[test]
+fn run_capture_returns_when_a_grandchild_keeps_the_pipes() {
+    let lingerer = compile_probe("lingerer");
+    let started = std::time::Instant::now();
+    let result = supervisor::run_capture(
+        Command::new(&lingerer),
+        &Limits {
+            wall: Duration::from_secs(2),
+            memory_bytes: None,
+            scrub_env: false,
+        },
+        b"",
+    )
+    .unwrap();
+    let took = started.elapsed();
+    // Best effort: do not leave the 30 s grandchild behind.
+    if let Some(pid) = result
+        .stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("child "))
+    {
+        let pid = pid.trim();
+        let _ = if cfg!(windows) {
+            Command::new("taskkill").args(["/F", "/PID", pid]).output()
+        } else {
+            Command::new("kill").args(["-9", pid]).output()
+        };
+    }
+    eprintln!("lingerer: run_capture took {took:?}");
+    assert!(took < Duration::from_secs(6), "run_capture took {took:?}");
+    assert_eq!(result.kind, StopKind::Exited(0), "stderr={}", result.stderr);
+    assert!(
+        result.stdout.contains("parent done"),
+        "stdout={:?}",
+        result.stdout
+    );
+}
+
+#[test]
+fn run_capture_keeps_all_output_of_a_normal_exit() {
+    let talker = compile_probe("talker");
+    let result = supervisor::run_capture(
+        Command::new(&talker),
+        &Limits {
+            wall: Duration::from_secs(20),
+            memory_bytes: None,
+            scrub_env: false,
+        },
+        b"",
+    )
+    .unwrap();
+    assert_eq!(result.kind, StopKind::Exited(0));
+    assert_eq!(result.stdout.len(), 400_000);
+    assert_eq!(result.stderr.len(), 100_000);
+    for (i, line) in result.stdout.lines().enumerate() {
+        assert_eq!(
+            line,
+            format!("{i:08} {}", "x".repeat(90)),
+            "stdout line {i}"
+        );
+    }
+    for (i, line) in result.stderr.lines().enumerate() {
+        assert_eq!(
+            line,
+            format!("{i:08} {}", "e".repeat(90)),
+            "stderr line {i}"
+        );
+    }
+}
+
+#[test]
 fn host_memory_cap_stops_a_large_allocation_and_allows_a_small_one() {
     let allocator = compile_probe("allocator");
 
