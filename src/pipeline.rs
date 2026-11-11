@@ -58,7 +58,7 @@ pub enum Gate {
 }
 
 impl Gate {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Gate::Prefilter => "prefilter",
             Gate::Check => "check",
@@ -109,7 +109,22 @@ pub struct Ms {
     pub oracle: u64,
 }
 
+/// How many characters of a case id, input, or output are kept on a verdict.
+pub(crate) const TEXT_CLIP: usize = 400;
+
+/// The first `pass_all` case whose output did not match. Each string is at
+/// most [`TEXT_CLIP`] characters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CaseFailure {
+    pub id: String,
+    pub input: String,
+    pub expected: String,
+    pub actual: String,
+}
+
 /// The result of evaluating one candidate. Also one journal line (WP-13).
+///
+/// `failure` is absent on journal lines written before this field existed.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Verdict {
     pub hash: String,
@@ -121,6 +136,8 @@ pub struct Verdict {
     pub diagnostics: Vec<Diagnostic>,
     pub ms: Ms,
     pub note: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failure: Option<CaseFailure>,
 }
 
 /// Evaluate `candidate` against `nugget`.
@@ -148,6 +165,7 @@ pub fn evaluate(
         diagnostics: Vec::new(),
         ms: Ms::default(),
         note: String::new(),
+        failure: None,
     };
 
     if let Err(message) = crate::emit::sandbox_prefilter(candidate) {
@@ -217,6 +235,7 @@ pub fn evaluate(
     let outcome = run_cases(nugget, &binary, opts)?;
     verdict.ms.run = elapsed_ms(started);
     verdict.passed = outcome.passed;
+    verdict.failure = outcome.failure;
     if let Some(note) = outcome.stop {
         verdict.note = note;
         return Ok(verdict);
@@ -361,6 +380,9 @@ struct RunOutcome {
     /// candidate has one entry per nugget case; the oracle compares these
     /// bytes and exit kinds with a fresh rustc run.
     runs: Vec<CaseCapture>,
+    /// First `pass_all` mismatch. `None` when every case matched, or the
+    /// objective is `minimize`.
+    failure: Option<CaseFailure>,
 }
 
 /// Lust's own `--time-limit` stays `nugget.timeout`. The host wall clock is
@@ -567,6 +589,7 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
     let mut sum = 0.0f64;
     let mut unclean: Option<RunClass> = None;
     let mut bad_score: Option<String> = None;
+    let mut failure: Option<CaseFailure> = None;
     let mut runs = Vec::with_capacity(nugget.cases.len());
 
     for case in &nugget.cases {
@@ -578,11 +601,13 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
         if class == RunClass::Clean {
             match nugget.objective {
                 Objective::PassAll => {
-                    let expected = case.expected.as_deref().unwrap_or("");
-                    if result.stdout.trim_end() == expected.trim_end() {
-                        passed = passed.saturating_add(1);
-                    } else {
+                    if let Some(found) = pass_all_failure(case, &result.stdout) {
                         mismatches = mismatches.saturating_add(1);
+                        if failure.is_none() {
+                            failure = Some(found);
+                        }
+                    } else {
+                        passed = passed.saturating_add(1);
                     }
                 }
                 Objective::Minimize => match parse_score(&result.stdout) {
@@ -615,6 +640,7 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
             score: 0.0,
             stop: Some(class_name(class).to_string()),
             runs,
+            failure,
         });
     }
     if let Some(note) = bad_score {
@@ -623,6 +649,7 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
             score: 0.0,
             stop: Some(note),
             runs,
+            failure,
         });
     }
     let score = match nugget.objective {
@@ -635,6 +662,7 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
             score: 0.0,
             stop: Some("non-finite score".to_string()),
             runs,
+            failure,
         });
     }
     Ok(RunOutcome {
@@ -642,7 +670,36 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
         score,
         stop: None,
         runs,
+        failure,
     })
+}
+
+/// `Some` when `stdout` is not the case's expected output. Comparison still
+/// ignores trailing whitespace; the stored strings are the original text,
+/// each cut to [`TEXT_CLIP`] characters.
+fn pass_all_failure(case: &crate::nugget::Case, stdout: &str) -> Option<CaseFailure> {
+    let expected = case.expected.as_deref().unwrap_or("");
+    if stdout.trim_end() == expected.trim_end() {
+        return None;
+    }
+    Some(CaseFailure {
+        id: clip_chars(&case.id, TEXT_CLIP),
+        input: clip_chars(&case.input, TEXT_CLIP),
+        expected: clip_chars(expected, TEXT_CLIP),
+        actual: clip_chars(stdout, TEXT_CLIP),
+    })
+}
+
+/// The first `max_chars` Unicode scalar values of `text`.
+pub(crate) fn clip_chars(text: &str, max_chars: usize) -> String {
+    let mut count = 0usize;
+    for (byte, _) in text.char_indices() {
+        if count == max_chars {
+            return text[..byte].to_string();
+        }
+        count += 1;
+    }
+    text.to_string()
 }
 
 fn class_name(class: RunClass) -> &'static str {
@@ -767,5 +824,58 @@ mod tests {
         assert_eq!(mapped[0].fix, "Change the value.");
         assert_eq!(mapped[1].line, 0);
         assert_eq!(mapped[1].code, "L0102");
+    }
+
+    #[test]
+    fn an_old_verdict_line_without_failure_still_parses() {
+        let line = r#"{"hash":"aaaaaaaaaaaaaaaa","gate":"run","status":"scored","score":1.0,"passed":1,"total":2,"diagnostics":[],"ms":{"check":0,"build":1,"run":2,"oracle":0},"note":"ok"}"#;
+        let verdict: Verdict = serde_json::from_str(line).unwrap();
+        assert!(verdict.failure.is_none());
+        assert_eq!(verdict.note, "ok");
+        let encoded = serde_json::to_value(&verdict).unwrap();
+        assert!(encoded.get("failure").is_none());
+
+        let with = Verdict {
+            failure: Some(CaseFailure {
+                id: "n".to_string(),
+                input: "in".to_string(),
+                expected: "exp".to_string(),
+                actual: "act".to_string(),
+            }),
+            ..verdict
+        };
+        let encoded = serde_json::to_value(&with).unwrap();
+        assert_eq!(encoded["failure"]["id"], "n");
+        assert_eq!(encoded["failure"]["expected"], "exp");
+        assert_eq!(encoded["failure"]["actual"], "act");
+        let again: Verdict = serde_json::from_value(encoded).unwrap();
+        assert_eq!(again, with);
+    }
+
+    #[test]
+    fn the_first_pass_all_mismatch_is_kept_and_each_field_is_cut() {
+        let long = "é".repeat(TEXT_CLIP + 1);
+        let miss = crate::nugget::Case {
+            id: long.clone(),
+            input: long.clone(),
+            expected: Some("41\n".to_string()),
+        };
+        let failure = pass_all_failure(&miss, "1\n").unwrap();
+        assert_eq!(failure.id.chars().count(), TEXT_CLIP);
+        assert_eq!(failure.input.chars().count(), TEXT_CLIP);
+        assert!(failure.id.starts_with('é'));
+        assert_eq!(failure.expected, "41\n");
+        assert_eq!(failure.actual, "1\n");
+
+        let later = crate::nugget::Case {
+            id: "range".to_string(),
+            input: "1\n".to_string(),
+            expected: Some("30\n".to_string()),
+        };
+        assert!(pass_all_failure(&later, "30\n").is_none());
+        assert!(pass_all_failure(&later, "30  \n").is_none());
+        let second = pass_all_failure(&later, "0\n").unwrap();
+        assert_eq!(second.id, "range");
+        assert_eq!(second.actual, "0\n");
     }
 }

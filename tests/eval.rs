@@ -93,6 +93,11 @@ fn seed_scores_every_demo_case_as_a_failure() {
     assert!(verdict.ms.build > 0, "build ms {}", verdict.ms.build);
     assert_eq!(verdict.hash.len(), 16);
     assert!(verdict.hash.chars().all(|c| c.is_ascii_hexdigit()));
+    let failure = verdict.failure.expect("the first failing case");
+    assert_eq!(failure.id, "negatives");
+    assert_eq!(failure.input, "-4\n5\n");
+    assert_eq!(failure.expected, "41\n");
+    assert_eq!(failure.actual, "1\n");
     let source = opts.work_dir.join(format!("{}.rs", verdict.hash));
     let text = fs::read_to_string(source).unwrap();
     assert!(text.contains(&nugget.seed));
@@ -111,6 +116,7 @@ fn correct_body_scores_zero() {
     assert_eq!(verdict.passed, 3);
     assert_eq!(verdict.total, 3);
     assert!(verdict.note.is_empty(), "{}", verdict.note);
+    assert!(verdict.failure.is_none());
     let source = fs::read_to_string(opts.work_dir.join(format!("{}.rs", verdict.hash))).unwrap();
     assert!(source.contains("x * x"));
     let name = if cfg!(windows) {
@@ -306,6 +312,7 @@ fn human_verdict_is_three_lines() {
         diagnostics: Vec::new(),
         ms: Ms::default(),
         note: "rustc failed: first\nsecond".to_string(),
+        failure: None,
     };
     let text = format_verdict(&rejected);
     assert_eq!(text.lines().count(), 3, "{text}");
