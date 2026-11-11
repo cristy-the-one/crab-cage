@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File, OpenOptions};
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::path::Path;
 
 use serde::Deserialize;
@@ -18,9 +18,12 @@ pub struct Journal {
     file: File,
     seen: HashSet<String>,
     next_n: u64,
-    /// The file had records and did not end in a newline. The next append
-    /// writes that newline first so the new object stays on its own line.
+    /// The last record parsed and the file did not end in a newline. The next
+    /// append writes that newline first so the new object stays on its own line.
     needs_leading_newline: bool,
+    /// Byte length of the valid prefix when a crash left a partial last line.
+    /// The next append drops that fragment before writing.
+    partial_tail: Option<u64>,
 }
 
 impl Journal {
@@ -32,17 +35,25 @@ impl Journal {
         } else {
             String::new()
         };
-        let records = parse_records(path, &text)?;
-        let mut seen = HashSet::with_capacity(records.len());
-        for record in &records {
+        let loaded = parse_records(path, &text)?;
+        let mut seen = HashSet::with_capacity(loaded.records.len());
+        for record in &loaded.records {
             seen.insert(record.hash.clone());
         }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .open(path)?;
+        file.seek(SeekFrom::End(0))?;
         Ok(Journal {
             file,
             seen,
-            next_n: following_n(records.len())?,
-            needs_leading_newline: !text.is_empty() && !text.ends_with('\n'),
+            next_n: following_n(loaded.records.len())?,
+            needs_leading_newline: loaded.partial_tail.is_none()
+                && !text.is_empty()
+                && !text.ends_with('\n'),
+            partial_tail: loaded.partial_tail,
         })
     }
 
@@ -57,6 +68,12 @@ impl Journal {
         let next = n
             .checked_add(1)
             .ok_or_else(|| err("journal line count overflow"))?;
+        if let Some(len) = self.partial_tail {
+            self.file.set_len(len)?;
+            self.file.seek(SeekFrom::Start(len))?;
+            self.partial_tail = None;
+            self.needs_leading_newline = false;
+        }
         let mut bytes = Vec::new();
         if self.needs_leading_newline {
             bytes.push(b'\n');
@@ -82,13 +99,18 @@ impl Journal {
     ///
     /// `rejected` counts gates only for rejected verdicts. `codes` is the ten
     /// most frequent diagnostic codes (each diagnostic counts once); equal
-    /// counts are ordered by the code. `best` is the lowest finite score, and
-    /// a tie keeps the earlier line. `codes none` and `best none` are used
-    /// when there is nothing to report.
+    /// counts are ordered by the code. `best` is the lowest finite score among
+    /// `scored` and `proven` lines; a tie keeps the earlier line. A `diverged`
+    /// or `rejected` score is not a result. `codes none` and `best none` are
+    /// used when there is nothing to report.
+    ///
+    /// A final line with no trailing newline that is not valid JSON is a
+    /// crash fragment: it is skipped here and in [`Journal::open`]. A bad
+    /// line anywhere else is an error.
     pub fn summary(path: &Path) -> Result<String> {
         let text = fs::read_to_string(path)?;
-        let records = parse_records(path, &text)?;
-        Ok(render_summary(&records))
+        let loaded = parse_records(path, &text)?;
+        Ok(render_summary(&loaded.records))
     }
 }
 
@@ -110,23 +132,47 @@ struct Code {
     code: String,
 }
 
-fn parse_records(path: &Path, text: &str) -> Result<Vec<Record>> {
+struct Loaded {
+    records: Vec<Record>,
+    /// Start of an unparsable last line that has no trailing newline.
+    partial_tail: Option<u64>,
+}
+
+fn parse_records(path: &Path, text: &str) -> Result<Loaded> {
+    let ends_with_newline = text.ends_with('\n');
+    let segments: Vec<&str> = text.split('\n').collect();
     let mut records = Vec::new();
-    for (index, raw) in text.split('\n').enumerate() {
+    let mut partial_tail = None;
+    for (index, raw) in segments.iter().enumerate() {
         let line = raw.trim_end_matches('\r').trim();
         if line.is_empty() {
             continue;
         }
-        let record = serde_json::from_str::<Record>(line).map_err(|source| {
-            err(format!(
-                "{}: journal line {}: {source}",
-                path.display(),
-                index + 1
-            ))
-        })?;
-        records.push(record);
+        let is_last = index + 1 == segments.len();
+        match serde_json::from_str::<Record>(line) {
+            Ok(record) => records.push(record),
+            Err(source) => {
+                if is_last && !ends_with_newline {
+                    partial_tail = Some(tail_offset(text)?);
+                    continue;
+                }
+                return Err(err(format!(
+                    "{}: journal line {}: {source}",
+                    path.display(),
+                    index + 1
+                )));
+            }
+        }
     }
-    Ok(records)
+    Ok(Loaded {
+        records,
+        partial_tail,
+    })
+}
+
+fn tail_offset(text: &str) -> Result<u64> {
+    let pos = text.rfind('\n').map(|index| index + 1).unwrap_or(0);
+    u64::try_from(pos).map_err(|_| err("journal is too large"))
 }
 
 fn following_n(count: usize) -> Result<u64> {
@@ -182,6 +228,9 @@ fn render_summary(records: &[Record]) -> String {
         }
         for diagnostic in &record.diagnostics {
             *codes.entry(diagnostic.code.as_str()).or_default() += 1;
+        }
+        if !matches!(record.status, Status::Scored | Status::Proven) {
+            continue;
         }
         if let Some(score) = record.score {
             if !score.is_finite() {
@@ -374,5 +423,113 @@ codes L0110=3 L0001=1 L0104=1
 best 1 cccccccccccccccc
 "
         );
+    }
+
+    fn line(hash: &str, status: &str, score: &str) -> String {
+        format!(
+            r#"{{"hash":"{hash}","gate":"run","status":"{status}","score":{score},"passed":0,"total":1,"diagnostics":[],"ms":{{"check":0,"build":0,"run":1,"oracle":0}},"note":"","proposer":"seed","n":1}}"#
+        )
+    }
+
+    #[test]
+    fn summary_best_ignores_a_diverged_score() {
+        let path = journal_path("best-diverged");
+        let body = format!(
+            "{}\n{}\n",
+            line("aaaaaaaaaaaaaaaa", "scored", "2"),
+            line("bbbbbbbbbbbbbbbb", "diverged", "0")
+        );
+        fs::write(&path, body).unwrap();
+        let text = Journal::summary(&path).unwrap();
+        assert_eq!(
+            text,
+            "\
+candidates 2
+status rejected=0 scored=1 proven=0 diverged=1
+rejected prefilter=0 check=0 build=0 run=0 oracle=0
+codes none
+best 2 aaaaaaaaaaaaaaaa
+"
+        );
+
+        let only = journal_path("best-diverged-only");
+        fs::write(
+            &only,
+            format!("{}\n", line("bbbbbbbbbbbbbbbb", "diverged", "0")),
+        )
+        .unwrap();
+        let text = Journal::summary(&only).unwrap();
+        assert!(text.contains("diverged=1"), "{text}");
+        assert!(text.ends_with("best none\n"), "{text}");
+    }
+
+    #[test]
+    fn a_truncated_final_line_is_skipped_and_a_bad_line_is_not() {
+        let path = journal_path("truncated");
+        let mut body = line("aaaaaaaaaaaaaaaa", "scored", "2");
+        body.push('\n');
+        body.push_str(r#"{"hash":"cccc","gate":"ru"#);
+        fs::write(&path, &body).unwrap();
+
+        let mut journal = Journal::open(&path).unwrap();
+        assert!(journal.seen("aaaaaaaaaaaaaaaa"));
+        assert!(!journal.seen("cccc"));
+        let summary = Journal::summary(&path).unwrap();
+        assert!(summary.contains("candidates 1\n"), "{summary}");
+        assert!(summary.contains("best 2 aaaaaaaaaaaaaaaa\n"), "{summary}");
+
+        journal
+            .append(
+                &verdict(
+                    "dddddddddddddddd",
+                    Gate::Run,
+                    Status::Scored,
+                    Some(1.0),
+                    &[],
+                ),
+                "folder",
+            )
+            .unwrap();
+        drop(journal);
+        let reopened = Journal::open(&path).unwrap();
+        assert!(reopened.seen("aaaaaaaaaaaaaaaa"));
+        assert!(reopened.seen("dddddddddddddddd"));
+        assert!(!reopened.seen("cccc"));
+        let text = fs::read_to_string(&path).unwrap();
+        assert!(!text.contains("\"cccc\""), "{text}");
+        let lines: Vec<&str> = text
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        let second: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(second["n"], 2);
+        assert_eq!(second["hash"], "dddddddddddddddd");
+
+        let bad = journal_path("bad-line");
+        fs::write(&bad, "{\"hash\":\"nope\"}\n").unwrap();
+        let message = match Journal::open(&bad) {
+            Ok(_) => panic!("a terminated bad line must not open"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("journal line 1"), "{message}");
+        let message = match Journal::summary(&bad) {
+            Ok(text) => panic!("a terminated bad line must not summarize: {text}"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("journal line 1"), "{message}");
+
+        let middle = journal_path("bad-middle");
+        fs::write(&middle, "{\"nope\":true}\n{\"hash\":\"cccc\",\"gate\":\"ru").unwrap();
+        let message = match Journal::open(&middle) {
+            Ok(_) => panic!("a bad line before a fragment must not open"),
+            Err(error) => error.to_string(),
+        };
+        assert!(message.contains("journal line 1"), "{message}");
+
+        let whole = journal_path("valid-without-newline");
+        fs::write(&whole, line("aaaaaaaaaaaaaaaa", "scored", "3")).unwrap();
+        let opened = Journal::open(&whole).unwrap();
+        assert!(opened.seen("aaaaaaaaaaaaaaaa"));
     }
 }
