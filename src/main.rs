@@ -11,6 +11,8 @@ use crab_cage::lust;
 use crab_cage::models;
 use crab_cage::nugget;
 use crab_cage::pipeline::{self, Status};
+use crab_cage::proposer::{FolderProposer, Proposer};
+use crab_cage::run;
 use crab_cage::supervisor;
 
 #[derive(Parser)]
@@ -40,6 +42,11 @@ enum Command {
     },
     /// Evaluate one candidate against a nugget.
     Eval(EvalArgs),
+    /// Evaluate the seed and folder snippets, and journal each verdict.
+    ///
+    /// `pass_all` exits 0 only when a proven candidate scores 0.
+    /// `minimize` exits 0 when any candidate is proven.
+    Run(RunArgs),
 }
 
 #[derive(Parser, Clone, Debug, Default)]
@@ -106,6 +113,24 @@ struct EvalArgs {
     oracle: bool,
 }
 
+#[derive(Parser, Debug)]
+struct RunArgs {
+    /// Directory with nugget.json, template.rs, and cases/.
+    nugget_dir: PathBuf,
+    /// Directory of `*.rs` candidate snippets.
+    #[arg(long)]
+    candidates: Option<PathBuf>,
+    /// Maximum number of candidates to evaluate, including the seed.
+    #[arg(long, default_value_t = 200)]
+    budget: usize,
+    /// Journal, work files, and the best candidate.
+    #[arg(long, default_value = "crab-out")]
+    out: PathBuf,
+    /// lust binary. Without it, rustc runs the fast gates.
+    #[arg(long)]
+    lust_bin: Option<PathBuf>,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
@@ -116,6 +141,7 @@ fn main() -> ExitCode {
         Some(Command::LustProbe { lust_bin }) => probe(lust_bin).map(|()| ExitCode::SUCCESS),
         Some(Command::Evolve(args)) => evolve(args).map(|()| ExitCode::SUCCESS),
         Some(Command::Eval(args)) => eval_cmd(args),
+        Some(Command::Run(args)) => run_cmd(args),
         None => evolve(cli.evolve).map(|()| ExitCode::SUCCESS),
     };
     match result {
@@ -345,6 +371,31 @@ fn read_config(path: &std::path::Path) -> Result<FileConfig> {
             .map_err(|e| err(format!("{}: {}", path.display(), e.message)))?;
     }
     Ok(file)
+}
+
+fn run_cmd(args: RunArgs) -> Result<ExitCode> {
+    let mut folder = args
+        .candidates
+        .as_ref()
+        .map(|dir| FolderProposer::new(dir.as_path()));
+    let mut proposers: Vec<&mut dyn Proposer> = Vec::new();
+    if let Some(folder) = folder.as_mut() {
+        proposers.push(folder);
+    }
+    let output = run::execute(
+        &run::RunOptions {
+            nugget_dir: args.nugget_dir,
+            budget: args.budget,
+            out_dir: args.out,
+            lust_bin: args.lust_bin,
+        },
+        &mut proposers,
+    )?;
+    if output.solved {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
 }
 
 fn eval_cmd(args: EvalArgs) -> Result<ExitCode> {

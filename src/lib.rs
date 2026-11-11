@@ -15,8 +15,10 @@ pub mod models;
 pub mod nugget;
 pub mod pipeline;
 pub mod plant;
+pub mod proposer;
 pub mod report;
 pub mod rng;
+pub mod run;
 pub mod supervisor;
 
 pub use error::{Error, Result};
