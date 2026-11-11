@@ -126,6 +126,10 @@ struct RunArgs {
     /// Directory of `*.rs` candidate snippets.
     #[arg(long)]
     candidates: Option<PathBuf>,
+    /// Perturb one numeric literal of the best candidate on each proposal.
+    /// Round-robin with `--candidates` when both are set.
+    #[arg(long)]
+    tweak: bool,
     /// Maximum number of candidates to evaluate, including the seed.
     #[arg(long, default_value_t = 200)]
     budget: usize,
@@ -393,6 +397,8 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
     if let Some(folder) = folder.as_mut() {
         proposers.push(folder);
     }
+    let mut tweak = None;
+    run::attach_tweak(args.tweak, &mut tweak, &mut proposers);
     let output = run::execute(
         &run::RunOptions {
             nugget_dir: args.nugget_dir,
