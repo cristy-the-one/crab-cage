@@ -38,7 +38,7 @@ The binary is `target/release/crab-cage` (`crab-cage.exe` on Windows).
 
 ## A nugget
 
-A nugget is a directory that states one problem. `nuggets/sum-squares` is the example in this repo.
+A nugget is a directory that states one problem. This repo has two: `nuggets/sum-squares`, which is easy, and `nuggets/normalize-path`, which is not (ten cases of Unix path rules; `reference.rs` beside it is a solution).
 
 ```text
 nuggets/sum-squares/
@@ -192,6 +192,8 @@ crab-cage run my-nugget --backend local --endpoint http://127.0.0.1:8080/v1 --mo
 The default endpoint is `http://127.0.0.1:11434/v1` (Ollama's) and the default model name is `qwen2.5-coder:14b`.
 
 Which model: the loop asks for many short function bodies and lets lust and `rustc` throw away the bad ones, so a model that answers quickly is worth more than a larger one that answers slowly. On a 16 GB GPU, Qwen2.5-Coder-14B (Q5_K_M, about 10.5 GB) fits with an 8k context; `crab-cage models` prints those notes. Without a discrete GPU, the 7B build is the place to start. The proposer has been run against one real model so far: a 7.6B Qwen-family coder at Q4_K_M under Ollama, on a laptop processor with no discrete GPU. It answered in about two seconds and solved the demo nugget in one request, ten runs out of ten; when its first reply was forced to be a fragment, it recovered on the next request, six runs out of six. Use `--jobs 1` with a model.
+
+The same model did not solve `nuggets/normalize-path`. In 19 requests (about 17 s each) it wrote five different candidates, all of which lust accepted, took the seed from 8 failing cases to 6, and then went round the same three variants until the proposer stopped. The details are in `docs/WORK-PACKAGES.md`.
 
 ## Example: controller search
 

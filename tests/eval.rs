@@ -804,3 +804,27 @@ fn json_string_field(stdout: &str, key: &str) -> String {
         .unwrap_or_else(|| panic!("unterminated {key} in {stdout}"));
     rest[..end].to_string()
 }
+
+/// The harder example nugget is consistent: its seed fails eight of its ten
+/// cases, and the reference solution kept beside it passes them all.
+#[test]
+fn normalize_path_nugget_has_a_wrong_seed_and_a_right_reference() {
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("nuggets")
+        .join("normalize-path");
+    let nugget = nugget::load(&dir).unwrap();
+    assert_eq!(nugget.cases.len(), 10);
+
+    let seed = evaluate(&nugget, &nugget.seed, &no_lust(), &options("np-seed")).unwrap();
+    assert_eq!(seed.status, Status::Scored, "{seed:?}");
+    assert_eq!(seed.score, Some(8.0));
+    assert_eq!(seed.passed, 2);
+
+    let reference = fs::read_to_string(dir.join("reference.rs"))
+        .unwrap()
+        .replace("\r\n", "\n");
+    let solved = evaluate(&nugget, &reference, &no_lust(), &options("np-reference")).unwrap();
+    assert_eq!(solved.status, Status::Scored, "{solved:?}");
+    assert_eq!(solved.score, Some(0.0));
+    assert_eq!(solved.passed, 10);
+}

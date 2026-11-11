@@ -69,7 +69,46 @@ Ollama 0.40 on the work laptop (Ryzen 7 8840HS, no discrete GPU, CPU inference),
 - Two changes fixed it, each measured by replaying the exact prompt eight to ten times: the system prompt says the reply *replaces* the lines and must never be a fragment, and the user prompt shows the current lines and puts the request **last**, after the diagnostics and the "already tried" list. With the request first, 8 of 8 replies were fragments; with it last, 8 of 8 were the whole region.
 - In the loop: 10 of 10 plain runs solved in one request (about 5 s for the run); 6 of 6 runs whose first reply was forced to be a fragment solved in two.
 
-What this does not show: a harder nugget, a `minimize` nugget, any other model, or `--jobs` above 1.
+What this does not show: a `minimize` nugget, any other model, or `--jobs` above 1.
+
+## A harder nugget against the same model (2026-11-11)
+
+`nuggets/normalize-path`: normalize a Unix path as text (repeated `/`, `.`, `..`, the root, relative paths that climb, nothing left). Ten cases; the rules are in a comment above the function; `reference.rs` passes all ten under lust and under `rustc`. The seed fails eight.
+
+`crab-cage run nuggets/normalize-path --backend local --model Thox-ai/thoxcode-8b --budget 16 --lust-bin …`:
+
+```text
+1 proven oracle 8 seed
+2 proven oracle 6 local
+3 scored run 6 local
+4 scored run 7 local
+5 scored run 7 local
+6 scored run 7 local
+local proposer finished: 3 proposal errors in a row: the local model repeated a region it already tried
+```
+
+19 requests, 320 s, about 17 s each (2,000 to 2,500 prompt tokens, about 120 reply tokens, CPU only). Not solved.
+
+What worked: every candidate the model wrote passed `lust check` and built (iterators, `peekable`, `Vec<&str>`, `join`, `format!`), so lust's subset was not the obstacle; the failing case reached the prompt with its input, expected and actual output; a repeat cost one retry and not fifty requests.
+
+What did not: the model kept changing how it handles `..` and never the thing the failing case showed (`a//b` must become `a/b`). Replaying that state with other prompts, four to eight times each, scored through the funnel:
+
+| Prompt | Result |
+|---|---|
+| as sent | failed 6 or 7 of 10, every time |
+| the failing case moved to the end, a two-line "already tried" list | the same |
+| "begin with a comment that says what the lines do wrong", then the code | the comment is right ("do not handle consecutive slashes"), the code skips empty components, and the score gets **worse** (9 of 10): absolute paths passed before only because the empty first component produced the leading `/` |
+| the same, but each step starts from the model's own last reply instead of the best (8 steps, twice) | 6 → 9 → 10 → 10 …; never recovers |
+
+So on this nugget the limit is the model, not the layout of the prompt. Three things the run shows about the tool, none built yet:
+
+- **The fix needs two changes at once** (skip empty components, and put the leading `/` back). The loop keeps only candidates that beat the best, so the half-way state is thrown away, and a small model does not make both changes in one reply.
+- **The "already tried" list is long and says little** when the regions are 500 characters that differ in one line: three entries cut at 400 characters each look the same. Listing only the lines that differ from the current region would be shorter and clearer.
+- **The feedback and the base can disagree.** The prompt shows the best region as "now" and the failing case of the proposer's *last* region. Here both failed the same case; in general the case shown should be the one the shown region fails.
+
+Options from here, in the order I would try them: a stronger model for this proposer (the 14B build, or the other machine's GPU); candidates from an outside model through `--candidates` or `crab-cage eval`, which need no change; then the two prompt points above.
+
+Also seen: `crab-cage run … | head -1` panics with `failed printing to stdout` when the reader closes the pipe early. Harmless, and worth a quiet exit.
 
 Decisions made while building, which later packages must keep:
 
