@@ -9,6 +9,8 @@ use crab_cage::error::{err, Result};
 use crab_cage::evolve::{execute, format_summary, BackendChoice, EvalMode, RunOptions};
 use crab_cage::lust;
 use crab_cage::models;
+use crab_cage::nugget;
+use crab_cage::pipeline::{self, Status};
 use crab_cage::supervisor;
 
 #[derive(Parser)]
@@ -36,6 +38,8 @@ enum Command {
         #[arg(long)]
         lust_bin: Option<PathBuf>,
     },
+    /// Evaluate one candidate against a nugget.
+    Eval(EvalArgs),
 }
 
 #[derive(Parser, Clone, Debug, Default)]
@@ -82,19 +86,37 @@ struct EvolveArgs {
     no_verify: bool,
 }
 
+#[derive(Parser, Debug)]
+struct EvalArgs {
+    /// Directory with nugget.json, template.rs, and cases/.
+    nugget_dir: PathBuf,
+    /// Candidate file. `-` reads stdin.
+    candidate: String,
+    /// lust binary. Without it, rustc runs the fast gates.
+    #[arg(long)]
+    lust_bin: Option<PathBuf>,
+    /// Directory for the spliced source and the built binary.
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
+    /// Print the verdict as one JSON line.
+    #[arg(long)]
+    json: bool,
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
         Some(Command::Models) => {
             print!("{}", models::recommended());
-            Ok(())
+            Ok(ExitCode::SUCCESS)
         }
-        Some(Command::LustProbe { lust_bin }) => probe(lust_bin),
-        Some(Command::Evolve(args)) => evolve(args),
-        None => evolve(cli.evolve),
+        Some(Command::LustProbe { lust_bin }) => probe(lust_bin).map(|()| ExitCode::SUCCESS),
+        Some(Command::Evolve(args)) => evolve(args).map(|()| ExitCode::SUCCESS),
+        Some(Command::Eval(args)) => eval_cmd(args),
+        None => evolve(cli.evolve).map(|()| ExitCode::SUCCESS),
     };
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(code) => code,
         Err(problem) => {
             eprintln!("crab-cage: {}", problem.message);
             ExitCode::from(1)
@@ -320,6 +342,59 @@ fn read_config(path: &std::path::Path) -> Result<FileConfig> {
             .map_err(|e| err(format!("{}: {}", path.display(), e.message)))?;
     }
     Ok(file)
+}
+
+fn eval_cmd(args: EvalArgs) -> Result<ExitCode> {
+    let nugget = nugget::load(&args.nugget_dir)?;
+    let candidate = read_candidate(&args.candidate)?;
+    let lust = match &args.lust_bin {
+        Some(path) => Some(lust::probe(path, Duration::from_secs(10))?),
+        None => None,
+    };
+    let work_dir = match args.work_dir {
+        Some(path) => path,
+        None => fresh_work_dir(),
+    };
+    let verdict = pipeline::evaluate(
+        &nugget,
+        &candidate,
+        &pipeline::Toolchain { lust },
+        &pipeline::EvalOptions {
+            work_dir,
+            host_memory: 1024 * 1024 * 1024,
+            compile_timeout: Duration::from_secs(180),
+            oracle: false,
+        },
+    )?;
+    if args.json {
+        println!("{}", serde_json::to_string(&verdict)?);
+    } else {
+        print!("{}", pipeline::format_verdict(&verdict));
+    }
+    if verdict.status == Status::Scored || verdict.status == Status::Proven {
+        Ok(ExitCode::SUCCESS)
+    } else {
+        Ok(ExitCode::from(1))
+    }
+}
+
+fn read_candidate(path: &str) -> Result<String> {
+    let text = if path == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+        buf
+    } else {
+        fs::read_to_string(path).map_err(|error| err(format!("{path}: {error}")))?
+    };
+    Ok(text.replace("\r\n", "\n"))
+}
+
+fn fresh_work_dir() -> PathBuf {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
+    std::env::temp_dir().join(format!("crab-cage-eval-{}-{nanos}", std::process::id()))
 }
 
 fn probe(lust_bin: Option<PathBuf>) -> Result<()> {
