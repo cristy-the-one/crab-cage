@@ -750,7 +750,7 @@ fn user_prompt(
             append_scored(&mut out, verdict, best_score);
         }
     }
-    append_tried(&mut out, tried, pending);
+    append_tried(&mut out, tried, pending, base);
     // The request comes last, after the feedback. With the request first and
     // a rejected fragment listed after it, the model continued the fragment
     // eight times out of eight; with the request last it wrote the whole
@@ -814,28 +814,73 @@ fn append_labeled(out: &mut String, label: &str, text: &str) {
     }
 }
 
-fn append_tried(out: &mut String, tried: &[Tried], pending: &[Pending]) {
+/// Each tried or pending region, then its outcome. `base` is the region the
+/// prompt shows as current. A region of at most [`WHOLE_REGION_LINES`] lines
+/// is quoted whole; a longer one only by its lines that are not in `base`,
+/// at most [`DIFF_LINES`] of them and [`TEXT_CLIP`] characters. Long regions
+/// often differ in one line, and quoted whole and cut they all look alike.
+fn append_tried(out: &mut String, tried: &[Tried], pending: &[Pending], base: &str) {
     if tried.is_empty() && pending.is_empty() {
         return;
     }
     out.push('\n');
     out.push_str("Already tried, do not repeat:\n");
     for item in tried {
-        append_region_line(out, &item.text, &item.outcome);
+        append_region_line(out, &item.text, base, &item.outcome);
     }
     for item in pending {
-        append_region_line(out, &item.text, "proposed, awaiting result");
+        append_region_line(out, &item.text, base, "proposed, awaiting result");
     }
 }
 
-fn append_region_line(out: &mut String, text: &str, outcome: &str) {
-    let region = clip_chars(text, TEXT_CLIP);
+/// Regions this short are quoted whole in the "already tried" list.
+const WHOLE_REGION_LINES: usize = 3;
+/// Lines quoted from a longer region: those not in the current one.
+const DIFF_LINES: usize = 6;
+
+fn append_region_line(out: &mut String, text: &str, base: &str, outcome: &str) {
+    let region = if text.lines().count() <= WHOLE_REGION_LINES {
+        clip_chars(text, TEXT_CLIP)
+    } else {
+        region_difference(text, base)
+    };
     out.push_str(&region);
     if !region.ends_with('\n') {
         out.push('\n');
     }
     out.push_str(outcome);
     out.push('\n');
+}
+
+/// The lines of `text` that are not lines of `base`, compared without
+/// leading and trailing spaces, under a heading. Blank lines are left out.
+fn region_difference(text: &str, base: &str) -> String {
+    let known: HashSet<&str> = base.lines().map(str::trim).collect();
+    let new: Vec<&str> = text
+        .lines()
+        .filter(|line| !line.trim().is_empty() && !known.contains(line.trim()))
+        .map(str::trim_end)
+        .collect();
+    if new.is_empty() {
+        return if text.trim() == base.trim() {
+            "(the same as the current lines)".to_string()
+        } else {
+            "(the current lines, with some removed or moved)".to_string()
+        };
+    }
+    let mut body = String::from("the current lines, but with:\n");
+    for line in new.iter().take(DIFF_LINES) {
+        body.push_str(line);
+        body.push('\n');
+    }
+    let mut out = clip_chars(&body, TEXT_CLIP);
+    if new.len() > DIFF_LINES {
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&format!("({} more changed lines)", new.len() - DIFF_LINES));
+    }
+    out
 }
 
 fn outcome_of(verdict: &Verdict) -> String {
@@ -1790,6 +1835,100 @@ mod tests {
         assert!(prompt.contains("region 1\n"), "{prompt}");
         assert!(prompt.contains("region 8\n"), "{prompt}");
         assert!(!prompt.contains("region 9\n"), "{prompt}");
+    }
+
+    fn long_region(changed: &str) -> String {
+        format!(
+            "    let mut parts = Vec::new();\n    for part in path.split('/') {{\n{changed}\n        parts.push(part);\n    }}\n    parts.join(\"/\")\n"
+        )
+    }
+
+    #[test]
+    fn a_long_tried_region_shows_only_the_lines_that_differ_from_the_current_one() {
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let best = long_region("        if part == \".\" { continue; }");
+        let one = long_region("        if part.is_empty() { continue; }");
+        let two = long_region("        if part == \"..\" { parts.pop(); continue; }");
+        let mut proposer = MockModelProposer::new(
+            vec![
+                one.clone(),
+                two.clone(),
+                best.clone(),
+                "short one\nshort two\n".to_string(),
+                "next\n".to_string(),
+            ],
+            "",
+        );
+        let verdict = scored(4, 10, 6.0, None);
+        let mut history: Vec<(String, Verdict)> = Vec::new();
+        for _ in 0..4 {
+            let view: Vec<(&str, &Verdict)> = history
+                .iter()
+                .map(|(text, item)| (text.as_str(), item))
+                .collect();
+            let feedback = Feedback {
+                best: Some((best.as_str(), 6.0)),
+                last: None,
+                recent: &view,
+            };
+            let text = proposer.next(&nugget, &feedback).unwrap();
+            let text = text.into_text().unwrap();
+            drop(view);
+            history.push((text, verdict.clone()));
+        }
+        let view: Vec<(&str, &Verdict)> = history
+            .iter()
+            .map(|(text, item)| (text.as_str(), item))
+            .collect();
+        let feedback = Feedback {
+            best: Some((best.as_str(), 6.0)),
+            last: None,
+            recent: &view,
+        };
+        proposer.next(&nugget, &feedback).unwrap();
+        let prompt = &proposer.prompts[4].user;
+        let tried = &prompt[prompt.find("Already tried, do not repeat:").unwrap()..];
+        let tried = &tried[..tried.find("The lines between").unwrap()];
+        assert!(
+            tried.contains("if part.is_empty() { continue; }"),
+            "{tried}"
+        );
+        assert!(tried.contains("if part == \"..\" { parts.pop(); continue; }"));
+        // The lines every region shares are not repeated in the list.
+        assert!(!tried.contains("parts.push(part);"), "{tried}");
+        assert!(!tried.contains("Vec::new()"), "{tried}");
+        assert_eq!(tried.matches("the current lines, but with:").count(), 2);
+        // The region that equals the current one is a marker and its outcome.
+        assert!(
+            tried.contains("(the same as the current lines)\nran, failed 6 of 10 cases"),
+            "{tried}"
+        );
+        // A short region is still quoted whole.
+        assert!(
+            tried.contains("short one\nshort two\nran, failed 6 of 10 cases"),
+            "{tried}"
+        );
+        assert_eq!(tried.matches("ran, failed 6 of 10 cases").count(), 4);
+        assert!(prompt.ends_with("Reply with the complete new lines that replace them.\n"));
+    }
+
+    #[test]
+    fn many_changed_lines_are_cut_to_six() {
+        let base = "a\nb\nc\nd\n";
+        let text = (0..9)
+            .map(|index| format!("new {index}\n"))
+            .collect::<String>();
+        let shown = region_difference(&text, base);
+        assert!(shown.contains("new 0\n"), "{shown}");
+        assert!(shown.contains("new 5\n"), "{shown}");
+        assert!(!shown.contains("new 6"), "{shown}");
+        assert!(shown.ends_with("(3 more changed lines)"), "{shown}");
+        assert_eq!(
+            region_difference("a\nb\nd\n", base),
+            "(the current lines, with some removed or moved)"
+        );
+        let wide = format!("{}\n{}\n", "x".repeat(300), "y".repeat(300));
+        assert!(region_difference(&wide, base).chars().count() <= TEXT_CLIP);
     }
 
     #[test]
