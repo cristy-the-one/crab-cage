@@ -50,7 +50,7 @@ Phase 3:  L-03 … L-11, any order
 | WP-18 | done | crab-cage #15; the proposer has run against a mock and a scripted stand-in server, not yet a real model |
 | WP-18b | done | crab-cage #18: an "already tried" list, the failing case, verdicts by hash |
 | The model prompt, tuned against a real model | done | see "First run against a real model" below |
-| The model ladder, an experiment to run on a GPU machine | ready, not yet run there | `experiments/model-ladder/`; two medium nuggets added for it |
+| The model ladder, an experiment to run on a GPU machine | run once, 2026-11-12 | `experiments/model-ladder/`; results in `experiments/model-ladder/results/2026-11-12-rtx5080/`; see "The model ladder on a GPU machine" below |
 | WP-19 | docs done; the tank port is not planned | README and DESIGN.md |
 | WP-20 | done | crab-cage #23. Exercised with zig 0.14.1 on `PATH` (the version lust's CI uses): the optimised build is used, `note` is empty, and `ms.opt` is real. Also exercised: no compiler at all (the TinyCC build is timed, with a note), `LUST_CC=gcc` under mingw (fails to link; falls back, with the error in the note), and two stand-in lusts in the tests. See "What the zig run showed" under WP-20 |
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
@@ -123,6 +123,29 @@ Decisions made while building, which later packages must keep:
 - **The model prompt ends with the request.** Feedback and the "already tried" list come before it. Changing the order or the wording needs a replay against a real model, not only the mock.
 
 ---
+
+## The model ladder on a GPU machine (2026-11-12)
+
+Run on a laptop with an RTX 5080 (16 GB), Ollama 0.40.16, crab-cage `c28e6d5` (before the loop changes of #24), lust 0.3.0, three runs per model and nugget, budget 20, one job. Every model was fully on the GPU with a 16,384-token context. The summaries, `results.jsonl` and `environment.json` are in `experiments/model-ladder/results/2026-11-12-rtx5080/` (two folders: `qwen2.5-coder:14b` failed to download in the first and was run alone in the second).
+
+| Model | sum-squares | run-lengths | merge-ranges | normalize-path | Seconds per candidate |
+|---|---|---|---|---|---:|
+| qwen2.5-coder:7b | 3/3 | 2/3 | 3/3 | 0/3 | 4.2 |
+| qwen2.5-coder:14b | 3/3 | 3/3 | 0/3 | 1/3 | 10 |
+| gpt-oss:20b | 3/3 | 3/3 | 3/3 | 3/3 | 17.9 |
+
+What it showed:
+
+- **gpt-oss:20b solved everything, 12 runs of 12.** `normalize-path`, which the 7B models never solve, took it 2, 2 and 4 candidates (23 to 75 s). It is the model to use on that machine.
+- **No divergence and no oracle rejection in 84 candidates.** Everything lust accepted and ran, rustc agreed with.
+- **The 14b model lost `merge-ranges` to one message, 0 of 3.** It wrote `let mut merged = Vec::new();` and then `merged.last_mut()` with `last.1`. rustc rejects that too, and says what to do: `E0282: type annotations needed for Vec<_>`. lust says `L0103: no field 1 on type &mut _`, with the fix "Check the field index". The model then changed the field access 32 times and never the declaration. 96 of the 104 diagnostics in the whole experiment are this one.
+- **Runs end long before the budget.** Every unsolved run ended with "3 proposal errors in a row: the local model repeated a region it already tried", after 1 to 16 candidates of 20. One `normalize-path` run of the 14b model went 8, 4, 3, 2 failing cases in four candidates and was then stopped by three repeats.
+
+Follow-ups, not started:
+
+1. **lust: say "type annotations needed" for a field or method on a type that is not yet known**, in place of L0103's "no field". (New item L-12.)
+2. **crab-cage: when the same lust code rejects a proposer's region twice in a row, add rustc's message for that program to the prompt** (`lust check --rustc`, or the oracle's rustc). rustc's messages are the ones models were trained on. It costs one rustc run, only on a repeated rejection.
+3. **crab-cage: do not retire the model on repeats while the budget is not spent and it has made progress.** Raise the temperature in steps on each repeat (0.8, 1.0, 1.2) and say in the prompt that the last reply was the same as the current lines.
 
 # Phase 0: make what exists true
 
@@ -610,3 +633,6 @@ A program that folds over `HashMap::iter()` printed three different results in t
 
 Options: say so in lust's docs and keep it; or randomise the seed as rustc does; or reject order-dependent uses (hard). Crab Cage's oracle already handles the candidate side: it runs the rustc binary twice on a mismatch and rejects the candidate as nondeterministic instead of filing a divergence.
 
+## L-12 "Type annotations needed" when the type is not known yet (T2)
+
+`let mut v = Vec::new(); if let Some(last) = v.last_mut() { last.1 = 0; }` is rejected by rustc with `E0282: type annotations needed for Vec<_>`. lust rejects it with `L0103: no field 1 on type &mut _` and the fix "Check the field index", which sends a model to the wrong line. In the model ladder of 2026-11-12 this one message cost `qwen2.5-coder:14b` all three runs of `merge-ranges` (32 rejected candidates). When a field access or method call is on a type that still holds an inference variable, report that annotations are needed, pointing at the `let`, as rustc does. An example program is `experiments/model-ladder/results/2026-11-12-rtx5080/needs-annotation.rs` in crab-cage.
