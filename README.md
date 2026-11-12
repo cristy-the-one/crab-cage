@@ -38,7 +38,7 @@ The binary is `target/release/crab-cage` (`crab-cage.exe` on Windows).
 
 ## A nugget
 
-A nugget is a directory that states one problem. This repo has two: `nuggets/sum-squares`, which is easy, and `nuggets/normalize-path`, which is not (ten cases of Unix path rules; `reference.rs` beside it is a solution).
+A nugget is a directory that states one problem. This repo has a ladder of four, easy to hard: `nuggets/sum-squares`, `nuggets/run-lengths`, `nuggets/merge-ranges` and `nuggets/normalize-path` (each of the last three has a `reference.rs` beside it that is a solution), and one real problem, `nuggets/delta-kernel`.
 
 ```text
 nuggets/sum-squares/
@@ -194,6 +194,8 @@ The default endpoint is `http://127.0.0.1:11434/v1` (Ollama's) and the default m
 Which model: the loop asks for many short function bodies and lets lust and `rustc` throw away the bad ones, so a model that answers quickly is worth more than a larger one that answers slowly. On a 16 GB GPU, Qwen2.5-Coder-14B (Q5_K_M, about 10.5 GB) fits with an 8k context; `crab-cage models` prints those notes. Without a discrete GPU, the 7B build is the place to start. The proposer has been run against one real model so far: a 7.6B Qwen-family coder at Q4_K_M under Ollama, on a laptop processor with no discrete GPU. It answered in about two seconds and solved the demo nugget in one request, ten runs out of ten; when its first reply was forced to be a fragment, it recovered on the next request, six runs out of six. Use `--jobs 1` with a model.
 
 The same model did not solve `nuggets/normalize-path`. In 19 requests (about 17 s each) it wrote five different candidates, all of which lust accepted, took the seed from 8 failing cases to 6, and then went round the same three variants until the proposer stopped. The details are in `docs/WORK-PACKAGES.md`.
+
+`experiments/model-ladder/run.ps1` runs a list of models over those nuggets several times each and writes one table: which model solved what, seconds per candidate, where candidates were rejected, and which lust error codes came up. It is made to be run on another machine and sent back; see [experiments/model-ladder/README.md](experiments/model-ladder/README.md).
 
 ## Example: controller search
 

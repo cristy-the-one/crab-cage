@@ -1,0 +1,4 @@
+# Built programs and spliced sources are large and can be rebuilt from the
+# journal. Keep the reports of lust and rustc disagreeing.
+results/**/work/*
+!results/**/work/divergences/

@@ -50,6 +50,7 @@ Phase 3:  L-03 … L-11, any order
 | WP-18 | done | crab-cage #15; the proposer has run against a mock and a scripted stand-in server, not yet a real model |
 | WP-18b | done | crab-cage #18: an "already tried" list, the failing case, verdicts by hash |
 | The model prompt, tuned against a real model | done | see "First run against a real model" below |
+| The model ladder, an experiment to run on a GPU machine | ready, not yet run there | `experiments/model-ladder/`; two medium nuggets added for it |
 | WP-19 | docs done; the tank port is not planned | README and DESIGN.md |
 | WP-20 | open | needs zig |
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |

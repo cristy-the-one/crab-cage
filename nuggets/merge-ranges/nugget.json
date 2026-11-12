@@ -1,0 +1,1 @@
+{ "name": "merge-ranges", "objective": "pass_all", "timeout_ms": 2000, "max_memory": "64M" }
