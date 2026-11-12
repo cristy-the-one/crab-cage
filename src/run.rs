@@ -360,7 +360,7 @@ fn first_passes(
 fn note_unjournaled(count: &mut usize) -> bool {
     *count += 1;
     if *count >= UNJOURNALED_LIMIT {
-        println!("{}", unjournaled_stop_line());
+        crate::console::line(&unjournaled_stop_line());
         true
     } else {
         false
@@ -373,7 +373,7 @@ fn unjournaled_stop_line() -> String {
 
 fn finish(journal_path: &Path, objective: Objective) -> Result<RunOutput> {
     let summary = Journal::summary(journal_path)?;
-    print!("{summary}");
+    crate::console::print(&summary);
     let proven = scan_proven(journal_path)?;
     Ok(RunOutput {
         solved: exit_solved(objective, &proven),
@@ -572,7 +572,7 @@ fn settle(
 
     journal.append(&verdict, proposer)?;
     let n = last_journal_n(journal_path)?;
-    println!("{}", format_candidate_line(n, &verdict, proposer));
+    crate::console::line(&format_candidate_line(n, &verdict, proposer));
     remember(nugget, candidate, &verdict, best, last, recent, out_dir)?;
     Ok(Outcome {
         recorded: true,

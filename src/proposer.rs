@@ -690,7 +690,7 @@ impl ModelMemory {
                 "local proposer finished: {PROPOSAL_ERROR_LIMIT} proposal errors in a row: {}",
                 error.message
             );
-            println!("{line}");
+            crate::console::line(&line);
             self.stopped = Some(line);
             true
         } else {
