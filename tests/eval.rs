@@ -417,6 +417,33 @@ fn cli_json_exits_zero_only_when_scored_and_human_output_is_three_lines() {
     assert_eq!(stdout.lines().count(), 1, "{stdout}");
 }
 
+#[test]
+fn cli_eval_exits_quietly_when_stdout_is_closed() {
+    let exe = crab_exe();
+    assert!(exe.is_file(), "missing binary {}", exe.display());
+    let dir = work("closed-stdout");
+    fs::create_dir_all(&dir).unwrap();
+    let good = dir.join("good.rs");
+    fs::write(&good, "    xs.iter().map(|x| x * x).sum()\n").unwrap();
+    let mut child = Command::new(&exe)
+        .arg("eval")
+        .arg(demo_dir())
+        .arg(&good)
+        .arg("--work-dir")
+        .arg(dir.join("work"))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Close the reading end before the verdict is printed: the candidate
+    // is compiled with rustc first, which takes far longer than this.
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+}
+
 fn options_oracle(label: &str) -> EvalOptions {
     let mut opts = options(label);
     opts.oracle = true;

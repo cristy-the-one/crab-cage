@@ -127,6 +127,45 @@ fn demo_folder_run_proves_the_right_snippet() {
 }
 
 #[test]
+fn a_closed_stdout_ends_the_output_and_not_the_run() {
+    let out = scratch("closed-stdout");
+    let candidates = scratch("closed-stdout-cands");
+    fs::write(candidates.join("a-wrong.rs"), "    0\n").unwrap();
+    fs::write(
+        candidates.join("b-right.rs"),
+        "    xs.iter().map(|x| x * x).sum()\n",
+    )
+    .unwrap();
+    let exe = crab_exe();
+    assert!(exe.is_file(), "missing binary {}", exe.display());
+    let mut child = Command::new(exe)
+        .current_dir(&out)
+        .args([
+            "run",
+            demo_dir().to_str().unwrap(),
+            "--candidates",
+            candidates.to_str().unwrap(),
+            "--budget",
+            "20",
+            "--out",
+            out.to_str().unwrap(),
+        ])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // As `| head -0` would: the reader is gone before the seed's line,
+    // which waits for two rustc builds.
+    drop(child.stdout.take());
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "{stderr}");
+    assert_eq!(output.status.code(), Some(0), "{stderr}");
+    // The run went on to the end after the output stopped.
+    assert_eq!(journal_records(&out).len(), 3);
+}
+
+#[test]
 fn budget_counts_the_seed_before_a_snippet() {
     let out = scratch("budget");
     let candidates = scratch("budget-cands");

@@ -557,9 +557,9 @@ fn eval_cmd(args: EvalArgs) -> Result<ExitCode> {
         },
     )?;
     if args.json {
-        println!("{}", serde_json::to_string(&verdict)?);
+        crab_cage::console::line(&serde_json::to_string(&verdict)?);
     } else {
-        print!("{}", pipeline::format_verdict(&verdict));
+        crab_cage::console::print(&pipeline::format_verdict(&verdict));
     }
     if verdict.status == Status::Scored || verdict.status == Status::Proven {
         Ok(ExitCode::SUCCESS)

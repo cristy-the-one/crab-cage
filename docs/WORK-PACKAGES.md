@@ -111,6 +111,8 @@ Options from here, in the order I would try them: a stronger model for this prop
 
 Also seen: `crab-cage run … | head -1` panics with `failed printing to stdout` when the reader closes the pipe early. Harmless, and worth a quiet exit.
 
+Changed since (2026-11-12): `Proposer::next` returns `Candidate`, `Later` or `Finished`; the model proposer says `Later` when a region it proposed still awaits its verdict and it cannot give a new one, so `--jobs` above 1 no longer retires it while it fills a batch. The "already tried" list quotes a region of more than three lines only by its lines that are not in the current region (six lines, 400 characters at most). The failed count and the failing case in the prompt are those of the region shown as current (`Feedback::best_verdict`, or the recent verdicts), with one line for the proposer's own last region when that differs. `run` and `eval` stop writing when stdout is closed and exit as they would have. Replayed against the same model: sum-squares still solves in one request (3 of 3); on `run-lengths` the model reaches 2 failing cases and then repeats the current lines, with the old wording as well (4 of 4 replays each).
+
 Decisions made while building, which later packages must keep:
 
 - **Exit code of `crab-cage run`.** A `pass_all` nugget exits 0 only when a proven candidate has score 0. A `minimize` or `fastest` nugget exits 0 when any candidate is proven.
