@@ -372,8 +372,21 @@ const REJECTS_BEFORE_RESET: usize = 3;
 const PROPOSAL_ERROR_LIMIT: usize = 3;
 /// Regions with a known outcome kept for the "already tried" list.
 const TRIED_LIMIT: usize = 8;
-/// One retry, after a reply repeats a region in that list.
-const REPEAT_TEMPERATURE: f64 = 0.8;
+/// The retries after a reply repeats a region in that list: each one hotter
+/// than the last. In the model ladder of 2026-11-12 every unsolved run ended
+/// on repeats with most of its budget left, one of them after going from 8
+/// failing cases to 2 in four candidates.
+const REPEAT_TEMPERATURES: [f64; 3] = [0.8, 1.0, 1.2];
+/// Added after the request when the reply before was a repeat.
+const REPEAT_NOTE: &str = "Your last reply was the same as lines already tried. Reply with lines that differ from them.\n";
+/// Rejections in a row with the same first lust code before rustc is asked
+/// what it says about the same program.
+const SAME_CODE_BEFORE_RUSTC: usize = 2;
+const SECOND_OPINION_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Given the whole program with a rejected region spliced in, the lines to
+/// add to the prompt about it, or None.
+pub type SecondOpinion = Box<dyn Fn(&str) -> Option<String>>;
 const SYSTEM_PREFIX: &str = "\
 You rewrite one marked region of a Rust program. Your reply replaces every line between the two markers, so it must be complete Rust statements or an expression that compile in that place. Reply with the replacement lines only: no markers, no markdown fence, no explanation, and never a fragment that continues the old code. Stay inside this subset of Rust:";
 
@@ -399,11 +412,19 @@ You rewrite one marked region of a Rust program. Your reply replaces every line 
 ///
 /// A reply whose [`candidate_hash`] matches a region already proposed — one of
 /// the last [`TRIED_LIMIT`] with an outcome, or one still awaiting its
-/// verdict — is not returned. The same prompt is asked once more at
-/// temperature [`REPEAT_TEMPERATURE`]. A second repeat counts as a proposal
-/// error, and when a region is awaiting its verdict it also ends this batch
-/// with [`Proposal::Later`]: with `--jobs` above 1 the model cannot write a
-/// second, different region from the same prompt.
+/// verdict — is not returned. The prompt is asked again with
+/// [`REPEAT_NOTE`] after it, at each of [`REPEAT_TEMPERATURES`] in turn (only
+/// the first while a region is awaiting its verdict). A repeat after the
+/// last of them counts as a proposal error, and when a region is awaiting
+/// its verdict it also ends this batch with [`Proposal::Later`]: with
+/// `--jobs` above 1 the model cannot write a second, different region from
+/// the same prompt.
+///
+/// When lust rejects two of this proposer's regions in a row with the same
+/// first code, the prompt also carries what rustc says about the last one
+/// (see [`rustc_second_opinion`]). lust's message can point at the wrong
+/// line: for a field read on a `Vec::new()` whose element type is not known
+/// it says "no field", where rustc says "type annotations needed".
 ///
 /// A region still awaiting a verdict after one [`Proposal::Later`] was never
 /// evaluated (the journal already had it, or its evaluation failed). It
@@ -415,9 +436,17 @@ pub struct ModelProposer {
     capabilities: String,
     timeout: Duration,
     memory: ModelMemory,
+    second_opinion: Option<SecondOpinion>,
 }
 
 impl ModelProposer {
+    /// Ask `opinion` about a region after repeated rejections with the same
+    /// lust code.
+    pub fn with_second_opinion(mut self, opinion: SecondOpinion) -> Self {
+        self.second_opinion = Some(opinion);
+        self
+    }
+
     pub fn new(
         endpoint: impl AsRef<str>,
         model: impl Into<String>,
@@ -429,6 +458,7 @@ impl ModelProposer {
             capabilities: capabilities.into(),
             timeout: MODEL_TIMEOUT,
             memory: ModelMemory::default(),
+            second_opinion: None,
         })
     }
 }
@@ -442,13 +472,20 @@ impl Proposer for ModelProposer {
         if self.memory.stopped.is_some() {
             return Ok(Proposal::Finished);
         }
-        let (system, user) = prepare_prompt(&mut self.memory, &self.capabilities, nugget, feedback);
+        let (system, user) = prepare_prompt(
+            &mut self.memory,
+            &self.capabilities,
+            nugget,
+            feedback,
+            self.second_opinion.as_ref(),
+        );
         let endpoint = self.endpoint.clone();
         let model = self.model.clone();
         let timeout = self.timeout;
         loop {
             let temperature = self.memory.next_temperature;
-            let raw = llm::chat(&endpoint, &model, &system, &user, timeout, temperature);
+            let asked = self.memory.prompt_now(&user);
+            let raw = llm::chat(&endpoint, &model, &system, &asked, timeout, temperature);
             match self.memory.consume(raw) {
                 Step::Return(text) => return Ok(Proposal::Candidate(text)),
                 Step::Later => return Ok(Proposal::Later),
@@ -468,6 +505,10 @@ pub struct MockModelProposer {
     /// Temperature of each scripted reply. Read by the unit tests.
     #[allow(dead_code)]
     asked_temperatures: Vec<f64>,
+    /// The user prompt of each scripted reply. Read by the unit tests.
+    #[allow(dead_code)]
+    asked_users: Vec<String>,
+    second_opinion: Option<SecondOpinion>,
 }
 
 struct Asked {
@@ -486,7 +527,14 @@ impl MockModelProposer {
             memory: ModelMemory::default(),
             prompts: Vec::new(),
             asked_temperatures: Vec::new(),
+            asked_users: Vec::new(),
+            second_opinion: None,
         }
+    }
+
+    pub fn with_second_opinion(mut self, opinion: SecondOpinion) -> Self {
+        self.second_opinion = Some(opinion);
+        self
     }
 }
 
@@ -499,14 +547,24 @@ impl Proposer for MockModelProposer {
         if self.memory.stopped.is_some() || self.replies.is_empty() {
             return Ok(Proposal::Finished);
         }
-        let (system, user) = prepare_prompt(&mut self.memory, &self.capabilities, nugget, feedback);
-        self.prompts.push(Asked { system, user });
+        let (system, user) = prepare_prompt(
+            &mut self.memory,
+            &self.capabilities,
+            nugget,
+            feedback,
+            self.second_opinion.as_ref(),
+        );
+        self.prompts.push(Asked {
+            system,
+            user: user.clone(),
+        });
         loop {
             if self.replies.is_empty() {
                 return Ok(Proposal::Finished);
             }
             let temperature = self.memory.next_temperature;
             self.asked_temperatures.push(temperature);
+            self.asked_users.push(self.memory.prompt_now(&user));
             let raw = Ok(self.replies.remove(0));
             match self.memory.consume(raw) {
                 Step::Return(text) => return Ok(Proposal::Candidate(text)),
@@ -529,8 +587,18 @@ struct ModelMemory {
     stopped: Option<String>,
     /// Temperature for the next reply.
     next_temperature: f64,
-    /// The next reply is the one hotter retry of a repeat.
-    retrying: bool,
+    /// Repeats since the last reply that was returned or counted as an
+    /// error: how many of [`REPEAT_TEMPERATURES`] have been used.
+    repeats: usize,
+    /// The region of `own`.
+    own_text: Option<String>,
+    /// First lust code of the last rejection, and how many rejections in a
+    /// row began with it.
+    last_code: Option<String>,
+    same_code: usize,
+    /// The second opinion on the region with this hash, kept so that a batch
+    /// of prompts asks once.
+    opinion: Option<(String, Option<String>)>,
 }
 
 struct Tried {
@@ -561,7 +629,11 @@ impl Default for ModelMemory {
             own: None,
             stopped: None,
             next_temperature: llm::DEFAULT_TEMPERATURE,
-            retrying: false,
+            repeats: 0,
+            own_text: None,
+            last_code: None,
+            same_code: 0,
+            opinion: None,
         }
     }
 }
@@ -577,10 +649,24 @@ impl ModelMemory {
             self.pending.retain(|item| item.hash != hash);
             if verdict.status == Status::Rejected {
                 self.rejected_in_a_row += 1;
+                let code = verdict
+                    .diagnostics
+                    .first()
+                    .map(|diagnostic| diagnostic.code.clone())
+                    .filter(|code| !code.is_empty());
+                if code.is_some() && code == self.last_code {
+                    self.same_code += 1;
+                } else {
+                    self.same_code = usize::from(code.is_some());
+                }
+                self.last_code = code;
             } else {
                 self.rejected_in_a_row = 0;
+                self.same_code = 0;
+                self.last_code = None;
             }
             self.own = Some(verdict.clone());
+            self.own_text = Some(region.clone());
             self.remember_tried(hash, region, outcome_of(verdict));
         }
         // Still pending after its batch settled: never evaluated.
@@ -614,13 +700,53 @@ impl ModelMemory {
         }
     }
 
+    /// The user prompt to send now: `user`, with [`REPEAT_NOTE`] after it
+    /// when the reply before was a repeat.
+    fn prompt_now(&self, user: &str) -> String {
+        if self.repeats == 0 {
+            user.to_string()
+        } else {
+            format!("{user}{REPEAT_NOTE}")
+        }
+    }
+
+    /// What `opinion` says about this proposer's last region, when lust has
+    /// rejected [`SAME_CODE_BEFORE_RUSTC`] of its regions in a row with the
+    /// same first code.
+    fn second_opinion(
+        &mut self,
+        nugget: &Nugget,
+        opinion: Option<&SecondOpinion>,
+    ) -> Option<String> {
+        let opinion = opinion?;
+        if self.same_code < SAME_CODE_BEFORE_RUSTC {
+            return None;
+        }
+        let hash = self.own.as_ref()?.hash.clone();
+        if let Some((known, text)) = &self.opinion {
+            if *known == hash {
+                return text.clone();
+            }
+        }
+        let text = opinion(&nugget.splice(self.own_text.as_ref()?));
+        self.opinion = Some((hash, text.clone()));
+        text
+    }
+
     fn consume(&mut self, raw: Result<String>) -> Step {
         match raw.and_then(|text| accept_region(&text)) {
             Ok(text) => {
                 let hash = candidate_hash(&text);
                 if self.is_repeat(&hash) {
-                    if self.retrying {
-                        self.retrying = false;
+                    // With a region awaiting its verdict one hotter retry
+                    // is enough: the verdict will change the prompt.
+                    let retries = if self.pending.is_empty() {
+                        REPEAT_TEMPERATURES.len()
+                    } else {
+                        1
+                    };
+                    if self.repeats >= retries {
+                        self.repeats = 0;
                         self.next_temperature = llm::DEFAULT_TEMPERATURE;
                         let error = err("the local model repeated a region it already tried");
                         let stop = self.fail(error);
@@ -634,12 +760,12 @@ impl ModelMemory {
                         }
                         return Step::AskAgain;
                     }
-                    self.retrying = true;
-                    self.next_temperature = REPEAT_TEMPERATURE;
+                    self.next_temperature = REPEAT_TEMPERATURES[self.repeats];
+                    self.repeats += 1;
                     return Step::AskAgain;
                 }
                 self.errors_in_a_row = 0;
-                self.retrying = false;
+                self.repeats = 0;
                 self.next_temperature = llm::DEFAULT_TEMPERATURE;
                 self.pending.push(Pending {
                     hash,
@@ -649,7 +775,7 @@ impl ModelMemory {
                 Step::Return(text)
             }
             Err(error) => {
-                self.retrying = false;
+                self.repeats = 0;
                 self.next_temperature = llm::DEFAULT_TEMPERATURE;
                 let stop = self.fail(error);
                 if self.errors_in_a_row < PROPOSAL_ERROR_LIMIT {
@@ -704,8 +830,10 @@ fn prepare_prompt(
     capabilities: &str,
     nugget: &Nugget,
     feedback: &Feedback,
+    opinion: Option<&SecondOpinion>,
 ) -> (String, String) {
     memory.observe(feedback);
+    let second = memory.second_opinion(nugget, opinion);
     let base = memory.base_text(nugget, feedback);
     let best_score = feedback.best.map(|(_, score)| score);
     let system = system_prompt(capabilities);
@@ -714,6 +842,7 @@ fn prepare_prompt(
         &base,
         base_verdict(&base, feedback),
         memory.own.as_ref(),
+        second.as_deref(),
         best_score,
         &memory.tried,
         &memory.pending,
@@ -752,6 +881,7 @@ fn user_prompt(
     base: &str,
     base_verdict: Option<&Verdict>,
     own: Option<&Verdict>,
+    second_opinion: Option<&str>,
     best_score: Option<f64>,
     tried: &[Tried],
     pending: &[Pending],
@@ -769,6 +899,12 @@ fn user_prompt(
     if let Some(verdict) = own {
         if verdict.status == Status::Rejected {
             append_rejection(&mut out, verdict);
+            if let Some(text) = second_opinion {
+                out.push_str(text);
+                if !text.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
         }
     }
     match base_verdict.filter(|verdict| fails_cases(verdict)) {
@@ -994,6 +1130,82 @@ fn format_diagnostic(diagnostic: &Diagnostic) -> String {
         "line {}, col {}: {} {}. Hint: {}",
         diagnostic.line, diagnostic.col, diagnostic.code, diagnostic.message, diagnostic.fix
     )
+}
+
+/// A [`SecondOpinion`] that checks the program with rustc, in `dir`.
+///
+/// rustc only checks it (`--emit=metadata`), which takes a fraction of a
+/// build. When rustc rejects it too, the answer is rustc's errors, each with
+/// the source line it points at. When rustc accepts it, the answer says that
+/// lust does not support something in the lines. None when rustc is missing,
+/// times out, or the files cannot be written.
+pub fn rustc_second_opinion(dir: PathBuf) -> SecondOpinion {
+    Box::new(move |program: &str| {
+        let rustc = crate::lust::which("rustc")?;
+        fs::create_dir_all(&dir).ok()?;
+        let source = dir.join("second-opinion.rs");
+        fs::write(&source, program).ok()?;
+        let mut command = std::process::Command::new(rustc);
+        command
+            .args(["--edition", "2021", "--error-format=short"])
+            .arg("--emit=metadata")
+            .arg("-o")
+            .arg(dir.join("second-opinion.rmeta"))
+            .arg(&source);
+        let limits = crate::supervisor::Limits {
+            wall: SECOND_OPINION_TIMEOUT,
+            memory_bytes: None,
+            scrub_env: false,
+        };
+        let ran = crate::supervisor::run_capture(command, &limits, b"").ok()?;
+        match ran.kind {
+            crate::supervisor::StopKind::Exited(0) => Some(
+                "rustc accepts these lines, so they use something lust does not support. Write them another way, with simpler Rust.\n"
+                    .to_string(),
+            ),
+            crate::supervisor::StopKind::Exited(_) => {
+                let summary = rustc_summary(&ran.stderr, program);
+                if summary.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "rustc rejects these lines too. It says:\n{summary}"
+                    ))
+                }
+            }
+            _ => None,
+        }
+    })
+}
+
+/// The errors in rustc's `--error-format=short` output, at most three: the
+/// message, then the source line of `program` it points at. A line there is
+/// `path:line:col: error[E0282]: message`.
+fn rustc_summary(stderr: &str, program: &str) -> String {
+    let source: Vec<&str> = program.lines().collect();
+    let mut out = String::new();
+    let mut errors = 0;
+    for line in stderr.lines() {
+        let Some(at) = line.find(": error") else {
+            continue;
+        };
+        if errors == 3 {
+            break;
+        }
+        errors += 1;
+        out.push_str(line[at + 2..].trim_end());
+        out.push('\n');
+        // The path may hold a colon (`C:\...`), so read from the right.
+        let mut parts = line[..at].rsplit(':');
+        let _col = parts.next();
+        let number = parts.next().and_then(|n| n.parse::<usize>().ok());
+        if let Some(text) = number.and_then(|n| source.get(n.checked_sub(1)?)) {
+            out.push_str("  at: ");
+            out.push_str(text.trim());
+            out.push('\n');
+        }
+    }
+    out
 }
 
 fn accept_region(raw: &str) -> Result<String> {
@@ -1658,14 +1870,8 @@ mod tests {
         assert_ne!(second, first);
         assert_eq!(proposer.asked_temperatures, vec![0.2, 0.2, 0.8]);
 
-        let mut stuck = MockModelProposer::new(
-            vec![
-                "again\n".to_string(),
-                "again\n".to_string(),
-                "again\n".to_string(),
-            ],
-            "",
-        );
+        // One region, then a repeat and its three hotter retries.
+        let mut stuck = MockModelProposer::new(vec!["again\n".to_string(); 5], "");
         let once = stuck.next(&nugget, &quiet()).unwrap().into_text().unwrap();
         let recent = [(once.as_str(), &verdict)];
         let feedback = Feedback {
@@ -2089,7 +2295,7 @@ mod tests {
     fn a_region_awaiting_its_result_is_not_proposed_again_and_keeps_its_indent() {
         let nugget = region_nugget(nugget::Objective::PassAll);
         let region = "    let total: i64 = \"no\";\n    total\n";
-        let mut proposer = MockModelProposer::new(vec![region.to_string(); 8], "");
+        let mut proposer = MockModelProposer::new(vec![region.to_string(); 12], "");
         let first = proposer
             .next(&nugget, &quiet())
             .unwrap()
@@ -2100,7 +2306,7 @@ mod tests {
         // proposer is not finished.
         assert_eq!(proposer.next(&nugget, &quiet()).unwrap(), Proposal::Later);
         assert!(proposer.memory.stopped.is_none());
-        assert_eq!(proposer.replies.len(), 5);
+        assert_eq!(proposer.replies.len(), 9);
         assert_eq!(proposer.asked_temperatures, vec![0.2, 0.2, 0.8]);
         let prompt = &proposer.prompts[1].user;
         assert!(prompt.contains("proposed, awaiting result"), "{prompt}");
@@ -2182,7 +2388,7 @@ mod tests {
             if self.memory.stopped.is_some() {
                 return Ok(Proposal::Finished);
             }
-            let _ = prepare_prompt(&mut self.memory, "", nugget, feedback);
+            let _ = prepare_prompt(&mut self.memory, "", nugget, feedback, None);
             loop {
                 self.asks += 1;
                 let index = self.memory.tried.len().min(self.regions.len() - 1);
@@ -2272,12 +2478,12 @@ mod tests {
         )
         .unwrap();
         assert!(
-            model.asked_temperatures.len() <= 8,
+            model.asked_temperatures.len() <= 12,
             "asked {} times: {:?}",
             model.asked_temperatures.len(),
             model.asked_temperatures
         );
-        assert!(model.replies.len() >= 30, "left {}", model.replies.len());
+        assert!(model.replies.len() >= 28, "left {}", model.replies.len());
         assert!(model.asked_temperatures.contains(&0.8));
         assert!(model.prompts[1].user.contains("proposed, awaiting result"));
         assert!(model.prompts[1].user.contains("    std::fs::read"));
@@ -2345,5 +2551,170 @@ mod tests {
         assert_eq!(proposer.endpoint, "http://127.0.0.1:11434/v1");
         assert_eq!(proposer.name(), "local");
         assert_eq!(proposer.capabilities, "caps");
+    }
+
+    #[test]
+    fn a_repeat_is_asked_again_hotter_each_time_with_a_note() {
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let mut proposer = MockModelProposer::new(
+            vec![
+                "one\n".to_string(),
+                "one\n".to_string(),
+                "one\n".to_string(),
+                "one\n".to_string(),
+                "two\n".to_string(),
+            ],
+            "",
+        );
+        let first = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let verdict = rejected("L0110", 1, "");
+        let recent = [(first.as_str(), &verdict)];
+        let feedback = Feedback {
+            best: None,
+            last: None,
+            recent: &recent,
+            best_verdict: None,
+        };
+        // Three repeats, each asked again hotter; the fourth reply is new.
+        assert_eq!(
+            proposer.next(&nugget, &feedback).unwrap(),
+            Proposal::Candidate("two".to_string())
+        );
+        assert_eq!(proposer.asked_temperatures, vec![0.2, 0.2, 0.8, 1.0, 1.2]);
+        assert_eq!(proposer.memory.errors_in_a_row, 0);
+        // The first ask of a prompt has no note; each ask after a repeat
+        // ends with it, after the request.
+        assert!(!proposer.asked_users[1].contains(REPEAT_NOTE));
+        for asked in &proposer.asked_users[2..] {
+            assert!(asked.ends_with(REPEAT_NOTE), "{asked}");
+            assert!(
+                asked.contains("Reply with the complete new lines that replace them.\n"),
+                "{asked}"
+            );
+        }
+    }
+
+    #[test]
+    fn rustc_is_asked_after_two_rejections_with_the_same_code() {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let seen: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
+        let record = Rc::clone(&seen);
+        let mut proposer = MockModelProposer::new(
+            vec![
+                "one\n".to_string(),
+                "two\n".to_string(),
+                "three\n".to_string(),
+                "four\n".to_string(),
+                "five\n".to_string(),
+            ],
+            "",
+        )
+        .with_second_opinion(Box::new(move |program: &str| {
+            record.borrow_mut().push(program.to_string());
+            Some("RUSTC_SAYS\n".to_string())
+        }));
+
+        let mut last = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
+        // One rejection: rustc is not asked.
+        let mut verdict = rejected("L0103", 1, "");
+        verdict.hash = candidate_hash(&last);
+        let recent = [(last.as_str(), &verdict)];
+        let feedback = Feedback {
+            best: None,
+            last: None,
+            recent: &recent,
+            best_verdict: None,
+        };
+        last = proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
+        assert!(seen.borrow().is_empty());
+        assert!(!proposer.prompts[1].user.contains("RUSTC_SAYS"));
+
+        // The same code again: rustc is asked about the whole program with
+        // the last region in it, and its answer follows lust's message.
+        let mut verdict = rejected("L0103", 1, "");
+        verdict.hash = candidate_hash(&last);
+        let recent = [(last.as_str(), &verdict)];
+        let feedback = Feedback {
+            best: None,
+            last: None,
+            recent: &recent,
+            best_verdict: None,
+        };
+        last = proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
+        assert_eq!(seen.borrow().len(), 1);
+        assert_eq!(seen.borrow()[0], nugget.splice("two"));
+        let prompt = &proposer.prompts[2].user;
+        let lust_at = prompt.find("L0103").unwrap();
+        let rustc_at = prompt.find("RUSTC_SAYS").unwrap();
+        assert!(lust_at < rustc_at, "{prompt}");
+        assert!(
+            prompt.ends_with("Reply with the complete new lines that replace them.\n"),
+            "{prompt}"
+        );
+
+        // A different code: the count starts again and rustc is not asked.
+        let mut verdict = rejected("L0110", 1, "");
+        verdict.hash = candidate_hash(&last);
+        let recent = [(last.as_str(), &verdict)];
+        let feedback = Feedback {
+            best: None,
+            last: None,
+            recent: &recent,
+            best_verdict: None,
+        };
+        proposer.next(&nugget, &feedback).unwrap();
+        assert_eq!(seen.borrow().len(), 1);
+        assert!(!proposer.prompts[3].user.contains("RUSTC_SAYS"));
+    }
+
+    #[test]
+    fn rustc_summary_keeps_the_message_and_the_source_line() {
+        let program = "fn main() {\n    let mut v = Vec::new();\n    v.len();\n}\n";
+        let stderr = "C:\\work\\second-opinion.rs:2:9: error[E0282]: type annotations needed for `Vec<_>`\nerror: aborting due to 1 previous error\n";
+        assert_eq!(
+            rustc_summary(stderr, program),
+            "error[E0282]: type annotations needed for `Vec<_>`\n  at: let mut v = Vec::new();\n"
+        );
+        assert_eq!(rustc_summary("warning: unused\n", program), "");
+    }
+
+    #[test]
+    fn rustc_gives_a_second_opinion_on_a_real_program() {
+        if crate::lust::which("rustc").is_none() {
+            return;
+        }
+        let dir = scratch("second-opinion");
+        let opinion = rustc_second_opinion(dir.clone());
+        // The program that cost a model every run of `merge-ranges`: lust
+        // says "no field `1`", rustc says where the type is missing.
+        let rejected = "fn main() {\n    let mut merged = Vec::new();\n    if let Some(last) = merged.last_mut() {\n        last.1 = 2;\n    }\n}\n";
+        let text = opinion(rejected).unwrap();
+        assert!(text.starts_with("rustc rejects these lines too."), "{text}");
+        assert!(text.contains("E0282"), "{text}");
+        assert!(text.contains("at: let mut merged = Vec::new();"), "{text}");
+
+        let accepted = "fn main() {\n    println!(\"ok\");\n}\n";
+        let text = opinion(accepted).unwrap();
+        assert!(text.starts_with("rustc accepts these lines"), "{text}");
+        let _ = fs::remove_dir_all(&dir);
     }
 }

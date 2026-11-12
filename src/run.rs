@@ -131,7 +131,13 @@ pub fn attach_model<'a>(
     // Reject a non-loopback URL before probing lust.
     crate::llm::normalize_endpoint(endpoint)?;
     let capabilities = capability_text(lust_bin)?;
-    *slot = Some(ModelProposer::new(endpoint, model, capabilities)?);
+    // Private to this process: two runs must not write the same file.
+    let opinion_dir =
+        std::env::temp_dir().join(format!("crab-cage-second-opinion-{}", std::process::id()));
+    *slot = Some(
+        ModelProposer::new(endpoint, model, capabilities)?
+            .with_second_opinion(crate::proposer::rustc_second_opinion(opinion_dir)),
+    );
     if let Some(proposer) = slot.as_mut() {
         proposers.push(proposer);
     }
