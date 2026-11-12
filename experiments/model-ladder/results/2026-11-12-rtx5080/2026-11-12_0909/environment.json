@@ -1,0 +1,30 @@
+{
+  "date": "2026-11-12 09:09",
+  "cpu": "Intel(R) Core(TM) Ultra 9 275HX",
+  "gpus": [
+    "Intel(R) Graphics",
+    "NVIDIA GeForce RTX 5080 Laptop GPU"
+  ],
+  "nvidia_smi": "NVIDIA GeForce RTX 5080 Laptop GPU, 16303 MiB",
+  "ram_gb": 63.0,
+  "os": "Microsoft Windows NT 10.0.26300.0",
+  "ollama": "0.40.16",
+  "crab_cage": "c28e6d5",
+  "rustc": "rustc 1.96.0 (ac68faa20 2026-05-25)",
+  "lust": "lust 0.3.0 (build 8eb1e88c)",
+  "endpoint": "http://127.0.0.1:11434/v1",
+  "reps": 3,
+  "budget": 20,
+  "tweak": false,
+  "prompt_tokens": 3690,
+  "nuggets": [
+    "sum-squares",
+    "run-lengths",
+    "merge-ranges",
+    "normalize-path"
+  ],
+  "models": [
+    "qwen2.5-coder:14b"
+  ],
+  "skipped_models": []
+}
