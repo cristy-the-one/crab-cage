@@ -1,0 +1,6 @@
+# One model per line, as Ollama names it. Lines starting with # are skipped.
+# Edit this list for the machine. These three fit a 16 GB GPU; the last one
+# is the largest and may not stay fully on the card with a long prompt.
+qwen2.5-coder:7b
+qwen2.5-coder:14b
+gpt-oss:20b

@@ -805,26 +805,44 @@ fn json_string_field(stdout: &str, key: &str) -> String {
     rest[..end].to_string()
 }
 
-/// The harder example nugget is consistent: its seed fails eight of its ten
-/// cases, and the reference solution kept beside it passes them all.
+/// Each example nugget with a `reference.rs` is consistent: its seed fails
+/// the number of cases recorded here, and the reference passes them all.
 #[test]
-fn normalize_path_nugget_has_a_wrong_seed_and_a_right_reference() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("nuggets")
-        .join("normalize-path");
-    let nugget = nugget::load(&dir).unwrap();
-    assert_eq!(nugget.cases.len(), 10);
+fn example_nuggets_have_a_wrong_seed_and_a_right_reference() {
+    for (name, cases, seed_fails) in [
+        ("run-lengths", 8u32, 7u32),
+        ("merge-ranges", 9, 7),
+        ("normalize-path", 10, 8),
+    ] {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("nuggets")
+            .join(name);
+        let nugget = nugget::load(&dir).unwrap();
+        assert_eq!(nugget.cases.len(), cases as usize, "{name}");
 
-    let seed = evaluate(&nugget, &nugget.seed, &no_lust(), &options("np-seed")).unwrap();
-    assert_eq!(seed.status, Status::Scored, "{seed:?}");
-    assert_eq!(seed.score, Some(8.0));
-    assert_eq!(seed.passed, 2);
+        let seed = evaluate(
+            &nugget,
+            &nugget.seed,
+            &no_lust(),
+            &options(&format!("{name}-seed")),
+        )
+        .unwrap();
+        assert_eq!(seed.status, Status::Scored, "{name}: {seed:?}");
+        assert_eq!(seed.score, Some(f64::from(seed_fails)), "{name}");
+        assert_eq!(seed.passed, cases - seed_fails, "{name}");
 
-    let reference = fs::read_to_string(dir.join("reference.rs"))
-        .unwrap()
-        .replace("\r\n", "\n");
-    let solved = evaluate(&nugget, &reference, &no_lust(), &options("np-reference")).unwrap();
-    assert_eq!(solved.status, Status::Scored, "{solved:?}");
-    assert_eq!(solved.score, Some(0.0));
-    assert_eq!(solved.passed, 10);
+        let reference = fs::read_to_string(dir.join("reference.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let solved = evaluate(
+            &nugget,
+            &reference,
+            &no_lust(),
+            &options(&format!("{name}-reference")),
+        )
+        .unwrap();
+        assert_eq!(solved.status, Status::Scored, "{name}: {solved:?}");
+        assert_eq!(solved.score, Some(0.0), "{name}");
+        assert_eq!(solved.passed, cases, "{name}");
+    }
 }
