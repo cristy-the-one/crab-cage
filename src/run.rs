@@ -61,6 +61,9 @@ struct Best {
     /// Present when `best.region.rs` is the text of `score`'s journal line.
     text: Option<String>,
     score: f64,
+    /// The verdict that made it the best. None for a best restored from the
+    /// journal.
+    verdict: Option<Verdict>,
 }
 
 /// Stops the lust daemon started in this directory when it is dropped.
@@ -469,7 +472,11 @@ fn restored_best(out_dir: &Path, journal_path: &Path) -> Result<Option<Best>> {
     } else {
         None
     };
-    Ok(Some(Best { text, score }))
+    Ok(Some(Best {
+        text,
+        score,
+        verdict: None,
+    }))
 }
 
 fn feedback_of<'a>(
@@ -485,6 +492,10 @@ fn feedback_of<'a>(
             .as_ref()
             .map(|(text, verdict)| (text.as_str(), verdict)),
         recent,
+        best_verdict: best
+            .as_ref()
+            .filter(|best| best.text.is_some())
+            .and_then(|best| best.verdict.as_ref()),
     }
 }
 
@@ -625,6 +636,7 @@ fn remember(
                 *best = Some(Best {
                     text: Some(candidate.to_string()),
                     score,
+                    verdict: Some(verdict.clone()),
                 });
             }
         }
@@ -742,6 +754,7 @@ mod tests {
         let best = Some(Best {
             text: Some("old".to_string()),
             score: 3.0,
+            verdict: None,
         });
         assert!(would_improve(&verdict(Status::Scored, Some(1.0)), &best));
         assert!(!would_improve(&verdict(Status::Scored, Some(3.0)), &best));
@@ -968,6 +981,7 @@ mod tests {
             best: None,
             last: None,
             recent: &[],
+            best_verdict: None,
         };
         let mut first = List {
             label: "one",
@@ -1179,6 +1193,45 @@ mod tests {
         assert!(same.calls < 60, "calls {}", same.calls);
     }
 
+    #[test]
+    fn feedback_carries_the_best_verdict_only_with_the_best_text() {
+        let dir =
+            std::env::temp_dir().join(format!("crab-cage-run-best-verdict-{}", std::process::id()));
+        if dir.exists() {
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        fs::create_dir_all(&dir).unwrap();
+        let mut best = None;
+        let mut last = None;
+        let mut proven = verdict(Status::Proven, Some(1.0));
+        proven.note = "THE_BEST".to_string();
+        remember(
+            &nugget(Objective::PassAll),
+            "body\n",
+            &proven,
+            &mut best,
+            &mut last,
+            &mut Vec::new(),
+            &dir,
+        )
+        .unwrap();
+        let feedback = feedback_of(&best, &last, &[]);
+        assert_eq!(feedback.best, Some(("body\n", 1.0)));
+        assert_eq!(
+            feedback.best_verdict.map(|v| v.note.as_str()),
+            Some("THE_BEST")
+        );
+
+        let restored = Some(Best {
+            text: None,
+            score: 1.0,
+            verdict: Some(proven.clone()),
+        });
+        let feedback = feedback_of(&restored, &None, &[]);
+        assert!(feedback.best.is_none());
+        assert!(feedback.best_verdict.is_none());
+    }
+
     /// Gives one region, then says `Later` on every call.
     struct OnceThenLater {
         calls: usize,
@@ -1208,6 +1261,7 @@ mod tests {
             best: None,
             last: None,
             recent: &[],
+            best_verdict: None,
         };
         let mut waiter = OnceThenLater { calls: 1 };
         let mut list = List {

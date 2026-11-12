@@ -38,6 +38,9 @@ pub struct Feedback<'a> {
     /// [`ModelProposer`] finds the verdicts it produced by hashing the text
     /// with [`candidate_hash`], so a verdict that is not `last` still counts.
     pub recent: &'a [(&'a str, &'a Verdict)],
+    /// The verdict of [`Feedback::best`]'s text, when the run has it. A best
+    /// restored from an earlier run's journal has none.
+    pub best_verdict: Option<&'a Verdict>,
 }
 
 /// What a [`Proposer`] has for the batch being gathered.
@@ -709,12 +712,30 @@ fn prepare_prompt(
     let user = user_prompt(
         nugget,
         &base,
+        base_verdict(&base, feedback),
         memory.own.as_ref(),
         best_score,
         &memory.tried,
         &memory.pending,
     );
     (system, user)
+}
+
+/// The verdict of the region the prompt shows as current: the best's own
+/// verdict, or the latest settled verdict for the same text.
+fn base_verdict<'a>(base: &str, feedback: &Feedback<'a>) -> Option<&'a Verdict> {
+    let hash = candidate_hash(base);
+    if let (Some((best, _)), Some(verdict)) = (feedback.best, feedback.best_verdict) {
+        if candidate_hash(best) == hash {
+            return Some(verdict);
+        }
+    }
+    feedback
+        .recent
+        .iter()
+        .rev()
+        .find(|(text, _)| candidate_hash(text) == hash)
+        .map(|&(_, verdict)| verdict)
 }
 
 fn system_prompt(capabilities: &str) -> String {
@@ -729,6 +750,7 @@ fn system_prompt(capabilities: &str) -> String {
 fn user_prompt(
     nugget: &Nugget,
     base: &str,
+    base_verdict: Option<&Verdict>,
     own: Option<&Verdict>,
     best_score: Option<f64>,
     tried: &[Tried],
@@ -741,13 +763,20 @@ fn user_prompt(
     out.push('\n');
     out.push_str(objective_sentence(nugget.objective));
     out.push('\n');
+    // A rejection is about the proposer's last reply. Failed cases are
+    // about the region shown as current when its verdict is known, so the
+    // case quoted is one that region fails.
     if let Some(verdict) = own {
         if verdict.status == Status::Rejected {
             append_rejection(&mut out, verdict);
-        } else if matches!(verdict.status, Status::Scored | Status::Proven)
-            && verdict.passed < verdict.total
-        {
-            append_scored(&mut out, verdict, best_score);
+        }
+    }
+    match base_verdict.filter(|verdict| fails_cases(verdict)) {
+        Some(current) => append_current_scored(&mut out, current, own),
+        None => {
+            if let Some(verdict) = own.filter(|verdict| fails_cases(verdict)) {
+                append_scored(&mut out, verdict, best_score);
+            }
         }
     }
     append_tried(&mut out, tried, pending, base);
@@ -778,6 +807,36 @@ fn objective_sentence(objective: Objective) -> &'static str {
         Objective::Fastest => {
             "Objective: fastest. Every case must print the expected output; among candidates that do, the one that runs in the least time wins. Lower is better."
         }
+    }
+}
+
+/// Ran and failed at least one case.
+fn fails_cases(verdict: &Verdict) -> bool {
+    matches!(verdict.status, Status::Scored | Status::Proven) && verdict.passed < verdict.total
+}
+
+/// The failed count and the failing case of the region shown as current,
+/// after one line for the proposer's own last region when that region ran,
+/// failed cases, and is not the current one.
+fn append_current_scored(out: &mut String, current: &Verdict, own: Option<&Verdict>) {
+    if let Some(own) = own.filter(|own| fails_cases(own) && own.hash != current.hash) {
+        let failed = own.total.saturating_sub(own.passed);
+        out.push_str(&format!(
+            "Your last region ran and failed {failed} of {} cases.\n",
+            own.total
+        ));
+    }
+    let failed = current.total.saturating_sub(current.passed);
+    out.push_str(&format!(
+        "The current lines ran and failed {failed} of {} cases.",
+        current.total
+    ));
+    match &current.failure {
+        Some(failure) => {
+            out.push_str(" One of them:\n");
+            append_failure(out, failure);
+        }
+        None => out.push('\n'),
     }
 }
 
@@ -1015,6 +1074,7 @@ mod tests {
             best: None,
             last: None,
             recent: &[],
+            best_verdict: None,
         };
         let mut proposer = FolderProposer::new(&dir);
         assert_eq!(proposer.name(), "folder");
@@ -1079,6 +1139,7 @@ mod tests {
             best: None,
             last: None,
             recent: &[],
+            best_verdict: None,
         };
         let mut proposer = FolderProposer::new(&dir);
         let message = proposer
@@ -1107,6 +1168,7 @@ mod tests {
             best: None,
             last: None,
             recent: &[],
+            best_verdict: None,
         }
     }
 
@@ -1118,6 +1180,7 @@ mod tests {
             best: Some((source, 1.0)),
             last: None,
             recent: &[],
+            best_verdict: None,
         };
         let mut proposer = LiteralProposer::new(1);
         assert_eq!(proposer.name(), "tweak");
@@ -1345,6 +1408,7 @@ mod tests {
             best: Some(("BEST_REGION\n", 2.0)),
             last: Some((first.as_str(), &verdict)),
             recent: &recent,
+            best_verdict: None,
         };
         let second = proposer
             .next(&nugget, &feedback)
@@ -1378,6 +1442,7 @@ mod tests {
             best: Some(("BEST_REGION\n", 1.0)),
             last: Some(("not-ours\n", &verdict)),
             recent: &recent,
+            best_verdict: None,
         };
         proposer
             .next(&nugget, &feedback)
@@ -1411,6 +1476,7 @@ mod tests {
             best: None,
             last: Some((first.as_str(), &verdict)),
             recent: &recent,
+            best_verdict: None,
         };
         proposer
             .next(&nugget, &feedback)
@@ -1438,6 +1504,7 @@ mod tests {
                     best: Some(("BEST_REGION\n", 1.0)),
                     last: Some((previous.as_str(), &verdict)),
                     recent: &recent,
+                    best_verdict: None,
                 };
                 proposer
                     .next(&nugget, &feedback)
@@ -1542,6 +1609,7 @@ mod tests {
             best: Some(("BEST_REGION\n", 1.0)),
             last: Some((first.as_str(), &verdict)),
             recent: &recent,
+            best_verdict: None,
         };
         proposer
             .next(&nugget, &feedback)
@@ -1579,6 +1647,7 @@ mod tests {
             best: None,
             last: None,
             recent: &recent,
+            best_verdict: None,
         };
         let second = proposer
             .next(&nugget, &feedback)
@@ -1603,6 +1672,7 @@ mod tests {
             best: None,
             last: None,
             recent: &recent,
+            best_verdict: None,
         };
         assert_eq!(stuck.next(&nugget, &feedback).unwrap(), Proposal::Finished);
         assert_eq!(stuck.memory.errors_in_a_row, 1);
@@ -1632,6 +1702,7 @@ mod tests {
             best: Some(("BEST_REGION\n", 1.0)),
             last: None,
             recent: &recent,
+            best_verdict: None,
         };
         let second = proposer
             .next(&nugget, &feedback)
@@ -1648,6 +1719,7 @@ mod tests {
             best: Some(("BEST_REGION\n", 1.0)),
             last: None,
             recent: &recent,
+            best_verdict: None,
         };
         proposer
             .next(&nugget, &feedback)
@@ -1694,6 +1766,7 @@ mod tests {
             best: Some(("BEST_REGION\n", 4.0)),
             last: None,
             recent: &recent,
+            best_verdict: None,
         };
         proposer
             .next(&nugget, &feedback)
@@ -1710,6 +1783,82 @@ mod tests {
             .find("ACTUAL_1")
             .unwrap_or_else(|| panic!("{prompt}"));
         assert!(at < expected && expected < actual, "{prompt}");
+    }
+
+    fn failure(id: &str, expected: &str, actual: &str) -> Option<CaseFailure> {
+        Some(CaseFailure {
+            id: id.to_string(),
+            input: format!("{id} input\n"),
+            expected: expected.to_string(),
+            actual: actual.to_string(),
+        })
+    }
+
+    #[test]
+    fn the_failing_case_shown_is_the_one_the_shown_region_fails() {
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let mut proposer = MockModelProposer::new(
+            vec![
+                "ours\n".to_string(),
+                "again\n".to_string(),
+                "third\n".to_string(),
+            ],
+            "",
+        );
+        let ours = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let mut own = scored(3, 10, 7.0, failure("climb", "OWN_EXPECTED", "OWN_ACTUAL"));
+        own.hash = candidate_hash(&ours);
+        let mut best = scored(4, 10, 6.0, failure("slashes", "a/b", "a//b"));
+        best.status = Status::Proven;
+        best.hash = candidate_hash("BEST_REGION\n");
+        let recent = [(ours.as_str(), &own)];
+        let feedback = Feedback {
+            best: Some(("BEST_REGION\n", 6.0)),
+            last: None,
+            recent: &recent,
+            best_verdict: Some(&best),
+        };
+        proposer.next(&nugget, &feedback).unwrap();
+        let prompt = &proposer.prompts[1].user;
+        assert!(
+            prompt.contains("Your last region ran and failed 7 of 10 cases.\n"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("The current lines ran and failed 6 of 10 cases. One of them:\ncase slashes\ninput:\nslashes input\nexpected:\na/b\nactual:\na//b\n"),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("OWN_EXPECTED"), "{prompt}");
+        assert!(!prompt.contains("case climb"), "{prompt}");
+        let shown = prompt.find("case slashes").unwrap();
+        let now = prompt
+            .find("The lines between // CRAB:BEGIN and // CRAB:END are now:\nBEST_REGION\n")
+            .unwrap();
+        assert!(shown < now, "{prompt}");
+
+        // Without `best_verdict` the base's verdict is found in `recent`, and
+        // the proposer's own rejection is still quoted before it.
+        let rejection = rejected("L0110", 2, "");
+        let mut seen_best = best.clone();
+        seen_best.failure = failure("root", "/", "");
+        let recent = [("BEST_REGION\n", &seen_best), ("again", &rejection)];
+        let feedback = Feedback {
+            best: Some(("BEST_REGION\n", 6.0)),
+            last: None,
+            recent: &recent,
+            best_verdict: None,
+        };
+        proposer.next(&nugget, &feedback).unwrap();
+        let prompt = &proposer.prompts[2].user;
+        let diagnostic = prompt.find("line 2, col 9: L0110").expect("diagnostic");
+        let case = prompt.find("case root").expect("base case");
+        assert!(diagnostic < case, "{prompt}");
+        assert!(!prompt.contains("Your last region ran"), "{prompt}");
+        assert!(!prompt.contains("case slashes"), "{prompt}");
     }
 
     #[test]
@@ -1746,6 +1895,7 @@ mod tests {
             best: Some(("BEST_REGION\n", 5.0)),
             last: Some(("someone-late\n", &late)),
             recent: &recent,
+            best_verdict: None,
         };
         proposer
             .next(&nugget, &feedback)
@@ -1784,6 +1934,7 @@ mod tests {
             best: None,
             last: None,
             recent: &recent,
+            best_verdict: None,
         };
         proposer
             .next(&nugget, &feedback)
@@ -1822,6 +1973,7 @@ mod tests {
                     best: None,
                     last: None,
                     recent: &view,
+                    best_verdict: None,
                 };
                 proposer
                     .next(&nugget, &feedback)
@@ -1870,6 +2022,7 @@ mod tests {
                 best: Some((best.as_str(), 6.0)),
                 last: None,
                 recent: &view,
+                best_verdict: None,
             };
             let text = proposer.next(&nugget, &feedback).unwrap();
             let text = text.into_text().unwrap();
@@ -1884,6 +2037,7 @@ mod tests {
             best: Some((best.as_str(), 6.0)),
             last: None,
             recent: &view,
+            best_verdict: None,
         };
         proposer.next(&nugget, &feedback).unwrap();
         let prompt = &proposer.prompts[4].user;
@@ -1995,6 +2149,7 @@ mod tests {
             best: None,
             last: None,
             recent: &recent,
+            best_verdict: None,
         };
         assert_eq!(
             proposer.next(&nugget, &feedback).unwrap(),
@@ -2156,6 +2311,7 @@ mod tests {
             best: Some(("BEST_REGION\n", 1.0)),
             last: None,
             recent: &recent,
+            best_verdict: None,
         };
         proposer
             .next(&nugget, &feedback)
