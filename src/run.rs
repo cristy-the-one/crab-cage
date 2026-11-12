@@ -18,7 +18,7 @@ use crate::journal::Journal;
 use crate::lust;
 use crate::nugget::{self, Nugget, Objective};
 use crate::pipeline::{self, candidate_hash, EvalOptions, Gate, Status, Toolchain, Verdict};
-use crate::proposer::{Feedback, LiteralProposer, ModelProposer, Proposer};
+use crate::proposer::{Feedback, LiteralProposer, ModelProposer, Proposal, Proposer};
 
 /// Settled candidates kept for [`Feedback::recent`]. Older ones are dropped.
 const RECENT_LIMIT: usize = 32;
@@ -144,9 +144,14 @@ fn capability_text(lust_bin: Option<&Path>) -> Result<String> {
 }
 
 /// Evaluate the seed, then ask `proposers` in round-robin until the budget is
-/// spent, every proposer returns [`None`](Proposer::next), a proven `pass_all`
+/// spent, every proposer is [`Proposal::Finished`], a batch ends empty because
+/// every live proposer said [`Proposal::Later`], a proven `pass_all`
 /// candidate scores 0, or [`UNJOURNALED_LIMIT`] proposals in a row leave no
 /// journal line.
+///
+/// A proposer that says `Later` is not asked again while the current batch
+/// is gathered; it is asked again after the batch settles. `Finished` is for
+/// the rest of the run.
 ///
 /// Writes `<out>/journal.jsonl`, and `<out>/best.rs` plus `<out>/best.region.rs`
 /// when a proven candidate becomes the best. Prints one line per journaled
@@ -219,6 +224,7 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
         // when another job settled later and `last` moved on.
         let want = jobs.min(options.budget - evaluated);
         let mut batch: Vec<(String, String)> = Vec::with_capacity(want);
+        let mut waiting = vec![false; proposers.len()];
         while batch.len() < want {
             let next = {
                 let view: Vec<(&str, &Verdict)> = recent
@@ -226,10 +232,22 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
                     .map(|(text, verdict)| (text.as_str(), verdict))
                     .collect();
                 let feedback = feedback_of(&best, &last, &view);
-                next_candidate(proposers, &mut cursor, &mut exhausted, &nugget, &feedback)?
+                next_candidate(
+                    proposers,
+                    &mut cursor,
+                    &mut exhausted,
+                    &mut waiting,
+                    &nugget,
+                    &feedback,
+                )?
             };
             let Some((name, text)) = next else {
-                done = true;
+                // Nobody has more for this batch. With a proposer only
+                // waiting, the batch is evaluated and it is asked again; an
+                // empty batch ends the run below.
+                if exhausted.iter().all(|finished| *finished) {
+                    done = true;
+                }
                 break;
             };
             let in_batch = batch.iter().any(|(_, other)| *other == text);
@@ -477,30 +495,32 @@ fn push_recent(recent: &mut Vec<(String, Verdict)>, candidate: &str, verdict: &V
     }
 }
 
+/// The next candidate in round-robin order, skipping proposers that are
+/// `exhausted` (finished for the run) or `waiting` (said
+/// [`Proposal::Later`] in this batch). None when no proposer has one now.
 fn next_candidate(
     proposers: &mut [&mut dyn Proposer],
     cursor: &mut usize,
     exhausted: &mut [bool],
+    waiting: &mut [bool],
     nugget: &Nugget,
     feedback: &Feedback,
 ) -> Result<Option<(String, String)>> {
     let len = proposers.len();
-    if len == 0 || exhausted.iter().all(|done| *done) {
-        return Ok(None);
-    }
     for _ in 0..len {
         if *cursor >= len {
             *cursor = 0;
         }
         let index = *cursor;
         *cursor += 1;
-        if exhausted[index] {
+        if exhausted[index] || waiting[index] {
             continue;
         }
         let name = proposers[index].name().to_string();
         match proposers[index].next(nugget, feedback)? {
-            Some(text) => return Ok(Some((name, text))),
-            None => exhausted[index] = true,
+            Proposal::Candidate(text) => return Ok(Some((name, text))),
+            Proposal::Later => waiting[index] = true,
+            Proposal::Finished => exhausted[index] = true,
         }
     }
     Ok(None)
@@ -681,7 +701,7 @@ mod tests {
     use super::*;
     use crate::nugget::{Case, Objective};
     use crate::pipeline::{Diagnostic, Gate, Ms, Status, Verdict};
-    use crate::proposer::{Feedback, Proposer};
+    use crate::proposer::{Feedback, Proposal, Proposer};
 
     fn verdict(status: Status, score: Option<f64>) -> Verdict {
         Verdict {
@@ -932,11 +952,11 @@ mod tests {
             self.label
         }
 
-        fn next(&mut self, _nugget: &Nugget, _feedback: &Feedback) -> Result<Option<String>> {
+        fn next(&mut self, _nugget: &Nugget, _feedback: &Feedback) -> Result<Proposal> {
             if self.left.is_empty() {
-                Ok(None)
+                Ok(Proposal::Finished)
             } else {
-                Ok(Some(self.left.remove(0)))
+                Ok(Proposal::Candidate(self.left.remove(0)))
             }
         }
     }
@@ -960,8 +980,17 @@ mod tests {
         let mut proposers: Vec<&mut dyn Proposer> = vec![&mut first, &mut second];
         let mut cursor = 0usize;
         let mut exhausted = vec![false; 2];
+        let mut waiting = vec![false; 2];
         let mut pull = |proposers: &mut [&mut dyn Proposer]| {
-            next_candidate(proposers, &mut cursor, &mut exhausted, &nugget, &feedback).unwrap()
+            next_candidate(
+                proposers,
+                &mut cursor,
+                &mut exhausted,
+                &mut waiting,
+                &nugget,
+                &feedback,
+            )
+            .unwrap()
         };
         assert_eq!(
             pull(&mut proposers).unwrap(),
@@ -1105,7 +1134,7 @@ mod tests {
             "same"
         }
 
-        fn next(&mut self, _nugget: &Nugget, feedback: &Feedback) -> Result<Option<String>> {
+        fn next(&mut self, _nugget: &Nugget, feedback: &Feedback) -> Result<Proposal> {
             self.calls += 1;
             if self.calls == 3 {
                 self.third_saw_own = feedback
@@ -1113,7 +1142,9 @@ mod tests {
                     .iter()
                     .any(|(text, _)| text.contains("std::fs"));
             }
-            Ok(Some("    std::fs::read(\"a\");\n".to_string()))
+            Ok(Proposal::Candidate(
+                "    std::fs::read(\"a\");\n".to_string(),
+            ))
         }
     }
 
@@ -1146,5 +1177,100 @@ mod tests {
         .unwrap();
         assert!(same.third_saw_own, "calls {}", same.calls);
         assert!(same.calls < 60, "calls {}", same.calls);
+    }
+
+    /// Gives one region, then says `Later` on every call.
+    struct OnceThenLater {
+        calls: usize,
+    }
+
+    impl Proposer for OnceThenLater {
+        fn name(&self) -> &str {
+            "later"
+        }
+
+        fn next(&mut self, _nugget: &Nugget, _feedback: &Feedback) -> Result<Proposal> {
+            self.calls += 1;
+            if self.calls == 1 {
+                Ok(Proposal::Candidate(
+                    "    std::fs::read(\"a\");\n".to_string(),
+                ))
+            } else {
+                Ok(Proposal::Later)
+            }
+        }
+    }
+
+    #[test]
+    fn later_is_asked_again_after_the_batch_and_an_empty_batch_ends_the_run() {
+        let nugget = nugget(Objective::PassAll);
+        let feedback = Feedback {
+            best: None,
+            last: None,
+            recent: &[],
+        };
+        let mut waiter = OnceThenLater { calls: 1 };
+        let mut list = List {
+            label: "list",
+            left: vec!["a".to_string(), "b".to_string()],
+        };
+        let mut proposers: Vec<&mut dyn Proposer> = vec![&mut waiter, &mut list];
+        let mut cursor = 0usize;
+        let mut exhausted = vec![false; 2];
+        let mut waiting = vec![false; 2];
+        let mut pull = |proposers: &mut [&mut dyn Proposer], waiting: &mut [bool]| {
+            next_candidate(
+                proposers,
+                &mut cursor,
+                &mut exhausted,
+                waiting,
+                &nugget,
+                &feedback,
+            )
+            .unwrap()
+        };
+        // The waiter says Later and is skipped for the rest of the batch.
+        assert_eq!(
+            pull(&mut proposers, &mut waiting),
+            Some(("list".to_string(), "a".to_string()))
+        );
+        assert_eq!(
+            pull(&mut proposers, &mut waiting),
+            Some(("list".to_string(), "b".to_string()))
+        );
+        assert_eq!(pull(&mut proposers, &mut waiting), None);
+        assert_eq!(waiting, vec![true, false]);
+        // A new batch asks the waiter again.
+        let mut waiting = vec![false; 2];
+        assert_eq!(pull(&mut proposers, &mut waiting), None);
+        drop(proposers);
+        assert_eq!(waiter.calls, 3);
+
+        let out =
+            std::env::temp_dir().join(format!("crab-cage-run-later-end-{}", std::process::id()));
+        if out.exists() {
+            fs::remove_dir_all(&out).unwrap();
+        }
+        fs::create_dir_all(&out).unwrap();
+        let mut waiter = OnceThenLater { calls: 0 };
+        let mut proposers: Vec<&mut dyn Proposer> = vec![&mut waiter];
+        execute(
+            &RunOptions {
+                nugget_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("nuggets")
+                    .join("sum-squares"),
+                budget: 20,
+                jobs: 3,
+                out_dir: out.clone(),
+                lust_bin: None,
+                lust_daemon: false,
+            },
+            &mut proposers,
+        )
+        .unwrap();
+        // Seed, the one region, then a batch where the only proposer waits.
+        assert_eq!(waiter.calls, 3);
+        let journal = fs::read_to_string(out.join("journal.jsonl")).unwrap();
+        assert_eq!(journal.lines().count(), 2, "{journal}");
     }
 }

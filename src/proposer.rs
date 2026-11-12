@@ -40,11 +40,37 @@ pub struct Feedback<'a> {
     pub recent: &'a [(&'a str, &'a Verdict)],
 }
 
+/// What a [`Proposer`] has for the batch being gathered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Proposal {
+    /// A candidate region.
+    Candidate(String),
+    /// Nothing more until the candidates already proposed have verdicts.
+    /// The run stops asking this proposer for the current batch and asks
+    /// again after the batch settles.
+    Later,
+    /// Nothing more for the rest of the run.
+    Finished,
+}
+
+impl Proposal {
+    /// The candidate text, or None for [`Proposal::Later`] and
+    /// [`Proposal::Finished`].
+    pub fn into_text(self) -> Option<String> {
+        match self {
+            Proposal::Candidate(text) => Some(text),
+            Proposal::Later | Proposal::Finished => None,
+        }
+    }
+}
+
 /// A source of candidate region text.
 pub trait Proposer {
     fn name(&self) -> &str;
-    /// The next candidate text, or None when this proposer has nothing more.
-    fn next(&mut self, nugget: &Nugget, feedback: &Feedback) -> Result<Option<String>>;
+    /// The next candidate text; [`Proposal::Later`] when nothing more can come
+    /// before the pending candidates settle; [`Proposal::Finished`] when this
+    /// proposer has nothing more for the run.
+    fn next(&mut self, nugget: &Nugget, feedback: &Feedback) -> Result<Proposal>;
 }
 
 /// Yields the text of each top-level `*.rs` file in `dir` once, in name order.
@@ -67,7 +93,7 @@ impl Proposer for FolderProposer {
         "folder"
     }
 
-    fn next(&mut self, _nugget: &Nugget, _feedback: &Feedback) -> Result<Option<String>> {
+    fn next(&mut self, _nugget: &Nugget, _feedback: &Feedback) -> Result<Proposal> {
         let mut names = Vec::new();
         let entries = fs::read_dir(&self.dir)
             .map_err(|error| err(format!("{}: {error}", self.dir.display())))?;
@@ -87,12 +113,12 @@ impl Proposer for FolderProposer {
         }
         names.sort();
         let Some(name) = names.into_iter().next() else {
-            return Ok(None);
+            return Ok(Proposal::Finished);
         };
         let path = self.dir.join(&name);
         let text = read_candidate(&path)?;
         self.yielded.insert(name);
-        Ok(Some(text))
+        Ok(Proposal::Candidate(text))
     }
 }
 
@@ -133,14 +159,14 @@ impl Proposer for LiteralProposer {
         "tweak"
     }
 
-    fn next(&mut self, nugget: &Nugget, feedback: &Feedback) -> Result<Option<String>> {
+    fn next(&mut self, nugget: &Nugget, feedback: &Feedback) -> Result<Proposal> {
         let text = match feedback.best {
             Some((best, _)) => best,
             None => nugget.seed.as_str(),
         };
         let literals = find_literals(text);
         if literals.is_empty() {
-            return Ok(None);
+            return Ok(Proposal::Finished);
         }
         let index = self.rng.gen_index(literals.len());
         let Literal { start, end, kind } = literals[index];
@@ -148,7 +174,12 @@ impl Proposer for LiteralProposer {
             LiteralKind::Int(value) => tweak_int(&mut self.rng, value),
             LiteralKind::Float(value) => tweak_float(&mut self.rng, value, &text[start..end]),
         };
-        Ok(Some(replace_span(text, start, end, &replacement)))
+        Ok(Proposal::Candidate(replace_span(
+            text,
+            start,
+            end,
+            &replacement,
+        )))
     }
 }
 
@@ -357,15 +388,24 @@ You rewrite one marked region of a Rust program. Your reply replaces every line 
 /// The capability summary is fixed at construction (empty when lust is
 /// absent). A reply that still contains a region marker, or an empty reply,
 /// or a chat error, is not returned to the run. Three of those in a row
-/// finish the proposer. `run::execute` treats `Err` from [`Proposer::next`]
-/// as fatal and this package does not change that loop, so the failure stays
-/// here and `next` returns [`None`](Option::None) after printing the reason.
+/// finish the proposer ([`Proposal::Finished`]) when no region it proposed
+/// is still awaiting a verdict; with one awaiting, `next` returns
+/// [`Proposal::Later`] instead, because the next prompt will carry that
+/// verdict. `run::execute` treats `Err` from [`Proposer::next`] as fatal, so
+/// the failure stays here and is printed when the proposer finishes.
 ///
 /// A reply whose [`candidate_hash`] matches a region already proposed — one of
 /// the last [`TRIED_LIMIT`] with an outcome, or one still awaiting its
 /// verdict — is not returned. The same prompt is asked once more at
 /// temperature [`REPEAT_TEMPERATURE`]. A second repeat counts as a proposal
-/// error.
+/// error, and when a region is awaiting its verdict it also ends this batch
+/// with [`Proposal::Later`]: with `--jobs` above 1 the model cannot write a
+/// second, different region from the same prompt.
+///
+/// A region still awaiting a verdict after one [`Proposal::Later`] was never
+/// evaluated (the journal already had it, or its evaluation failed). It
+/// moves to the "already tried" list, so it does not hold the proposer in
+/// `Later` for the rest of the run.
 pub struct ModelProposer {
     endpoint: String,
     model: String,
@@ -395,9 +435,9 @@ impl Proposer for ModelProposer {
         "local"
     }
 
-    fn next(&mut self, nugget: &Nugget, feedback: &Feedback) -> Result<Option<String>> {
+    fn next(&mut self, nugget: &Nugget, feedback: &Feedback) -> Result<Proposal> {
         if self.memory.stopped.is_some() {
-            return Ok(None);
+            return Ok(Proposal::Finished);
         }
         let (system, user) = prepare_prompt(&mut self.memory, &self.capabilities, nugget, feedback);
         let endpoint = self.endpoint.clone();
@@ -407,8 +447,9 @@ impl Proposer for ModelProposer {
             let temperature = self.memory.next_temperature;
             let raw = llm::chat(&endpoint, &model, &system, &user, timeout, temperature);
             match self.memory.consume(raw) {
-                Step::Return(text) => return Ok(Some(text)),
-                Step::Stop => return Ok(None),
+                Step::Return(text) => return Ok(Proposal::Candidate(text)),
+                Step::Later => return Ok(Proposal::Later),
+                Step::Stop => return Ok(Proposal::Finished),
                 Step::AskAgain => {}
             }
         }
@@ -451,22 +492,23 @@ impl Proposer for MockModelProposer {
         "mock"
     }
 
-    fn next(&mut self, nugget: &Nugget, feedback: &Feedback) -> Result<Option<String>> {
+    fn next(&mut self, nugget: &Nugget, feedback: &Feedback) -> Result<Proposal> {
         if self.memory.stopped.is_some() || self.replies.is_empty() {
-            return Ok(None);
+            return Ok(Proposal::Finished);
         }
         let (system, user) = prepare_prompt(&mut self.memory, &self.capabilities, nugget, feedback);
         self.prompts.push(Asked { system, user });
         loop {
             if self.replies.is_empty() {
-                return Ok(None);
+                return Ok(Proposal::Finished);
             }
             let temperature = self.memory.next_temperature;
             self.asked_temperatures.push(temperature);
             let raw = Ok(self.replies.remove(0));
             match self.memory.consume(raw) {
-                Step::Return(text) => return Ok(Some(text)),
-                Step::Stop => return Ok(None),
+                Step::Return(text) => return Ok(Proposal::Candidate(text)),
+                Step::Later => return Ok(Proposal::Later),
+                Step::Stop => return Ok(Proposal::Finished),
                 Step::AskAgain => {}
             }
         }
@@ -477,8 +519,7 @@ struct ModelMemory {
     rejected_in_a_row: usize,
     errors_in_a_row: usize,
     /// Regions returned and not yet matched to a settled verdict.
-    /// `(hash, text)`, hashed with [`candidate_hash`].
-    pending: Vec<(String, String)>,
+    pending: Vec<Pending>,
     /// Last [`TRIED_LIMIT`] regions that have an outcome, oldest first.
     tried: Vec<Tried>,
     own: Option<Verdict>,
@@ -494,6 +535,18 @@ struct Tried {
     text: String,
     outcome: String,
 }
+
+struct Pending {
+    /// [`candidate_hash`] of `text`.
+    hash: String,
+    text: String,
+    /// A [`Proposal::Later`] was returned while this region was pending, so
+    /// its batch has settled since.
+    waited: bool,
+}
+
+/// Outcome shown for a pending region that got no verdict in its batch.
+const NOT_EVALUATED: &str = "not evaluated: already in the journal, or its evaluation failed";
 
 impl Default for ModelMemory {
     fn default() -> Self {
@@ -514,29 +567,36 @@ impl ModelMemory {
     fn observe(&mut self, feedback: &Feedback) {
         for &(text, verdict) in feedback.recent {
             let hash = candidate_hash(text);
-            let Some(pos) = self
-                .pending
-                .iter()
-                .position(|(pending, _)| pending == &hash)
-            else {
+            let Some(pos) = self.pending.iter().position(|item| item.hash == hash) else {
                 continue;
             };
-            let (_, region) = self.pending.remove(pos);
-            self.pending.retain(|(pending, _)| pending != &hash);
+            let region = self.pending.remove(pos).text;
+            self.pending.retain(|item| item.hash != hash);
             if verdict.status == Status::Rejected {
                 self.rejected_in_a_row += 1;
             } else {
                 self.rejected_in_a_row = 0;
             }
             self.own = Some(verdict.clone());
-            self.tried.push(Tried {
-                hash,
-                text: region,
-                outcome: outcome_of(verdict),
-            });
-            if self.tried.len() > TRIED_LIMIT {
-                self.tried.remove(0);
-            }
+            self.remember_tried(hash, region, outcome_of(verdict));
+        }
+        // Still pending after its batch settled: never evaluated.
+        let (stale, live): (Vec<Pending>, Vec<Pending>) =
+            self.pending.drain(..).partition(|item| item.waited);
+        self.pending = live;
+        for item in stale {
+            self.remember_tried(item.hash, item.text, NOT_EVALUATED.to_string());
+        }
+    }
+
+    fn remember_tried(&mut self, hash: String, text: String, outcome: String) {
+        self.tried.push(Tried {
+            hash,
+            text,
+            outcome,
+        });
+        if self.tried.len() > TRIED_LIMIT {
+            self.tried.remove(0);
         }
     }
 
@@ -560,7 +620,13 @@ impl ModelMemory {
                         self.retrying = false;
                         self.next_temperature = llm::DEFAULT_TEMPERATURE;
                         let error = err("the local model repeated a region it already tried");
-                        if self.fail(error) {
+                        let stop = self.fail(error);
+                        // The same prompt gives the same region. Wait for
+                        // the pending verdicts, which change the prompt.
+                        if !self.pending.is_empty() {
+                            return self.later();
+                        }
+                        if stop {
                             return Step::Stop;
                         }
                         return Step::AskAgain;
@@ -572,19 +638,35 @@ impl ModelMemory {
                 self.errors_in_a_row = 0;
                 self.retrying = false;
                 self.next_temperature = llm::DEFAULT_TEMPERATURE;
-                self.pending.push((hash, text.clone()));
+                self.pending.push(Pending {
+                    hash,
+                    text: text.clone(),
+                    waited: false,
+                });
                 Step::Return(text)
             }
             Err(error) => {
                 self.retrying = false;
                 self.next_temperature = llm::DEFAULT_TEMPERATURE;
-                if self.fail(error) {
+                let stop = self.fail(error);
+                if self.errors_in_a_row < PROPOSAL_ERROR_LIMIT {
+                    Step::AskAgain
+                } else if stop {
                     Step::Stop
                 } else {
-                    Step::AskAgain
+                    self.later()
                 }
             }
         }
+    }
+
+    /// End this batch for the proposer. Every region pending now gets its
+    /// verdict when the batch settles, or it never will.
+    fn later(&mut self) -> Step {
+        for item in &mut self.pending {
+            item.waited = true;
+        }
+        Step::Later
     }
 
     /// A region already proposed, whether or not its verdict has come back.
@@ -592,12 +674,15 @@ impl ModelMemory {
     /// so a pending region has to count or the same reply is returned again.
     fn is_repeat(&self, hash: &str) -> bool {
         self.tried.iter().any(|item| item.hash == hash)
-            || self.pending.iter().any(|(pending, _)| pending == hash)
+            || self.pending.iter().any(|item| item.hash == hash)
     }
 
+    /// Count one proposal error. True when the limit is reached and nothing
+    /// is pending, which finishes the proposer. With a region pending the
+    /// count stays, and the caller returns [`Step::Later`].
     fn fail(&mut self, error: crate::error::Error) -> bool {
         self.errors_in_a_row += 1;
-        if self.errors_in_a_row >= PROPOSAL_ERROR_LIMIT {
+        if self.errors_in_a_row >= PROPOSAL_ERROR_LIMIT && self.pending.is_empty() {
             let line = format!(
                 "local proposer finished: {PROPOSAL_ERROR_LIMIT} proposal errors in a row: {}",
                 error.message
@@ -647,7 +732,7 @@ fn user_prompt(
     own: Option<&Verdict>,
     best_score: Option<f64>,
     tried: &[Tried],
-    pending: &[(String, String)],
+    pending: &[Pending],
 ) -> String {
     let mut out = nugget.splice(base);
     if !out.ends_with('\n') {
@@ -729,7 +814,7 @@ fn append_labeled(out: &mut String, label: &str, text: &str) {
     }
 }
 
-fn append_tried(out: &mut String, tried: &[Tried], pending: &[(String, String)]) {
+fn append_tried(out: &mut String, tried: &[Tried], pending: &[Pending]) {
     if tried.is_empty() && pending.is_empty() {
         return;
     }
@@ -738,8 +823,8 @@ fn append_tried(out: &mut String, tried: &[Tried], pending: &[(String, String)])
     for item in tried {
         append_region_line(out, &item.text, &item.outcome);
     }
-    for (_, text) in pending {
-        append_region_line(out, text, "proposed, awaiting result");
+    for item in pending {
+        append_region_line(out, &item.text, "proposed, awaiting result");
     }
 }
 
@@ -834,6 +919,8 @@ fn region_text(raw: &str) -> String {
 enum Step {
     Return(String),
     AskAgain,
+    /// Nothing new before the pending regions settle.
+    Later,
     Stop,
 }
 
@@ -887,29 +974,55 @@ mod tests {
         let mut proposer = FolderProposer::new(&dir);
         assert_eq!(proposer.name(), "folder");
         assert_eq!(
-            proposer.next(&nugget, &feedback).unwrap().as_deref(),
+            proposer
+                .next(&nugget, &feedback)
+                .unwrap()
+                .into_text()
+                .as_deref(),
             Some("ten\n")
         );
         assert_eq!(
-            proposer.next(&nugget, &feedback).unwrap().as_deref(),
+            proposer
+                .next(&nugget, &feedback)
+                .unwrap()
+                .into_text()
+                .as_deref(),
             Some("two\n")
         );
         assert_eq!(
-            proposer.next(&nugget, &feedback).unwrap().as_deref(),
+            proposer
+                .next(&nugget, &feedback)
+                .unwrap()
+                .into_text()
+                .as_deref(),
             Some("a\n")
         );
         assert_eq!(
-            proposer.next(&nugget, &feedback).unwrap().as_deref(),
+            proposer
+                .next(&nugget, &feedback)
+                .unwrap()
+                .into_text()
+                .as_deref(),
             Some("b\n")
         );
-        assert_eq!(proposer.next(&nugget, &feedback).unwrap(), None);
+        assert_eq!(
+            proposer.next(&nugget, &feedback).unwrap(),
+            Proposal::Finished
+        );
 
         fs::write(dir.join("c.rs"), "c\n").unwrap();
         assert_eq!(
-            proposer.next(&nugget, &feedback).unwrap().as_deref(),
+            proposer
+                .next(&nugget, &feedback)
+                .unwrap()
+                .into_text()
+                .as_deref(),
             Some("c\n")
         );
-        assert_eq!(proposer.next(&nugget, &feedback).unwrap(), None);
+        assert_eq!(
+            proposer.next(&nugget, &feedback).unwrap(),
+            Proposal::Finished
+        );
     }
 
     #[test]
@@ -963,7 +1076,11 @@ mod tests {
         };
         let mut proposer = LiteralProposer::new(1);
         assert_eq!(proposer.name(), "tweak");
-        let got = proposer.next(&nugget, &feedback).unwrap().unwrap();
+        let got = proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
 
         let spans = find_literals(source);
         assert_eq!(spans.len(), 1, "the 7 in the comment is not a literal");
@@ -986,7 +1103,11 @@ mod tests {
         let source = "let k = 0.0;";
         let nugget = nugget_with_seed(source);
         let mut proposer = LiteralProposer::new(1);
-        let got = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let got = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
 
         let spans = find_literals(source);
         assert_eq!(spans.len(), 1);
@@ -1013,8 +1134,14 @@ mod tests {
         let nugget = nugget_with_seed(source);
         let feedback = quiet();
         let mut proposer = LiteralProposer::new(1);
-        assert_eq!(proposer.next(&nugget, &feedback).unwrap(), None);
-        assert_eq!(proposer.next(&nugget, &feedback).unwrap(), None);
+        assert_eq!(
+            proposer.next(&nugget, &feedback).unwrap(),
+            Proposal::Finished
+        );
+        assert_eq!(
+            proposer.next(&nugget, &feedback).unwrap(),
+            Proposal::Finished
+        );
     }
 
     #[test]
@@ -1030,7 +1157,9 @@ mod tests {
             from_second.push(second.next(&nugget, &feedback).unwrap());
         }
         assert_eq!(from_first, from_second);
-        assert!(from_first.iter().all(|item| item.is_some()));
+        assert!(from_first
+            .iter()
+            .all(|item| matches!(item, Proposal::Candidate(_))));
 
         let mut other = LiteralProposer::new(12);
         let mut from_other = Vec::new();
@@ -1052,7 +1181,11 @@ mod tests {
 
         let nugget = nugget_with_seed("let n = 5;");
         let mut proposer = LiteralProposer::new(1);
-        let got = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let got = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         let mut rng = Pcg64::new(1, TWEAK_STREAM);
         let _ = rng.gen_index(1);
         let choices = integer_choices(5);
@@ -1142,7 +1275,11 @@ mod tests {
             vec!["let a = 1;\n".to_string(), "let b = 2;\n".to_string()],
             "no unsafe",
         );
-        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let first = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         assert_eq!(first, "let a = 1;");
         assert!(proposer.prompts[0].user.contains("SEED_REGION"));
         assert!(proposer.prompts[0].user.contains("Objective: pass_all."));
@@ -1164,7 +1301,11 @@ mod tests {
             last: Some((first.as_str(), &verdict)),
             recent: &recent,
         };
-        let second = proposer.next(&nugget, &feedback).unwrap().unwrap();
+        let second = proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
         assert_eq!(second, "let b = 2;");
         let prompt = &proposer.prompts[1].user;
         assert!(prompt.contains("L0110"), "{prompt}");
@@ -1181,7 +1322,11 @@ mod tests {
         let nugget = region_nugget(nugget::Objective::Minimize);
         let mut proposer =
             MockModelProposer::new(vec!["one\n".to_string(), "two\n".to_string()], "");
-        proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         let verdict = rejected("L0999", 8, "");
         let recent = [("not-ours\n", &verdict)];
         let feedback = Feedback {
@@ -1189,7 +1334,11 @@ mod tests {
             last: Some(("not-ours\n", &verdict)),
             recent: &recent,
         };
-        proposer.next(&nugget, &feedback).unwrap().unwrap();
+        proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
         let prompt = &proposer.prompts[1].user;
         assert!(!prompt.contains("L0999"), "{prompt}");
         assert!(prompt.contains("BEST_REGION"), "{prompt}");
@@ -1206,7 +1355,11 @@ mod tests {
         let nugget = region_nugget(nugget::Objective::PassAll);
         let mut proposer =
             MockModelProposer::new(vec!["one\n".to_string(), "two\n".to_string()], "");
-        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let first = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         let verdict = rejected("", 0, "lust check failed");
         let recent = [(first.as_str(), &verdict)];
         let feedback = Feedback {
@@ -1214,7 +1367,11 @@ mod tests {
             last: Some((first.as_str(), &verdict)),
             recent: &recent,
         };
-        proposer.next(&nugget, &feedback).unwrap().unwrap();
+        proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
         assert!(proposer.prompts[1].user.contains("lust check failed"));
     }
 
@@ -1223,7 +1380,11 @@ mod tests {
         let nugget = region_nugget(nugget::Objective::PassAll);
         let replies = (0..4).map(|i| format!("body {i}\n")).collect();
         let mut proposer = MockModelProposer::new(replies, "");
-        let mut previous = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let mut previous = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         let verdict = rejected("L0110", 1, "");
         for round in 0..3 {
             previous = {
@@ -1233,7 +1394,11 @@ mod tests {
                     last: Some((previous.as_str(), &verdict)),
                     recent: &recent,
                 };
-                proposer.next(&nugget, &feedback).unwrap().unwrap()
+                proposer
+                    .next(&nugget, &feedback)
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
             };
             let prompt = &proposer.prompts.last().unwrap().user;
             if round < 2 {
@@ -1254,7 +1419,11 @@ mod tests {
             "",
         );
         assert_eq!(
-            fenced.next(&nugget, &quiet()).unwrap().as_deref(),
+            fenced
+                .next(&nugget, &quiet())
+                .unwrap()
+                .into_text()
+                .as_deref(),
             Some("    xs.iter().map(|x| x * x).sum()")
         );
 
@@ -1266,7 +1435,11 @@ mod tests {
             "",
         );
         assert_eq!(
-            retried.next(&nugget, &quiet()).unwrap().as_deref(),
+            retried
+                .next(&nugget, &quiet())
+                .unwrap()
+                .into_text()
+                .as_deref(),
             Some("let n = 1;")
         );
         assert!(retried.memory.stopped.is_none());
@@ -1281,7 +1454,10 @@ mod tests {
             ],
             "",
         );
-        assert_eq!(proposer.next(&nugget, &quiet()).unwrap(), None);
+        assert_eq!(
+            proposer.next(&nugget, &quiet()).unwrap(),
+            Proposal::Finished
+        );
         let reason = proposer.memory.stopped.clone().unwrap();
         assert!(reason.contains("3 proposal errors in a row"), "{reason}");
         assert!(
@@ -1289,7 +1465,10 @@ mod tests {
             "{reason}"
         );
         assert_eq!(proposer.replies, vec!["unused\n".to_string()]);
-        assert_eq!(proposer.next(&nugget, &quiet()).unwrap(), None);
+        assert_eq!(
+            proposer.next(&nugget, &quiet()).unwrap(),
+            Proposal::Finished
+        );
         assert_eq!(proposer.replies, vec!["unused\n".to_string()]);
     }
 
@@ -1298,7 +1477,11 @@ mod tests {
         let nugget = region_nugget(nugget::Objective::PassAll);
         let mut proposer =
             MockModelProposer::new(vec!["one\n".to_string(), "two\n".to_string()], "");
-        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let first = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         let mut verdict = rejected("D0", 1, "");
         verdict.diagnostics = (0..11)
             .map(|index| Diagnostic {
@@ -1315,7 +1498,11 @@ mod tests {
             last: Some((first.as_str(), &verdict)),
             recent: &recent,
         };
-        proposer.next(&nugget, &feedback).unwrap().unwrap();
+        proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
         let prompt = &proposer.prompts[1].user;
         assert!(prompt.contains("D0"), "{prompt}");
         assert!(prompt.contains("D9"), "{prompt}");
@@ -1333,7 +1520,11 @@ mod tests {
             ],
             "",
         );
-        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let first = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         assert_eq!(first, "same region");
         assert_eq!(proposer.asked_temperatures, vec![0.2]);
 
@@ -1344,7 +1535,11 @@ mod tests {
             last: None,
             recent: &recent,
         };
-        let second = proposer.next(&nugget, &feedback).unwrap().unwrap();
+        let second = proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
         assert_eq!(second, "fresh region");
         assert_ne!(second, first);
         assert_eq!(proposer.asked_temperatures, vec![0.2, 0.2, 0.8]);
@@ -1357,14 +1552,14 @@ mod tests {
             ],
             "",
         );
-        let once = stuck.next(&nugget, &quiet()).unwrap().unwrap();
+        let once = stuck.next(&nugget, &quiet()).unwrap().into_text().unwrap();
         let recent = [(once.as_str(), &verdict)];
         let feedback = Feedback {
             best: None,
             last: None,
             recent: &recent,
         };
-        assert_eq!(stuck.next(&nugget, &feedback).unwrap(), None);
+        assert_eq!(stuck.next(&nugget, &feedback).unwrap(), Proposal::Finished);
         assert_eq!(stuck.memory.errors_in_a_row, 1);
         assert!(stuck.memory.stopped.is_none());
         assert!(stuck.replies.is_empty());
@@ -1381,7 +1576,11 @@ mod tests {
             ],
             "",
         );
-        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let first = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         let rejected_verdict = rejected("L0110", 4, "SECRET_NOTE");
         let recent = [(first.as_str(), &rejected_verdict)];
         let feedback = Feedback {
@@ -1389,7 +1588,11 @@ mod tests {
             last: None,
             recent: &recent,
         };
-        let second = proposer.next(&nugget, &feedback).unwrap().unwrap();
+        let second = proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
 
         let scored_verdict = scored(1, 3, 2.0, None);
         let recent = [
@@ -1401,7 +1604,11 @@ mod tests {
             last: None,
             recent: &recent,
         };
-        proposer.next(&nugget, &feedback).unwrap().unwrap();
+        proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
         let prompt = &proposer.prompts[2].user;
         assert!(prompt.contains("Already tried, do not repeat:"), "{prompt}");
         let one = prompt.find("region one").expect("region one");
@@ -1421,7 +1628,11 @@ mod tests {
         let nugget = region_nugget(nugget::Objective::PassAll);
         let mut proposer =
             MockModelProposer::new(vec!["body one\n".to_string(), "body two\n".to_string()], "");
-        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let first = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         let verdict = scored(
             1,
             4,
@@ -1439,7 +1650,11 @@ mod tests {
             last: None,
             recent: &recent,
         };
-        proposer.next(&nugget, &feedback).unwrap().unwrap();
+        proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
         let prompt = &proposer.prompts[1].user;
         let line = "Your last region ran and failed 3 of 4 cases. The best so far has score 4.";
         let at = prompt.find(line).unwrap_or_else(|| panic!("{prompt}"));
@@ -1459,7 +1674,11 @@ mod tests {
             vec!["our region\n".to_string(), "next region\n".to_string()],
             "",
         );
-        let ours = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let ours = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         let early = rejected("EARLY_CODE", 1, "early note");
         let late = rejected("LATE_CODE", 2, "late note");
         let scored_verdict = scored(
@@ -1483,7 +1702,11 @@ mod tests {
             last: Some(("someone-late\n", &late)),
             recent: &recent,
         };
-        proposer.next(&nugget, &feedback).unwrap().unwrap();
+        proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
         let prompt = &proposer.prompts[1].user;
         assert!(
             prompt.contains(
@@ -1504,7 +1727,11 @@ mod tests {
         let long = "R".repeat(450);
         let mut proposer =
             MockModelProposer::new(vec![format!("{long}\n"), "other\n".to_string()], "");
-        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let first = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         assert_eq!(first.chars().count(), 450);
         let verdict = rejected("L0110", 1, "");
         let recent = [(first.as_str(), &verdict)];
@@ -1513,7 +1740,11 @@ mod tests {
             last: None,
             recent: &recent,
         };
-        proposer.next(&nugget, &feedback).unwrap().unwrap();
+        proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
         let prompt = &proposer.prompts[1].user;
         assert!(prompt.contains(&"R".repeat(400)), "{prompt}");
         assert!(!prompt.contains(&"R".repeat(401)), "{prompt}");
@@ -1529,7 +1760,11 @@ mod tests {
         let replies: Vec<String> = (0..10).map(|index| format!("region {index}\n")).collect();
         let mut proposer = MockModelProposer::new(replies, "");
         let verdict = rejected("", 0, "nope");
-        let mut previous = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let mut previous = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         let mut history = Vec::new();
         for _ in 0..9 {
             history.push((previous.clone(), verdict.clone()));
@@ -1543,7 +1778,11 @@ mod tests {
                     last: None,
                     recent: &view,
                 };
-                proposer.next(&nugget, &feedback).unwrap().unwrap()
+                proposer
+                    .next(&nugget, &feedback)
+                    .unwrap()
+                    .into_text()
+                    .unwrap()
             };
         }
         let prompt = &proposer.prompts.last().unwrap().user;
@@ -1558,16 +1797,157 @@ mod tests {
         let nugget = region_nugget(nugget::Objective::PassAll);
         let region = "    let total: i64 = \"no\";\n    total\n";
         let mut proposer = MockModelProposer::new(vec![region.to_string(); 8], "");
-        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let first = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         assert_eq!(first, "    let total: i64 = \"no\";\n    total");
-        assert_eq!(proposer.next(&nugget, &quiet()).unwrap(), None);
-        assert!(proposer.memory.stopped.is_some());
-        assert_eq!(proposer.replies.len(), 1);
-        assert!(proposer.asked_temperatures.contains(&0.8));
+        // The repeat and its hotter retry, then wait for the verdict: the
+        // proposer is not finished.
+        assert_eq!(proposer.next(&nugget, &quiet()).unwrap(), Proposal::Later);
+        assert!(proposer.memory.stopped.is_none());
+        assert_eq!(proposer.replies.len(), 5);
+        assert_eq!(proposer.asked_temperatures, vec![0.2, 0.2, 0.8]);
         let prompt = &proposer.prompts[1].user;
         assert!(prompt.contains("proposed, awaiting result"), "{prompt}");
         assert!(prompt.contains("    let total: i64 = \"no\";"), "{prompt}");
         assert!(prompt.contains("\n    total\n"), "{prompt}");
+
+        // The batch settled without a verdict for it: it was never
+        // evaluated. It is tried now, not pending, and repeats of it count
+        // to the limit with nothing pending, so the proposer finishes.
+        assert_eq!(
+            proposer.next(&nugget, &quiet()).unwrap(),
+            Proposal::Finished
+        );
+        let prompt = &proposer.prompts[2].user;
+        assert!(!prompt.contains("proposed, awaiting result"), "{prompt}");
+        assert!(prompt.contains(NOT_EVALUATED), "{prompt}");
+        assert!(proposer.memory.pending.is_empty());
+        let reason = proposer.memory.stopped.clone().unwrap();
+        assert!(reason.contains("3 proposal errors in a row"), "{reason}");
+        assert_eq!(proposer.replies.len(), 1);
+    }
+
+    #[test]
+    fn errors_with_a_region_pending_wait_and_without_one_finish() {
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let mut proposer = MockModelProposer::new(
+            vec![
+                "first\n".to_string(),
+                "   \n".to_string(),
+                "\n".to_string(),
+                " \n".to_string(),
+                "second\n".to_string(),
+            ],
+            "",
+        );
+        assert_eq!(
+            proposer.next(&nugget, &quiet()).unwrap(),
+            Proposal::Candidate("first".to_string())
+        );
+        // Three empty replies with `first` awaiting its verdict.
+        assert_eq!(proposer.next(&nugget, &quiet()).unwrap(), Proposal::Later);
+        assert!(proposer.memory.stopped.is_none());
+        let verdict = rejected("L0110", 1, "");
+        let recent = [("first", &verdict)];
+        let feedback = Feedback {
+            best: None,
+            last: None,
+            recent: &recent,
+        };
+        assert_eq!(
+            proposer.next(&nugget, &feedback).unwrap(),
+            Proposal::Candidate("second".to_string())
+        );
+        assert_eq!(proposer.memory.errors_in_a_row, 0);
+
+        let mut lonely = MockModelProposer::new(
+            vec!["   \n".to_string(), "\n".to_string(), " \n".to_string()],
+            "",
+        );
+        assert_eq!(lonely.next(&nugget, &quiet()).unwrap(), Proposal::Finished);
+        assert!(lonely.memory.stopped.is_some());
+    }
+
+    /// Answers like a model at low temperature: the same prompt state gives
+    /// the same region. Region `k` is the reply once `k` verdicts are back.
+    struct OnePerVerdict {
+        regions: Vec<String>,
+        memory: ModelMemory,
+        asks: usize,
+    }
+
+    impl Proposer for OnePerVerdict {
+        fn name(&self) -> &str {
+            "one-per-verdict"
+        }
+
+        fn next(&mut self, nugget: &Nugget, feedback: &Feedback) -> Result<Proposal> {
+            if self.memory.stopped.is_some() {
+                return Ok(Proposal::Finished);
+            }
+            let _ = prepare_prompt(&mut self.memory, "", nugget, feedback);
+            loop {
+                self.asks += 1;
+                let index = self.memory.tried.len().min(self.regions.len() - 1);
+                match self.memory.consume(Ok(self.regions[index].clone())) {
+                    Step::Return(text) => return Ok(Proposal::Candidate(text)),
+                    Step::Later => return Ok(Proposal::Later),
+                    Step::Stop => return Ok(Proposal::Finished),
+                    Step::AskAgain => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn later_with_three_jobs_keeps_the_model_for_the_next_batch() {
+        let out = std::env::temp_dir().join(format!(
+            "crab-cage-proposer-jobs-later-{}",
+            std::process::id()
+        ));
+        if out.exists() {
+            fs::remove_dir_all(&out).unwrap();
+        }
+        fs::create_dir_all(&out).unwrap();
+        let mut model = OnePerVerdict {
+            regions: (0..4)
+                .map(|index| format!("    std::fs::read(\"{index}\");\n"))
+                .collect(),
+            memory: ModelMemory::default(),
+            asks: 0,
+        };
+        let mut proposers: Vec<&mut dyn crate::proposer::Proposer> = vec![&mut model];
+        crate::run::execute(
+            &crate::run::RunOptions {
+                nugget_dir: PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+                    .join("nuggets")
+                    .join("sum-squares"),
+                budget: 5,
+                jobs: 3,
+                out_dir: out.clone(),
+                lust_bin: None,
+                lust_daemon: false,
+            },
+            &mut proposers,
+        )
+        .unwrap();
+        // Before `Later`, the second ask of the first batch repeated the
+        // pending region three times and the proposer was finished for the
+        // run, leaving the seed and one candidate.
+        assert!(model.memory.stopped.is_none());
+        let journal = fs::read_to_string(out.join("journal.jsonl")).unwrap();
+        assert_eq!(journal.lines().count(), 5, "{journal}");
+        for index in 0..4 {
+            assert!(
+                journal.contains(&candidate_hash(&format!("    std::fs::read(\"{index}\");"))),
+                "region {index}: {journal}"
+            );
+        }
+        // One new region and one repeat with its retry per batch.
+        assert!(model.asks <= 12, "asked {}", model.asks);
     }
 
     #[test]
@@ -1614,7 +1994,11 @@ mod tests {
         let nugget = region_nugget(nugget::Objective::PassAll);
         let mut proposer =
             MockModelProposer::new(vec!["body\n".to_string(), "next\n".to_string()], "");
-        let first = proposer.next(&nugget, &quiet()).unwrap().unwrap();
+        let first = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
         let mut verdict = scored(
             2,
             3,
@@ -1634,7 +2018,11 @@ mod tests {
             last: None,
             recent: &recent,
         };
-        proposer.next(&nugget, &feedback).unwrap().unwrap();
+        proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
         let prompt = &proposer.prompts[1].user;
         assert!(
             prompt.contains(
