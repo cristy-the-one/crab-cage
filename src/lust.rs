@@ -237,6 +237,10 @@ pub fn fix(tool: &LustTool, source: &Path, timeout: Duration) -> Result<ExecResu
     )
 }
 
+/// `lust build --sandbox`. With `opt`, also `--opt`: the same generated C
+/// compiled by an optimising C compiler (`zig cc`, `cc`, or `LUST_CC`)
+/// instead of tcc. With no such compiler lust fails; see
+/// [`is_no_c_compiler`].
 pub fn build(
     tool: &LustTool,
     source: &Path,
@@ -244,9 +248,13 @@ pub fn build(
     max_memory: u64,
     time_limit: Option<Duration>,
     timeout: Duration,
+    opt: bool,
 ) -> Result<()> {
     let memory = max_memory.to_string();
     let mut args = vec!["build".to_string(), "--sandbox".to_string()];
+    if opt {
+        args.push("--opt".to_string());
+    }
     if tool.supports_max_memory {
         args.push("--max-memory".to_string());
         args.push(memory);
@@ -282,6 +290,21 @@ pub fn build(
         )));
     }
     Ok(())
+}
+
+/// Whether a failed `lust build --opt` failed only because no optimising C
+/// compiler was found. lust 0.3.0 on Windows without zig prints
+/// ``no C compiler for target `x86_64-pc-windows-msvc`: install zig (zig cc
+/// cross-compiles it) or set LUST_CC to a cross compiler command``. A plain
+/// `cc` that is missing or not found is matched too.
+pub fn is_no_c_compiler(message: &str) -> bool {
+    let text = message.to_lowercase();
+    text.contains("no c compiler")
+        || text.contains("install zig")
+        || text.contains("zig: not found")
+        || text.contains("`zig` not found")
+        || text.contains("cc: not found")
+        || text.contains("`cc` not found")
 }
 
 /// Why rustc did not produce a binary.
@@ -722,6 +745,19 @@ mod tests {
             elapsed: Duration::from_millis(20),
         };
         assert_eq!(classify(&host), RunClass::MemoryHost);
+    }
+
+    #[test]
+    fn the_missing_c_compiler_message_is_recognised() {
+        // lust 0.3.0 on Windows 11 with no zig, no cc and no LUST_CC.
+        assert!(is_no_c_compiler(
+            "lust build failed (Exited(3)): error: no C compiler for target `x86_64-pc-windows-msvc`: install zig (zig cc cross-compiles it) or set LUST_CC to a cross compiler command"
+        ));
+        assert!(is_no_c_compiler("sh: cc: not found"));
+        assert!(!is_no_c_compiler(
+            "lust build failed (Exited(1)): the C compiler failed for target x86_64-pc-windows-msvc:\nfoo.c:1: error"
+        ));
+        assert!(!is_no_c_compiler("error[L0110]: mismatched types"));
     }
 
     #[test]

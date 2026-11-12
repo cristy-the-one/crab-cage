@@ -805,6 +805,298 @@ fn json_string_field(stdout: &str, key: &str) -> String {
     rest[..end].to_string()
 }
 
+fn fast_sum_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("nuggets")
+        .join("fast-sum")
+}
+
+fn fast_sum_reference() -> String {
+    fs::read_to_string(fast_sum_dir().join("reference.rs"))
+        .unwrap()
+        .replace("\r\n", "\n")
+}
+
+/// Timing is noisy on a loaded machine, so this asserts only the order, and
+/// only after the gap is large: the seed does about n * n / 2 steps (5e7 for
+/// the largest case) and the reference does a constant few. A run that is
+/// too close to call is repeated, up to three times, before it fails.
+#[test]
+fn fastest_seed_is_slower_than_the_reference() {
+    let nugget = nugget::load(&fast_sum_dir()).unwrap();
+    assert_eq!(nugget.objective, Objective::Fastest);
+    let reference = fast_sum_reference();
+    let mut last = (0.0, 0.0);
+    for attempt in 0..3 {
+        let seed = evaluate(
+            &nugget,
+            &nugget.seed,
+            &no_lust(),
+            &options(&format!("fast-seed-{attempt}")),
+        )
+        .unwrap();
+        assert_eq!(seed.status, Status::Scored, "{seed:?}");
+        assert_eq!(seed.passed, 3);
+        assert!(seed.note.is_empty(), "{}", seed.note);
+        let fast = evaluate(
+            &nugget,
+            &reference,
+            &no_lust(),
+            &options(&format!("fast-reference-{attempt}")),
+        )
+        .unwrap();
+        assert_eq!(fast.status, Status::Scored, "{fast:?}");
+        assert_eq!(fast.passed, 3);
+        let seed_ms = seed.score.unwrap();
+        let fast_ms = fast.score.unwrap();
+        assert!(seed_ms > 0.0 && seed_ms < 1e9, "seed {seed_ms}");
+        assert!(fast_ms > 0.0 && fast_ms < 1e9, "reference {fast_ms}");
+        assert!(seed.ms.opt > 0, "seed opt ms {}", seed.ms.opt);
+        last = (seed_ms, fast_ms);
+        if fast_ms < seed_ms {
+            return;
+        }
+    }
+    panic!(
+        "the reference ({} ms) was never faster than the seed ({} ms)",
+        last.1, last.0
+    );
+}
+
+#[test]
+fn fastest_wrong_body_scores_at_least_a_billion() {
+    let nugget = nugget::load(&fast_sum_dir()).unwrap();
+    let verdict = evaluate(&nugget, "    n\n", &no_lust(), &options("fast-wrong")).unwrap();
+    assert_eq!(verdict.status, Status::Scored, "{verdict:?}");
+    assert_eq!(verdict.passed, 0);
+    assert_eq!(verdict.score, Some(1e9 + 3.0));
+    assert!(verdict.score.unwrap() >= 1e9);
+    assert_eq!(verdict.ms.opt, 0, "a wrong candidate is not timed");
+    let failure = verdict.failure.expect("the first failing case");
+    assert_eq!(failure.id, "large");
+}
+
+#[test]
+fn fastest_with_the_oracle_and_no_lust_is_proven_with_a_time() {
+    let nugget = nugget::load(&fast_sum_dir()).unwrap();
+    let verdict = evaluate(
+        &nugget,
+        &fast_sum_reference(),
+        &no_lust(),
+        &options_oracle("fast-oracle"),
+    )
+    .unwrap();
+    assert_eq!(verdict.status, Status::Proven, "{verdict:?}");
+    let score = verdict.score.unwrap();
+    assert!(score > 0.0 && score < 1e9, "{score}");
+}
+
+#[test]
+fn an_old_journal_line_without_ms_opt_still_parses() {
+    let line = r#"{"hash":"aaaaaaaaaaaaaaaa","gate":"run","status":"scored","score":1.0,"passed":1,"total":2,"diagnostics":[],"ms":{"check":0,"build":1,"run":2,"oracle":0},"note":""}"#;
+    let verdict: Verdict = serde_json::from_str(line).unwrap();
+    assert_eq!(verdict.ms.opt, 0);
+    assert_eq!(verdict.ms.run, 2);
+    let encoded = serde_json::to_string(&verdict).unwrap();
+    assert!(encoded.contains("\"opt\":0"), "{encoded}");
+}
+
+/// Stand-in lust whose `build` copies itself as a binary that prints the
+/// fast-sum answer for the number on stdin, and whose `build --opt` fails
+/// the way lust 0.3.0 does on Windows without zig. Built once.
+fn no_cc_lust() -> PathBuf {
+    static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BUILT.get_or_init(build_no_cc_lust).clone()
+}
+
+fn build_no_cc_lust() -> PathBuf {
+    let dir =
+        std::env::temp_dir().join(format!("crab-cage-eval-no-cc-lust-{}", std::process::id()));
+    if dir.exists() {
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    fs::create_dir_all(&dir).unwrap();
+    let source = dir.join("no_cc_lust.rs");
+    fs::write(&source, NO_CC_LUST).unwrap();
+    let output = dir.join(if cfg!(windows) {
+        "no_cc_lust.exe"
+    } else {
+        "no_cc_lust"
+    });
+    let status = Command::new("rustc")
+        .args([
+            "--edition",
+            "2021",
+            "-C",
+            "opt-level=2",
+            "-C",
+            "debuginfo=0",
+            "-o",
+        ])
+        .arg(&output)
+        .arg(&source)
+        .status()
+        .unwrap();
+    assert!(status.success(), "fake lust failed to compile");
+    output
+}
+
+const NO_CC_LUST: &str = r#"
+use std::env;
+use std::fs;
+use std::io::Read;
+use std::path::PathBuf;
+use std::process;
+
+fn main() {
+    let exe = env::current_exe().unwrap_or_else(|_| PathBuf::from("no-cc-lust"));
+    let mode_path = PathBuf::from(format!("{}.crabmode", exe.display()));
+    if let Ok(mode) = fs::read_to_string(&mode_path) {
+        if mode.trim() == "wrong" {
+            println!("wrong");
+            return;
+        }
+        let mut input = String::new();
+        let _ = std::io::stdin().read_to_string(&mut input);
+        let n: u64 = input.trim().parse().unwrap_or(0);
+        let mut sum = 0u64;
+        for i in 1..=n {
+            sum = (sum + i * i % 1_000_000_007) % 1_000_000_007;
+        }
+        println!("{sum}");
+        return;
+    }
+    let args: Vec<String> = env::args().skip(1).collect();
+    match args.first().map(String::as_str) {
+        Some("--version") => println!("lust 0.3.0-no-cc"),
+        None => {
+            eprintln!("usage: lust <check|build|run> <file.rs> [--sandbox] [--max-memory <size>] [--time-limit <duration>] [--opt]");
+            process::exit(2);
+        }
+        Some("check") => {
+            if args.iter().any(|arg| arg == "--json") {
+                println!("{{\"schema\":1,\"ok\":true}}");
+            }
+        }
+        Some("build") => {
+            let opt = args.iter().any(|arg| arg == "--opt");
+            // A copy named `wrong_opt_lust` has a C compiler, but its opt
+            // binary prints the wrong line.
+            let wrong_opt = exe
+                .file_stem()
+                .is_some_and(|stem| stem.to_string_lossy().contains("wrong_opt"));
+            if opt && !wrong_opt {
+                eprintln!("error: no C compiler for target `x86_64-pc-windows-msvc`: install zig (zig cc cross-compiles it) or set LUST_CC to a cross compiler command");
+                process::exit(3);
+            }
+            let Some(out) = args
+                .iter()
+                .position(|arg| arg == "-o")
+                .and_then(|index| args.get(index + 1))
+            else {
+                eprintln!("missing -o");
+                process::exit(3);
+            };
+            if let Err(err) = fs::copy(&exe, out) {
+                eprintln!("copy failed: {err}");
+                process::exit(4);
+            }
+            let mode = if opt { "wrong\n" } else { "answer\n" };
+            if let Err(err) = fs::write(format!("{out}.crabmode"), mode) {
+                eprintln!("mode failed: {err}");
+                process::exit(4);
+            }
+        }
+        _ => {
+            eprintln!("fake lust: unknown command");
+            process::exit(2);
+        }
+    }
+}
+"#;
+
+#[test]
+fn fastest_without_a_c_compiler_times_the_tcc_build_and_says_so() {
+    let nugget = nugget::load(&fast_sum_dir()).unwrap();
+    let tool = lust::probe(&no_cc_lust(), Duration::from_secs(30)).unwrap();
+    let opts = options("fast-no-cc");
+    let verdict = evaluate(
+        &nugget,
+        &fast_sum_reference(),
+        &Toolchain { lust: Some(tool) },
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(verdict.status, Status::Scored, "{verdict:?}");
+    assert_eq!(verdict.gate, Gate::Run);
+    assert_eq!(verdict.note, "opt build unavailable, timed the tcc build");
+    assert_eq!(verdict.passed, 3);
+    let score = verdict.score.unwrap();
+    assert!(score > 0.0 && score < 1e9, "{score}");
+    assert!(verdict.ms.opt > 0, "opt ms {}", verdict.ms.opt);
+    let opt_bin = if cfg!(windows) {
+        format!("{}.opt.exe", verdict.hash)
+    } else {
+        format!("{}.opt", verdict.hash)
+    };
+    assert!(!opts.work_dir.join(opt_bin).exists());
+    assert!(!opts.work_dir.join("divergences").exists());
+}
+
+/// The same stand-in under the name `wrong_opt_lust`: its `--opt` build
+/// succeeds and prints a wrong line. Copied once.
+fn wrong_opt_lust() -> PathBuf {
+    static COPIED: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    COPIED
+        .get_or_init(|| {
+            let original = no_cc_lust();
+            let name = if cfg!(windows) {
+                "wrong_opt_lust.exe"
+            } else {
+                "wrong_opt_lust"
+            };
+            let copy = original.with_file_name(name);
+            fs::copy(&original, &copy).unwrap();
+            copy
+        })
+        .clone()
+}
+
+#[test]
+fn fastest_opt_build_with_a_different_output_diverges_and_writes_the_case() {
+    let nugget = nugget::load(&fast_sum_dir()).unwrap();
+    let tool = lust::probe(&wrong_opt_lust(), Duration::from_secs(30)).unwrap();
+    let opts = options("fast-wrong-opt");
+    let verdict = evaluate(
+        &nugget,
+        &fast_sum_reference(),
+        &Toolchain { lust: Some(tool) },
+        &opts,
+    )
+    .unwrap();
+    assert_eq!(verdict.status, Status::Diverged, "{verdict:?}");
+    assert_eq!(verdict.passed, 3, "the tcc build printed every answer");
+    assert!(verdict.score.is_none());
+    let first = &nugget.cases[0];
+    assert!(verdict.note.contains(&first.id), "{}", verdict.note);
+    let div = opts.work_dir.join("divergences").join(&verdict.hash);
+    assert_eq!(
+        fs::read_to_string(div.join("case.in")).unwrap(),
+        first.input
+    );
+    assert_eq!(
+        fs::read_to_string(div.join("opt.stdout")).unwrap(),
+        "wrong\n"
+    );
+    assert_eq!(
+        fs::read_to_string(div.join("fast.stdout")).unwrap(),
+        first.expected.as_deref().unwrap()
+    );
+    let readme = fs::read_to_string(div.join("README.txt")).unwrap();
+    assert!(readme.contains("build --sandbox --opt"), "{readme}");
+    assert!(readme.contains(&format!("case: {}", first.id)), "{readme}");
+}
+
 /// Each example nugget with a `reference.rs` is consistent: its seed fails
 /// the number of cases recorded here, and the reference passes them all.
 #[test]

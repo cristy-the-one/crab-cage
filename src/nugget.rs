@@ -1,7 +1,7 @@
 //! Load a nugget directory and splice a candidate into its template.
 //!
 //! A nugget is `nugget.json`, `template.rs`, and `cases/<id>.in` (plus
-//! `<id>.out` when the objective is `pass_all`). The template has one
+//! `<id>.out` when the objective is `pass_all` or `fastest`). The template has one
 //! `// CRAB:BEGIN` line and a later `// CRAB:END` line. The seed is the text
 //! between them.
 
@@ -32,6 +32,25 @@ pub struct Case {
 pub enum Objective {
     PassAll,
     Minimize,
+    /// Every case must print its `.out`; among candidates that do, the
+    /// score is the run time in milliseconds.
+    Fastest,
+}
+
+impl Objective {
+    /// Whether every case needs a `.out` file and is compared with it.
+    pub fn needs_expected(self) -> bool {
+        matches!(self, Objective::PassAll | Objective::Fastest)
+    }
+
+    /// The name used in `nugget.json`.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Objective::PassAll => "pass_all",
+            Objective::Minimize => "minimize",
+            Objective::Fastest => "fastest",
+        }
+    }
 }
 
 /// A loaded nugget. `cases` is sorted by id.
@@ -117,8 +136,9 @@ fn parse_objective(path: &Path, objective: &str) -> Result<Objective> {
     match objective {
         "pass_all" => Ok(Objective::PassAll),
         "minimize" => Ok(Objective::Minimize),
+        "fastest" => Ok(Objective::Fastest),
         other => Err(err(format!(
-            "{}: unknown objective `{other}`; expected pass_all or minimize",
+            "{}: unknown objective `{other}`; expected pass_all, minimize or fastest",
             path.display()
         ))),
     }
@@ -229,10 +249,11 @@ fn load_cases(dir: &Path, objective: Objective) -> Result<Vec<Case>> {
         let out_path = cases_dir.join(format!("{id}.out"));
         let expected = if out_path.is_file() {
             Some(read_text(&out_path)?)
-        } else if objective == Objective::PassAll {
+        } else if objective.needs_expected() {
             return Err(err(format!(
-                "{}: case `{id}` has no .out file and objective is pass_all",
-                out_path.display()
+                "{}: case `{id}` has no .out file and objective is {}",
+                out_path.display(),
+                objective.as_str()
             )));
         } else {
             None
@@ -551,11 +572,36 @@ mod tests {
     #[test]
     fn unknown_objective_is_an_error() {
         let dir = scratch("objective");
-        write_json(&dir, r#"{"name":"probe","objective":"fastest"}"#);
+        write_json(&dir, r#"{"name":"probe","objective":"quickest"}"#);
         write_template(&dir, "// CRAB:BEGIN\nseed\n// CRAB:END\n");
         write_case(&dir, "a", "1\n", Some("1\n"));
         let text = load_error(&dir);
-        assert!(text.contains("unknown objective `fastest`"), "{text}");
+        assert!(text.contains("unknown objective `quickest`"), "{text}");
+    }
+
+    #[test]
+    fn fastest_case_missing_out_is_an_error() {
+        let dir = scratch("fastest-missing-out");
+        write_json(&dir, &probe_json("fastest"));
+        write_template(&dir, "// CRAB:BEGIN\nseed\n// CRAB:END\n");
+        write_case(&dir, "alpha", "1\n", Some("1\n"));
+        write_case(&dir, "beta", "2\n", None);
+        let text = load_error(&dir);
+        assert!(text.contains("case `beta`"), "{text}");
+        assert!(text.contains("fastest"), "{text}");
+        assert!(text.contains(".out"), "{text}");
+    }
+
+    #[test]
+    fn loads_the_fast_sum_demo() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("nuggets")
+            .join("fast-sum");
+        let nugget = load(&dir).unwrap();
+        assert_eq!(nugget.name, "fast-sum");
+        assert_eq!(nugget.objective, Objective::Fastest);
+        assert_eq!(nugget.cases.len(), 3);
+        assert!(nugget.cases.iter().all(|case| case.expected.is_some()));
     }
 
     #[test]

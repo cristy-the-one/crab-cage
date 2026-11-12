@@ -690,6 +690,9 @@ fn objective_sentence(objective: Objective) -> &'static str {
         Objective::Minimize => {
             "Objective: minimize. Each case's last stdout line must be `score: <number>`, and the score is their sum. Lower is better."
         }
+        Objective::Fastest => {
+            "Objective: fastest. Every case must print the expected output; among candidates that do, the one that runs in the least time wins. Lower is better."
+        }
     }
 }
 

@@ -52,7 +52,7 @@ Phase 3:  L-03 … L-11, any order
 | The model prompt, tuned against a real model | done | see "First run against a real model" below |
 | The model ladder, an experiment to run on a GPU machine | ready, not yet run there | `experiments/model-ladder/`; two medium nuggets added for it |
 | WP-19 | docs done; the tank port is not planned | README and DESIGN.md |
-| WP-20 | open | needs zig |
+| WP-20 | done except the zig path | branch `wp-20-fastest`. Exercised: the tests without lust (rustc timed), two stand-in lusts (no C compiler; an opt binary that prints a wrong line), and real lust 0.3.0 on Windows without zig (`no C compiler for target …`, so the tcc build is timed with the note, exit 0) and with `LUST_CC=gcc` (mingw gcc fails to link: `undefined reference to __imp_WSAGetLastError`, so the tcc build is timed and the note carries the error). Not exercised: a working `--opt` build, so neither a non-empty `ms.opt` from zig nor an empty note. Any failed opt build falls back to the tcc timing; only a different output is `diverged` |
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
 | L-02 | done for literal bounds; variable bounds open | lust-lang #37 |
 | L-03 | done | lust-lang #36 |
@@ -113,7 +113,7 @@ Also seen: `crab-cage run … | head -1` panics with `failed printing to stdout`
 
 Decisions made while building, which later packages must keep:
 
-- **Exit code of `crab-cage run`.** A `pass_all` nugget exits 0 only when a proven candidate has score 0. A `minimize` nugget exits 0 when any candidate is proven.
+- **Exit code of `crab-cage run`.** A `pass_all` nugget exits 0 only when a proven candidate has score 0. A `minimize` or `fastest` nugget exits 0 when any candidate is proven.
 - **Only `proven` is a result.** `diverged`, and `rejected` with the note `nondeterministic output`, never become the best.
 - **The oracle matches lust's profile.** rustc is run with `-C debug-assertions=on -C overflow-checks=on`.
 - **The daemon needs one file.** With lust's daemon on, lust always compiles `<work>/slot.rs`. A new file name per candidate is slower than no daemon at all.

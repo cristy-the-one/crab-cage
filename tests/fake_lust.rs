@@ -104,6 +104,7 @@ fn runner_passes_sandbox_and_max_memory_and_classifies_the_guest_stop() {
         1024 * 1024,
         Some(Duration::from_millis(500)),
         Duration::from_secs(10),
+        false,
     )
     .unwrap();
     let ran = supervisor::run_capture(

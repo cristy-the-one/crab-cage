@@ -1,0 +1,1 @@
+{ "name": "fast-sum", "objective": "fastest", "timeout_ms": 5000, "max_memory": "64M" }

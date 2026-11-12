@@ -362,7 +362,7 @@ fn finish(journal_path: &Path, objective: Objective) -> Result<RunOutput> {
 fn exit_solved(objective: Objective, proven: &ProvenScan) -> bool {
     match objective {
         Objective::PassAll => proven.zero,
-        Objective::Minimize => proven.any,
+        Objective::Minimize | Objective::Fastest => proven.any,
     }
 }
 

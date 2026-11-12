@@ -101,13 +101,33 @@ pub struct Diagnostic {
 }
 
 /// Wall-clock milliseconds of each stage. A stage that did not run is 0.
+///
+/// `opt` is the `fastest` timing stage: the `--opt` build (when lust is
+/// there) plus the timed runs. Journal lines written before it existed
+/// read as 0.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Ms {
     pub check: u64,
     pub build: u64,
     pub run: u64,
     pub oracle: u64,
+    #[serde(default)]
+    pub opt: u64,
 }
+
+/// The score floor of a `fastest` candidate that printed a wrong output:
+/// `WRONG_OUTPUT_SCORE + failed cases`, so it never beats a correct one.
+pub const WRONG_OUTPUT_SCORE: f64 = 1e9;
+
+/// How many times each case runs when a `fastest` candidate is timed. The
+/// case's time is the median.
+pub const TIMED_RUNS: usize = 3;
+
+/// The `note` of a `fastest` verdict whose `--opt` build found no C compiler.
+pub const OPT_UNAVAILABLE: &str = "opt build unavailable, timed the tcc build";
+
+/// How many characters of a failed opt build's message reach the `note`.
+const OPT_NOTE_CLIP: usize = 300;
 
 /// How many characters of a case id, input, or output are kept on a verdict.
 pub(crate) const TEXT_CLIP: usize = 400;
@@ -214,6 +234,7 @@ pub fn evaluate(
             nugget.max_memory,
             Some(nugget.timeout),
             opts.compile_timeout,
+            false,
         )
     } else {
         lust::compile_rustc_any_edition(&source, &binary, opts.compile_timeout)
@@ -242,6 +263,23 @@ pub fn evaluate(
     }
     verdict.status = Status::Scored;
     verdict.score = Some(outcome.score);
+
+    // `fastest`: only a candidate that printed every expected output is
+    // timed. A wrong one keeps its `WRONG_OUTPUT_SCORE + failed` score.
+    if nugget.objective == Objective::Fastest && verdict.passed == verdict.total {
+        let started = Instant::now();
+        let timed = TimedBuild {
+            source: &source,
+            fast_source: &fast_source,
+            fast_bin: &binary,
+            fast_runs: &outcome.runs,
+        };
+        time_candidate(&mut verdict, nugget, &timed, tools, opts)?;
+        verdict.ms.opt = elapsed_ms(started);
+        if verdict.status != Status::Scored {
+            return Ok(verdict);
+        }
+    }
 
     // Rejections returned above, so the status here is `scored`.
     if opts.oracle {
@@ -275,8 +313,8 @@ pub fn format_verdict(verdict: &Verdict) -> String {
         ))
     } else {
         format!(
-            "ms check={} build={} run={} oracle={}",
-            verdict.ms.check, verdict.ms.build, verdict.ms.run, verdict.ms.oracle
+            "ms check={} build={} run={} opt={} oracle={}",
+            verdict.ms.check, verdict.ms.build, verdict.ms.run, verdict.ms.opt, verdict.ms.oracle
         )
     };
     format!(
@@ -380,8 +418,8 @@ struct RunOutcome {
     /// candidate has one entry per nugget case; the oracle compares these
     /// bytes and exit kinds with a fresh rustc run.
     runs: Vec<CaseCapture>,
-    /// First `pass_all` mismatch. `None` when every case matched, or the
-    /// objective is `minimize`.
+    /// First `pass_all` or `fastest` mismatch. `None` when every case
+    /// matched, or the objective is `minimize`.
     failure: Option<CaseFailure>,
 }
 
@@ -582,6 +620,203 @@ fn rustc_command(edition: &str, oracle_bin: &Path, source: &Path) -> String {
     )
 }
 
+/// The fast build of a `fastest` candidate that printed every expected output.
+struct TimedBuild<'a> {
+    /// `<hash>.rs`, the record and what rustc compiles.
+    source: &'a Path,
+    /// What lust compiles: `source`, or the slot file when the daemon is on.
+    fast_source: &'a Path,
+    fast_bin: &'a Path,
+    /// One clean run per case from the fast build.
+    fast_runs: &'a [CaseCapture],
+}
+
+/// Score a correct `fastest` candidate by run time.
+///
+/// With lust: `lust build --opt` to `<hash>.opt[.exe]` and time that. If the
+/// opt build fails (no C compiler, a compiler that cannot link, a timeout),
+/// time the fast (tcc) build and say so in `note`. An opt binary whose
+/// output differs is `diverged`, with a report under `divergences/`.
+/// Without lust the fast build already is rustc at `opt-level=2`; time it.
+///
+/// The score is the sum over cases of the median of [`TIMED_RUNS`] elapsed
+/// times, in milliseconds.
+fn time_candidate(
+    verdict: &mut Verdict,
+    nugget: &Nugget,
+    build: &TimedBuild,
+    tools: &Toolchain,
+    opts: &EvalOptions,
+) -> crate::error::Result<()> {
+    let Some(tool) = &tools.lust else {
+        return time_fast_build(verdict, nugget, build.fast_bin, opts);
+    };
+    let opt_bin = opts
+        .work_dir
+        .join(bin_name(&format!("{}.opt", verdict.hash)));
+    let built = lust::build(
+        tool,
+        build.fast_source,
+        &opt_bin,
+        nugget.max_memory,
+        Some(nugget.timeout),
+        opts.compile_timeout,
+        true,
+    );
+    if let Err(problem) = built {
+        // A host without a usable C compiler must not fail the run, and must
+        // not turn every candidate into a divergence: time the tcc build.
+        time_fast_build(verdict, nugget, build.fast_bin, opts)?;
+        if verdict.status == Status::Scored {
+            verdict.note = if lust::is_no_c_compiler(&problem.message) {
+                OPT_UNAVAILABLE.to_string()
+            } else {
+                format!(
+                    "opt build failed, timed the tcc build: {}",
+                    clip_chars(&one_line(&problem.message), OPT_NOTE_CLIP)
+                )
+            };
+        }
+        return Ok(());
+    }
+    match time_cases(nugget, &opt_bin, opts)? {
+        Timing::Score(score) => verdict.score = Some(score),
+        Timing::Mismatch(index, opt_run) => {
+            let case = &nugget.cases[index];
+            let fast = build
+                .fast_runs
+                .get(index)
+                .ok_or_else(|| crate::error::err("timing expected one fast run per case"))?;
+            save_opt_divergence(
+                verdict, nugget, tool, build, &opt_bin, opts, case, fast, &opt_run,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+/// Time the binary that already ran once. A second run that prints
+/// something else is the oracle's `nondeterministic output` reject.
+fn time_fast_build(
+    verdict: &mut Verdict,
+    nugget: &Nugget,
+    bin: &Path,
+    opts: &EvalOptions,
+) -> crate::error::Result<()> {
+    match time_cases(nugget, bin, opts)? {
+        Timing::Score(score) => verdict.score = Some(score),
+        Timing::Mismatch(..) => {
+            verdict.status = Status::Rejected;
+            verdict.score = None;
+            verdict.note = "nondeterministic output".to_string();
+        }
+    }
+    Ok(())
+}
+
+enum Timing {
+    /// Sum over cases of the median elapsed milliseconds.
+    Score(f64),
+    /// The index of the first case whose run was not clean or printed the
+    /// wrong output, and that run.
+    Mismatch(usize, CaseCapture),
+}
+
+fn time_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::Result<Timing> {
+    let limits = host_limits(nugget, opts);
+    let mut total = 0.0f64;
+    for (index, case) in nugget.cases.iter().enumerate() {
+        let mut times = Vec::with_capacity(TIMED_RUNS);
+        for _ in 0..TIMED_RUNS {
+            let result =
+                supervisor::run_capture(Command::new(bin), &limits, case.input.as_bytes())?;
+            if lust::classify(&result) != RunClass::Clean
+                || pass_all_failure(case, &result.stdout).is_some()
+            {
+                return Ok(Timing::Mismatch(
+                    index,
+                    CaseCapture {
+                        stdout: result.stdout,
+                        kind: result.kind,
+                    },
+                ));
+            }
+            times.push(result.elapsed.as_secs_f64() * 1000.0);
+        }
+        total += median(&mut times);
+    }
+    Ok(Timing::Score(total))
+}
+
+/// The middle value; the mean of the two middle values for an even count.
+fn median(values: &mut [f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    if values.len() % 2 == 1 {
+        values[middle]
+    } else {
+        (values[middle - 1] + values[middle]) / 2.0
+    }
+}
+
+fn opt_command(tool: &LustTool, nugget: &Nugget, source: &Path, opt_bin: &Path) -> String {
+    fast_command(tool, nugget, source, opt_bin).replacen(
+        " build --sandbox",
+        " build --sandbox --opt",
+        1,
+    )
+}
+
+/// The opt binary printed something other than the expected output (or did
+/// not stop cleanly) where the tcc binary matched.
+#[allow(clippy::too_many_arguments)]
+fn save_opt_divergence(
+    verdict: &mut Verdict,
+    nugget: &Nugget,
+    tool: &LustTool,
+    build: &TimedBuild,
+    opt_bin: &Path,
+    opts: &EvalOptions,
+    case: &crate::nugget::Case,
+    fast: &CaseCapture,
+    opt_run: &CaseCapture,
+) -> crate::error::Result<()> {
+    let dir = divergence_dir(&opts.work_dir, &verdict.hash);
+    fs::create_dir_all(&dir)?;
+    let _ = fs::copy(build.source, dir.join("source.rs"))?;
+    fs::write(dir.join("case.in"), &case.input)?;
+    fs::write(
+        dir.join("expected.stdout"),
+        case.expected.as_deref().unwrap_or(""),
+    )?;
+    fs::write(dir.join("fast.stdout"), &fast.stdout)?;
+    fs::write(dir.join("opt.stdout"), &opt_run.stdout)?;
+    let readme = format!(
+        "\
+lust version: {version}
+fast: {fast_cmd}
+opt: {opt_cmd}
+case: {case_id}
+fast exit: {fast_kind:?}
+opt exit: {opt_kind:?}
+",
+        version = tool.version,
+        fast_cmd = fast_command(tool, nugget, build.fast_source, build.fast_bin),
+        opt_cmd = opt_command(tool, nugget, build.fast_source, opt_bin),
+        case_id = case.id,
+        fast_kind = fast.kind,
+        opt_kind = opt_run.kind,
+    );
+    fs::write(dir.join("README.txt"), readme)?;
+    verdict.status = Status::Diverged;
+    verdict.score = None;
+    verdict.note = format!("opt build differs from the tcc build on case {}", case.id);
+    Ok(())
+}
+
 fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::Result<RunOutcome> {
     let limits = host_limits(nugget, opts);
     let mut passed = 0u32;
@@ -600,7 +835,7 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
         // wrong output is still scored and the remaining cases still run.
         if class == RunClass::Clean {
             match nugget.objective {
-                Objective::PassAll => {
+                Objective::PassAll | Objective::Fastest => {
                     if let Some(found) = pass_all_failure(case, &result.stdout) {
                         mismatches = mismatches.saturating_add(1);
                         if failure.is_none() {
@@ -655,6 +890,9 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
     let score = match nugget.objective {
         Objective::PassAll => f64::from(mismatches),
         Objective::Minimize => sum,
+        // 0 here is a placeholder: `evaluate` replaces it with the time.
+        Objective::Fastest if mismatches == 0 => 0.0,
+        Objective::Fastest => WRONG_OUTPUT_SCORE + f64::from(mismatches),
     };
     if nugget.objective == Objective::Minimize && !score.is_finite() {
         return Ok(RunOutcome {
