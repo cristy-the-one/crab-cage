@@ -1057,6 +1057,17 @@ fn wrong_opt_lust() -> PathBuf {
             };
             let copy = original.with_file_name(name);
             fs::copy(&original, &copy).unwrap();
+            // On Linux a file cannot be executed while any process holds it
+            // open for writing ("Text file busy"). Tests run on parallel
+            // threads, and a child that another thread forked during the
+            // copy keeps the copy's descriptor until its own exec. Wait here
+            // until the copy can be started, so no test sees that window.
+            for _ in 0..250 {
+                match std::process::Command::new(&copy).arg("--version").output() {
+                    Ok(_) => break,
+                    Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                }
+            }
             copy
         })
         .clone()
