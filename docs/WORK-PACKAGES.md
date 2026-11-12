@@ -52,7 +52,7 @@ Phase 3:  L-03 … L-11, any order
 | The model prompt, tuned against a real model | done | see "First run against a real model" below |
 | The model ladder, an experiment to run on a GPU machine | ready, not yet run there | `experiments/model-ladder/`; two medium nuggets added for it |
 | WP-19 | docs done; the tank port is not planned | README and DESIGN.md |
-| WP-20 | open | needs zig |
+| WP-20 | done | crab-cage #23. Exercised with zig 0.14.1 on `PATH` (the version lust's CI uses): the optimised build is used, `note` is empty, and `ms.opt` is real. Also exercised: no compiler at all (the TinyCC build is timed, with a note), `LUST_CC=gcc` under mingw (fails to link; falls back, with the error in the note), and two stand-in lusts in the tests. See "What the zig run showed" under WP-20 |
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
 | L-02 | done for literal bounds; variable bounds open | lust-lang #37 |
 | L-03 | done | lust-lang #36 |
@@ -113,7 +113,7 @@ Also seen: `crab-cage run … | head -1` panics with `failed printing to stdout`
 
 Decisions made while building, which later packages must keep:
 
-- **Exit code of `crab-cage run`.** A `pass_all` nugget exits 0 only when a proven candidate has score 0. A `minimize` nugget exits 0 when any candidate is proven.
+- **Exit code of `crab-cage run`.** A `pass_all` nugget exits 0 only when a proven candidate has score 0. A `minimize` or `fastest` nugget exits 0 when any candidate is proven.
 - **Only `proven` is a result.** `diverged`, and `rejected` with the note `nondeterministic output`, never become the best.
 - **The oracle matches lust's profile.** rustc is run with `-C debug-assertions=on -C overflow-checks=on`.
 - **The daemon needs one file.** With lust's daemon on, lust always compiles `<work>/slot.rs`. A new file name per candidate is slower than no daemon at all.
@@ -515,6 +515,19 @@ The first start of a new executable costs about 40 ms (the system inspects the f
 | 8 | 8.7 s | 59 ms | 156 ms | 141 ms |
 
 The run column is flat now: candidate starts overlap. The whole run is 1.6× faster with four jobs, not the 2× asked for. About 2.4 s of every run is fixed (the probe, the daemon's cold start, the seed and its oracle), and the time lust takes to build grows as builds overlap (50 ms alone, 93 ms with four, 156 ms with eight), which is on the lust side. Without the daemon the same run goes from 33.8 s to 15.2 s with four jobs (2.2×). Same decisions in the same order for 1, 2, 4 and 8. `tests/limits.rs` passes unchanged, with one test added.
+
+**What the zig run showed (2026-11-12, Windows, zig 0.14.1, the machine busy with other builds).** On the slow seed of `nuggets/fast-sum`, one case:
+
+| Build | Time to build | Time to run |
+|---|---:|---:|
+| `lust build --sandbox` (TinyCC) | 1.9 s | 1,119 ms |
+| `lust build --sandbox --opt` (zig, `-O2 -flto`) | 14.3 s | 856 ms |
+| `rustc -C opt-level=2`, checks on | about 1 s | 605 ms |
+
+Two things follow, neither acted on yet:
+
+- **The optimised build costs about 14 s per candidate** (49 s the first time, while zig filled its cache). `evaluate` makes it for every correct candidate, so a run of 20 correct candidates spends about five minutes there. It should be made only for a candidate whose TinyCC time is already close to the best, or only when a candidate is about to become the best.
+- **On this program the optimised binary is only 1.3 times faster than the TinyCC one**, where lust's notes report about 7.5 times on their benchmark. The loop is dominated by a remainder with overflow checks on. That is a question for lust, with this program as the example.
 
 # Phase 3: lust-lang
 

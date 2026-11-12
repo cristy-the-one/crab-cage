@@ -38,7 +38,7 @@ The binary is `target/release/crab-cage` (`crab-cage.exe` on Windows).
 
 ## A nugget
 
-A nugget is a directory that states one problem. This repo has a ladder of four, easy to hard: `nuggets/sum-squares`, `nuggets/run-lengths`, `nuggets/merge-ranges` and `nuggets/normalize-path` (each of the last three has a `reference.rs` beside it that is a solution), and one real problem, `nuggets/delta-kernel`.
+A nugget is a directory that states one problem. This repo has a ladder of four, easy to hard: `nuggets/sum-squares`, `nuggets/run-lengths`, `nuggets/merge-ranges` and `nuggets/normalize-path` (each of the last three has a `reference.rs` beside it that is a solution), one real problem, `nuggets/delta-kernel`, and one speed problem, `nuggets/fast-sum`, whose seed is right but slow.
 
 ```text
 nuggets/sum-squares/
@@ -68,6 +68,9 @@ fn sum_squares(xs: &[i64]) -> i64 {
 |---|---|---|
 | `pass_all` | the number of cases whose stdout is wrong; 0 is solved | a `.out` file for every case |
 | `minimize` | the sum over the cases of the number on the program's last stdout line, written `score: <number>` | nothing more |
+| `fastest` | when every case prints its `.out`: the sum over the cases of the median of three run times, in milliseconds. Otherwise 1e9 plus the number of wrong cases, so a wrong candidate never beats a right one | a `.out` file for every case |
+
+For `fastest`, lust times its `--opt` build (the same C compiled with `zig cc -O2`, `cc`, or `LUST_CC`), and that binary must print the same outputs, or the verdict is `diverged`. With no such compiler, or when the opt build fails, the tcc build is timed and `note` says so (`opt build unavailable, timed the tcc build`). Without lust the rustc build is timed. `ms.opt` is the time spent on the opt build and the timed runs. `nuggets/fast-sum` is the example: a correct but slow seed, and a fast `reference.rs`. Times from runs with `--jobs` above 1 are taken while other candidates run, so they are noisier.
 
 ## Evaluate one candidate
 
@@ -139,7 +142,7 @@ work/             every candidate as <hash>.rs, its binary, and divergences/
 ```
 
 - **Only `proven` counts.** A candidate becomes the best only after `rustc` has built it and printed the same output as the fast build. A candidate whose `rustc` build disagrees with itself between two runs is rejected as nondeterministic.
-- **Exit code.** For `pass_all`, 0 only when a proven candidate has score 0. For `minimize`, 0 when any candidate is proven.
+- **Exit code.** For `pass_all`, 0 only when a proven candidate has score 0. For `minimize` and `fastest`, 0 when any candidate is proven; neither stops early.
 - **Resume.** Run again with the same `--out`. Candidates already in the journal are skipped, and the best is restored.
 - **`--budget N`** is the number of candidates to journal, the seed included (default 200). A run also stops after 50 proposals in a row that add nothing new.
 - **`--jobs N`** evaluates up to `N` candidates at the same time. The journal keeps the order the candidates were proposed in.

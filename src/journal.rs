@@ -320,6 +320,7 @@ mod tests {
                 build: 0,
                 run: 0,
                 oracle: 0,
+                opt: 0,
             },
             note: String::new(),
             failure: None,

@@ -274,6 +274,7 @@ fn verify_winner(
                 options.max_memory,
                 Some(options.run_timeout),
                 options.compile_timeout,
+                false,
             )?;
             let (error, lines) = replay(genome, &built, options)?;
             verification.lust_replay_error = Some(error);
@@ -340,6 +341,7 @@ fn compile_candidate(source: &Path, work: &Path, options: &RunOptions) -> Result
             options.max_memory,
             Some(options.run_timeout),
             options.compile_timeout,
+            false,
         )?;
         return Ok(built);
     }
@@ -354,6 +356,7 @@ fn compile_candidate(source: &Path, work: &Path, options: &RunOptions) -> Result
                     options.max_memory,
                     Some(options.run_timeout),
                     options.compile_timeout,
+                    false,
                 )?;
                 return Ok(built);
             }
