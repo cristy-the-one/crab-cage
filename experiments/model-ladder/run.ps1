@@ -309,7 +309,7 @@ foreach ($model in $ready) {
             $results += $result
             $mark = 'not solved'
             if ($result.solved) { $mark = "solved at candidate $($result.solved_at_candidate)" }
-            if ($result.objective -eq 'minimize') { $mark = "seed $($result.seed_score)" }
+            if ($result.objective -ne 'pass_all') { $mark = "seed $($result.seed_score)" }
             Write-Host ("   [{0}/{1}] {2} rep {3}: {4}, best {5}, {6} candidates, {7} s" -f `
                     $done, $total, $nugget, $rep, $mark, $result.best_score, $result.candidates, $result.wall_s)
             [System.IO.File]::AppendAllText((Join-Path $OutDir 'results.jsonl'), (($result | ConvertTo-Json -Depth 5 -Compress) + "`n"), $utf8)
@@ -346,7 +346,8 @@ $lines += ''
 $lines += 'Each cell: runs solved of runs made; then, over the solved runs, the median number of model candidates it took and the median wall time.'
 $lines += ''
 $passAll = @($Nuggets | Where-Object { $objective[$_] -eq 'pass_all' })
-$minimize = @($Nuggets | Where-Object { $objective[$_] -eq 'minimize' })
+# minimize and fastest: no "solved", only a best proven score (lower is better).
+$minimize = @($Nuggets | Where-Object { $objective[$_] -ne 'pass_all' })
 $lines += '| Model | ' + ($passAll -join ' | ') + ' |'
 $lines += '|---|' + (($passAll | ForEach-Object { '---' }) -join '|') + '|'
 foreach ($item in $loaded) {
@@ -384,7 +385,7 @@ if ($minimize.Count -gt 0) {
     $lines += ''
     $lines += '| Model | Nugget | Rep | Seed score | Best proven | Candidates | Wall | How it ended |'
     $lines += '|---|---|---:|---:|---:|---:|---:|---|'
-    foreach ($run in @($results | Where-Object { $_.objective -eq 'minimize' })) {
+    foreach ($run in @($results | Where-Object { $_.objective -ne 'pass_all' })) {
         $lines += "| $($run.model) | $($run.nugget) | $($run.rep) | $($run.seed_score) | $($run.best_score) | $($run.candidates) | $($run.wall_s) s | $($run.stop) |"
     }
 }
