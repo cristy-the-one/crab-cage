@@ -144,6 +144,12 @@ struct RunArgs {
     /// Maximum number of candidates to evaluate, including the seed.
     #[arg(long, default_value_t = 200)]
     budget: usize,
+    /// Makes a run repeatable. `--tweak` draws its changes from it
+    /// (default 1). With `--backend local`, each request to the model
+    /// carries a seed counted up from it; without the flag the model
+    /// server picks its own and two runs differ.
+    #[arg(long)]
+    seed: Option<u64>,
     /// Candidates evaluated at the same time. Each one gets its own slot
     /// file; the journal keeps the order the candidates were proposed in.
     #[arg(long, default_value_t = 1)]
@@ -494,13 +500,14 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
         proposers.push(folder);
     }
     let mut tweak = None;
-    run::attach_tweak(args.tweak, &mut tweak, &mut proposers);
+    run::attach_tweak(args.tweak, args.seed, &mut tweak, &mut proposers);
     let mut model = None;
     run::attach_model(
         args.backend.as_deref(),
         args.endpoint.as_deref(),
         args.model.as_deref(),
         args.lust_bin.as_deref(),
+        args.seed,
         &mut model,
         &mut proposers,
     )?;

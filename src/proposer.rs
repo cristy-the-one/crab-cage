@@ -437,6 +437,10 @@ pub struct ModelProposer {
     timeout: Duration,
     memory: ModelMemory,
     second_opinion: Option<SecondOpinion>,
+    /// `--seed`. None sends no seed and the server picks its own.
+    seed: Option<u64>,
+    /// Requests sent so far; added to the seed.
+    requests: u64,
 }
 
 impl ModelProposer {
@@ -459,7 +463,25 @@ impl ModelProposer {
             timeout: MODEL_TIMEOUT,
             memory: ModelMemory::default(),
             second_opinion: None,
+            seed: None,
+            requests: 0,
         })
+    }
+
+    /// Send a seed with every request, so a run can be repeated: the first
+    /// request gets `seed`, the next `seed + 1`, and so on. One seed for
+    /// every request would make a model that repeats a region repeat it
+    /// again when it is asked a second time.
+    pub fn with_seed(mut self, seed: Option<u64>) -> Self {
+        self.seed = seed;
+        self
+    }
+
+    /// The seed of the next request, or None when the run has no seed.
+    fn request_seed(&mut self) -> Option<u64> {
+        let seed = self.seed?.wrapping_add(self.requests);
+        self.requests += 1;
+        Some(seed)
     }
 }
 
@@ -485,7 +507,16 @@ impl Proposer for ModelProposer {
         loop {
             let temperature = self.memory.next_temperature;
             let asked = self.memory.prompt_now(&user);
-            let raw = llm::chat(&endpoint, &model, &system, &asked, timeout, temperature);
+            let seed = self.request_seed();
+            let raw = llm::chat(
+                &endpoint,
+                &model,
+                &system,
+                &asked,
+                timeout,
+                temperature,
+                seed,
+            );
             match self.memory.consume(raw) {
                 Step::Return(text) => return Ok(Proposal::Candidate(text)),
                 Step::Later => return Ok(Proposal::Later),
@@ -2716,5 +2747,19 @@ mod tests {
         let text = opinion(accepted).unwrap();
         assert!(text.starts_with("rustc accepts these lines"), "{text}");
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_seeded_model_proposer_counts_its_requests_up_from_the_seed() {
+        let mut plain = ModelProposer::new("http://127.0.0.1:11434/v1", "m", "").unwrap();
+        assert_eq!(plain.request_seed(), None);
+        assert_eq!(plain.request_seed(), None);
+
+        let mut seeded = ModelProposer::new("http://127.0.0.1:11434/v1", "m", "")
+            .unwrap()
+            .with_seed(Some(40));
+        assert_eq!(seeded.request_seed(), Some(40));
+        assert_eq!(seeded.request_seed(), Some(41));
+        assert_eq!(seeded.request_seed(), Some(42));
     }
 }

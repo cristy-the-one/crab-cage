@@ -194,6 +194,7 @@ impl LlmBackend for LocalBackend {
             &mutation_prompt(request),
             self.timeout,
             DEFAULT_TEMPERATURE,
+            None,
         )?;
         parse_mutation(&content)
     }
@@ -325,6 +326,9 @@ fn is_fence_tag(tag: &str) -> bool {
 struct ChatRequest<'a> {
     model: &'a str,
     temperature: f64,
+    /// Left out of the request when None: the server then picks its own.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    seed: Option<u64>,
     messages: [ChatMessage<'a>; 2],
 }
 
@@ -353,18 +357,19 @@ struct ChatContent {
 /// retrying a repeated region passes a higher value.
 pub(crate) const DEFAULT_TEMPERATURE: f64 = 0.2;
 
-pub(crate) fn chat(
-    endpoint: &str,
+/// The request body of one completion. With a `seed`, a server that honours
+/// it (Ollama does) gives the same reply to the same request.
+fn chat_body(
     model: &str,
     system: &str,
     user: &str,
-    timeout: Duration,
     temperature: f64,
+    seed: Option<u64>,
 ) -> Result<String> {
-    let url = format!("{endpoint}/chat/completions");
-    let body = serde_json::to_string(&ChatRequest {
+    Ok(serde_json::to_string(&ChatRequest {
         model,
         temperature,
+        seed,
         messages: [
             ChatMessage {
                 role: "system",
@@ -375,7 +380,20 @@ pub(crate) fn chat(
                 content: user,
             },
         ],
-    })?;
+    })?)
+}
+
+pub(crate) fn chat(
+    endpoint: &str,
+    model: &str,
+    system: &str,
+    user: &str,
+    timeout: Duration,
+    temperature: f64,
+    seed: Option<u64>,
+) -> Result<String> {
+    let url = format!("{endpoint}/chat/completions");
+    let body = chat_body(model, system, user, temperature, seed)?;
     let response = http::post_json(&url, &body, timeout)?;
     let parsed: ChatResponse = serde_json::from_str(&response)
         .map_err(|e| err(format!("the local model response was not chat JSON ({e})")))?;
@@ -404,6 +422,14 @@ mod tests {
         assert_eq!(first.law, Some(LawKind::Pi));
         let again = mock_proposal(2, LawKind::Pi);
         assert!(again.law.is_none());
+    }
+
+    #[test]
+    fn the_seed_is_sent_only_when_one_is_given() {
+        let plain = chat_body("m", "s", "u", 0.2, None).unwrap();
+        assert!(!plain.contains("seed"), "{plain}");
+        let seeded = chat_body("m", "s", "u", 0.2, Some(7)).unwrap();
+        assert!(seeded.contains("\"seed\":7"), "{seeded}");
     }
 
     #[test]

@@ -44,6 +44,10 @@ param(
     # Also run the literal-tweak proposer, taking turns with the model. Worth
     # it on a `minimize` nugget whose candidates carry tunable numbers.
     [switch]$Tweak,
+    # Makes the runs repeatable: run number N of each model and nugget passes
+    # `--seed (Seed + N - 1)` to crab-cage. 0 (the default) passes no seed,
+    # and the model server picks its own each time.
+    [int]$Seed = 0,
     # One model's first nugget, one run, budget 6: a two-minute check that
     # everything is wired up.
     [switch]$Quick
@@ -214,6 +218,7 @@ function Invoke-Run([string]$Model, [string]$Nugget, [int]$Rep) {
         '--budget', "$Budget", '--jobs', '1', '--out', $out)
     if ($LustBin) { $arguments += @('--lust-bin', $LustBin) }
     if ($Tweak) { $arguments += '--tweak' }
+    if ($Seed -ne 0) { $arguments += @('--seed', "$($Seed + $Rep - 1)") }
 
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $previous = $ErrorActionPreference
