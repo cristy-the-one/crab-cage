@@ -50,7 +50,7 @@ Phase 3:  L-03 … L-11, any order
 | WP-18 | done | crab-cage #15; the proposer has run against a mock and a scripted stand-in server, not yet a real model |
 | WP-18b | done | crab-cage #18: an "already tried" list, the failing case, verdicts by hash |
 | The model prompt, tuned against a real model | done | see "First run against a real model" below |
-| The model ladder, an experiment to run on a GPU machine | run three times, 2026-11-12 and twice on 2026-11-13 | `experiments/model-ladder/`; results in `experiments/model-ladder/results/`; see "The model ladder on a GPU machine", "The second ladder run" and "The third ladder run" below |
+| The model ladder, an experiment to run on a GPU machine | run four times, 2026-11-12 and three times on 2026-11-13 | `experiments/model-ladder/`; results in `experiments/model-ladder/results/`; see "The model ladder on a GPU machine", "The second ladder run", "The third ladder run" and "The fourth ladder run" below |
 | WP-19 | docs done; the tank port is not planned | README and DESIGN.md |
 | WP-20 | done | crab-cage #23. Exercised with zig 0.14.1 on `PATH` (the version lust's CI uses): the optimised build is used, `note` is empty, and `ms.opt` is real. Also exercised: no compiler at all (the TinyCC build is timed, with a note), `LUST_CC=gcc` under mingw (fails to link; falls back, with the error in the note), and two stand-in lusts in the tests. See "What the zig run showed" under WP-20 |
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
@@ -209,6 +209,27 @@ Follow-ups:
 2. **crab-cage: do not quote a rejected line once per attempt in "Already tried".** Open.
 3. **lust, L-13: offer the dereference as an edit that `lust fix` applies**, which is the same idea without rustc. A better fix text alone would be read as little as rustc's was.
 4. **Run the ladder a fourth time** with the repair proposer.
+
+## The fourth ladder run (2026-11-13)
+
+The same command and seeds as the third run, with crab-cage `abe8225`: the `repair` proposer applies rustc's `MachineApplicable` fixes to a candidate that did not compile. lust 0.3.1 unchanged. The files are in `experiments/model-ladder/results/2026-11-13-rtx5080-run4/`.
+
+The solved table is the same as the third run, cell for cell: 2/3, 3/3, 0/3 for the 7b model and 3/3, 3/3, 1/3 for the 14b model.
+
+What it showed:
+
+- **A seed repeats a run on the GPU.** Every run in which the repair proposer had nothing to do is the third run again, candidate for candidate and with the same number of requests: all nine runs of the 14b model and six of the 7b model's. A difference between two runs is now caused by the change under test.
+- **No divergence and no oracle rejection in 129 candidates**, 470 over the four runs.
+- **The repair proposer did what it is for.** On `normalize-path` the 7b model's candidates were rejected for `c != "."` as before. In two of its three runs every one of the 9 rejected candidates was followed by a repaired one that compiled and ran. In the third run 6 of 9 were; the other three had a second error for which rustc has no fix it marks as safe.
+- **The repaired candidates fail all 10 cases**, worse than the seed's 8. The first case expects `/usr/lib` and gets `usr/lib`. The model's lines are wrong, and the compile error hid that.
+- **The model is not told.** After its region was repaired, run and found failing, its next prompt still reports the compile error, with rustc's help, for the line that is already fixed. It then writes the same region again. The run alternates between one rejection and one repair until the budget is spent.
+- **The 14b model's one stuck case was left alone**, correctly: the fix for the `Vec` annotation is `HasPlaceholders`.
+
+Follow-ups:
+
+1. **crab-cage: report the repaired region's result to the model.** When a region of the model's did not compile and the repaired version ran, the next prompt shows the fixed lines and the case the repaired region fails, in place of the compile error. Done in the pull request after this run.
+2. **Run the ladder a fifth time** with it.
+3. Still open from the third run: the "Already tried" list quotes a rejected line once per attempt; L-13 as an edit for `lust fix`.
 
 # Phase 0: make what exists true
 
