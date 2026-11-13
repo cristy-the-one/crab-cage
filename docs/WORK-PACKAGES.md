@@ -50,7 +50,7 @@ Phase 3:  L-03 … L-11, any order
 | WP-18 | done | crab-cage #15; the proposer has run against a mock and a scripted stand-in server, not yet a real model |
 | WP-18b | done | crab-cage #18: an "already tried" list, the failing case, verdicts by hash |
 | The model prompt, tuned against a real model | done | see "First run against a real model" below |
-| The model ladder, an experiment to run on a GPU machine | run twice, 2026-11-12 and 2026-11-13 | `experiments/model-ladder/`; results in `experiments/model-ladder/results/`; see "The model ladder on a GPU machine" and "The second ladder run" below |
+| The model ladder, an experiment to run on a GPU machine | run three times, 2026-11-12 and twice on 2026-11-13 | `experiments/model-ladder/`; results in `experiments/model-ladder/results/`; see "The model ladder on a GPU machine", "The second ladder run" and "The third ladder run" below |
 | WP-19 | docs done; the tank port is not planned | README and DESIGN.md |
 | WP-20 | done | crab-cage #23. Exercised with zig 0.14.1 on `PATH` (the version lust's CI uses): the optimised build is used, `note` is empty, and `ms.opt` is real. Also exercised: no compiler at all (the TinyCC build is timed, with a note), `LUST_CC=gcc` under mingw (fails to link; falls back, with the error in the note), and two stand-in lusts in the tests. See "What the zig run showed" under WP-20 |
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
@@ -180,6 +180,35 @@ Follow-ups:
 1. **crab-cage: put rustc's whole first error into the prompt, with its help, and save every prompt and reply under `<out>/prompts/`.** Done in the pull request after this run.
 2. **lust: make the fix of L0113 name the dereference** when the two sides differ by one reference. New item L-13.
 3. **Run the ladder a third time** with both, and with `-Seed 1`, so the run can be repeated.
+
+## The third ladder run (2026-11-13)
+
+The same machine, models, nuggets, budget and three runs each, with lust 0.3.1 unchanged and crab-cage `b550ceb`: rustc's whole first error in the prompt, with its help, and every prompt saved. Run with `-Seed 1`. The one question was whether a model uses a fix that the prompt shows it. The files are in `experiments/model-ladder/results/2026-11-13-rtx5080-run3/`; `prompt-with-rustc-help.txt` there is one of the saved prompts with the model's reply.
+
+| Model | Nugget | Second run | Third run |
+|---|---|---|---|
+| qwen2.5-coder:7b | run-lengths | 1/3 | 2/3 |
+| qwen2.5-coder:7b | merge-ranges | 3/3 | 3/3 |
+| qwen2.5-coder:7b | normalize-path | 0/3 | 0/3 |
+| qwen2.5-coder:14b | run-lengths | 3/3 | 3/3 |
+| qwen2.5-coder:14b | merge-ranges | 3/3 | 3/3 |
+| qwen2.5-coder:14b | normalize-path | 1/3 | 1/3 |
+
+What it showed:
+
+- **No divergence and no oracle rejection in 129 candidates.** That is 341 candidates over the three runs.
+- **The 7b model does not use a fix it is shown.** On `normalize-path` it made 129 requests in three runs. 107 of them carried rustc's help with the corrected line, `*c != "."`. It wrote `c != "."` again in all but one reply, and all three runs spent the whole budget on that line.
+- **The prompt works against the fix.** In a prompt of 142 lines the wrong line stands 9 times, because the "Already tried, do not repeat" list quotes it for every rejected attempt, and the corrected line stands once.
+- **The 14b model uses the help, slowly.** Two of its three `merge-ranges` runs solved on the first candidate. The third had rustc's "consider giving `merged_ranges` an explicit type" in 10 prompts before it wrote `let mut merged_ranges: Vec<(usize, usize)> = Vec::new();`. In the second run it never annotated.
+- **The 14b model on `normalize-path` has another problem.** Its candidates compile and reach 1 failing case of 10, and stay there. No error message is involved.
+- **Whether a seed repeats a run on the GPU was not checked.**
+
+Follow-ups:
+
+1. **crab-cage: apply rustc's fixes without a model.** rustc marks the `*` as `MachineApplicable`. A proposer `repair` applies such fixes to a candidate that did not compile and proposes the result. Done in the pull request after this run. The fix for the `Vec` is `HasPlaceholders` and stays with the model.
+2. **crab-cage: do not quote a rejected line once per attempt in "Already tried".** Open.
+3. **lust, L-13: offer the dereference as an edit that `lust fix` applies**, which is the same idea without rustc. A better fix text alone would be read as little as rustc's was.
+4. **Run the ladder a fourth time** with the repair proposer.
 
 # Phase 0: make what exists true
 
