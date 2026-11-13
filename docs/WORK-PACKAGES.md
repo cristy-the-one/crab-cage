@@ -50,7 +50,7 @@ Phase 3:  L-03 … L-11, any order
 | WP-18 | done | crab-cage #15; the proposer has run against a mock and a scripted stand-in server, not yet a real model |
 | WP-18b | done | crab-cage #18: an "already tried" list, the failing case, verdicts by hash |
 | The model prompt, tuned against a real model | done | see "First run against a real model" below |
-| The model ladder, an experiment to run on a GPU machine | run four times, 2026-11-12 and three times on 2026-11-13 | `experiments/model-ladder/`; results in `experiments/model-ladder/results/`; see "The model ladder on a GPU machine", "The second ladder run", "The third ladder run" and "The fourth ladder run" below |
+| The model ladder, an experiment to run on a GPU machine | run five times, 2026-11-12 and four times on 2026-11-13 | `experiments/model-ladder/`; results in `experiments/model-ladder/results/`; see "The model ladder on a GPU machine", "The second ladder run", "The third ladder run", "The fourth ladder run" and "The fifth ladder run" below |
 | WP-19 | docs done; the tank port is not planned | README and DESIGN.md |
 | WP-20 | done | crab-cage #23. Exercised with zig 0.14.1 on `PATH` (the version lust's CI uses): the optimised build is used, `note` is empty, and `ms.opt` is real. Also exercised: no compiler at all (the TinyCC build is timed, with a note), `LUST_CC=gcc` under mingw (fails to link; falls back, with the error in the note), and two stand-in lusts in the tests. See "What the zig run showed" under WP-20 |
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
@@ -230,6 +230,33 @@ Follow-ups:
 1. **crab-cage: report the repaired region's result to the model.** When a region of the model's did not compile and the repaired version ran, the next prompt shows the fixed lines and the case the repaired region fails, in place of the compile error. Done in the pull request after this run.
 2. **Run the ladder a fifth time** with it.
 3. Still open from the third run: the "Already tried" list quotes a rejected line once per attempt; L-13 as an edit for `lust fix`.
+
+## The fifth ladder run (2026-11-13)
+
+The same command and seeds, with crab-cage `cc2b102`: the model is told what became of a region that only compiled after rustc's fix. lust 0.3.1 unchanged. `gpt-oss:20b` was run on the same three nuggets as a separate command. The files are in `experiments/model-ladder/results/2026-11-13-rtx5080-run5/` (`gpt-oss-20b/` holds the separate command's).
+
+| Model | run-lengths | merge-ranges | normalize-path |
+|---|---|---|---|
+| qwen2.5-coder:7b | 2/3 | 3/3 | 0/3 |
+| qwen2.5-coder:14b | 3/3 | 3/3 | 1/3 |
+| gpt-oss:20b | 3/3 | 3/3 | 3/3 |
+
+What it showed:
+
+- **The 7b model got the feedback and used it, and it was not enough.** On `normalize-path` the new block was in 48 of its 79 prompts. In the fourth run none of its own candidates compiled; now 9 did, with no repair. Every candidate that ran, its own or a repaired one, failed 9 or 10 of the 10 cases. The seed fails 8, so the best never moved.
+- **What the change does not touch is the fourth run again**, candidate for candidate: all nine runs of the 14b model and the 7b model's other six.
+- **`gpt-oss:20b` solved 9 of 9**, eight of them with its first candidate, and lust rejected none of its 10 candidates. `normalize-path` took it 1, 1 and 2 candidates; in the first run 2, 2 and 4.
+- **No divergence and no oracle rejection in 139 candidates**, 609 over the five runs.
+
+What the five runs say together:
+
+- **`normalize-path` is beyond a 7B model, and the loop is no longer the reason.** It compiles, it sees the case it fails, and it cannot write the logic. The 14b model is the same one step up: it reaches 1 failing case of 10 and stays there.
+- **The loop changes did what each was for.** Unsolved runs use the budget. A misleading message no longer costs a nugget (the 14b model on `merge-ranges`, 0 of 3 to 3 of 3). A compile error with a safe fix is repaired without a model. A run can be repeated with a seed, on the CPU and on the GPU. Every prompt and reply is on disk.
+- **The model for that machine is `gpt-oss:20b`.** It takes about three times as long per candidate as the 14b model and needs a fraction of the candidates.
+
+Next: the real problem. `nuggets/delta-kernel`, a `minimize` nugget, with `gpt-oss:20b` and the literal tweaker taking turns. It has not been run with a capable model. The steps are in `experiments/model-ladder/NEXT-RUN.md`.
+
+Still open, and not urgent now: the "Already tried" list quotes a rejected line once per attempt; L-13 as an edit for `lust fix`.
 
 # Phase 0: make what exists true
 
