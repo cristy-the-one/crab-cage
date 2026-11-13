@@ -29,8 +29,8 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Proposals that are already in the journal, or whose evaluation returns an
 /// error, do not append a line. This many in a row ends the run.
 const UNJOURNALED_LIMIT: usize = 50;
-/// `--tweak` has no seed flag. 1 is the evolve command's default seed, so a
-/// tweak run repeats on every machine.
+/// The tweak proposer's seed without `--seed`. 1 is the evolve command's
+/// default seed, so a tweak run repeats on every machine.
 const TWEAK_SEED: u64 = 1;
 const LOCAL_ENDPOINT: &str = "http://127.0.0.1:11434/v1";
 const LOCAL_MODEL: &str = "qwen2.5-coder:14b";
@@ -80,20 +80,22 @@ struct Outcome {
     stop: bool,
 }
 
-/// Append the literal-tweak proposer when `--tweak` is set.
+/// Append the literal-tweak proposer when `--tweak` is set. `seed` is
+/// `--seed`; without it the proposer uses [`TWEAK_SEED`].
 ///
 /// Proposers already in the list stay ahead of it, so a folder proposer still
 /// goes first and the two alternate. `slot` owns the proposer for the rest of
 /// the run.
 pub fn attach_tweak<'a>(
     enabled: bool,
+    seed: Option<u64>,
     slot: &'a mut Option<LiteralProposer>,
     proposers: &mut Vec<&'a mut dyn Proposer>,
 ) {
     if !enabled {
         return;
     }
-    *slot = Some(LiteralProposer::new(TWEAK_SEED));
+    *slot = Some(LiteralProposer::new(seed.unwrap_or(TWEAK_SEED)));
     if let Some(proposer) = slot.as_mut() {
         proposers.push(proposer);
     }
@@ -105,12 +107,14 @@ pub fn attach_tweak<'a>(
 /// for the rest of the run. The endpoint must be loopback http. The lust
 /// capability summary is read once here. It is empty with no `--lust-bin`,
 /// and empty when lust runs but the summary command fails. A `--lust-bin`
-/// that cannot be probed is an error.
+/// that cannot be probed is an error. `seed` is `--seed`: with it, each
+/// request to the model carries a seed.
 pub fn attach_model<'a>(
     backend: Option<&str>,
     endpoint: Option<&str>,
     model: Option<&str>,
     lust_bin: Option<&Path>,
+    seed: Option<u64>,
     slot: &'a mut Option<ModelProposer>,
     proposers: &mut Vec<&'a mut dyn Proposer>,
 ) -> Result<()> {
@@ -136,7 +140,8 @@ pub fn attach_model<'a>(
         std::env::temp_dir().join(format!("crab-cage-second-opinion-{}", std::process::id()));
     *slot = Some(
         ModelProposer::new(endpoint, model, capabilities)?
-            .with_second_opinion(crate::proposer::rustc_second_opinion(opinion_dir)),
+            .with_second_opinion(crate::proposer::rustc_second_opinion(opinion_dir))
+            .with_seed(seed),
     );
     if let Some(proposer) = slot.as_mut() {
         proposers.push(proposer);
@@ -1035,7 +1040,7 @@ mod tests {
         };
         let mut proposers: Vec<&mut dyn Proposer> = vec![&mut folder];
         let mut slot = None;
-        attach_tweak(false, &mut slot, &mut proposers);
+        attach_tweak(false, None, &mut slot, &mut proposers);
         assert_eq!(proposers.len(), 1);
         assert_eq!(proposers[0].name(), "folder");
 
@@ -1045,7 +1050,7 @@ mod tests {
         };
         let mut proposers: Vec<&mut dyn Proposer> = vec![&mut folder];
         let mut slot = None;
-        attach_tweak(true, &mut slot, &mut proposers);
+        attach_tweak(true, None, &mut slot, &mut proposers);
         assert_eq!(proposers.len(), 2);
         assert_eq!(proposers[0].name(), "folder");
         assert_eq!(proposers[1].name(), "tweak");
@@ -1059,7 +1064,7 @@ mod tests {
         };
         let mut proposers: Vec<&mut dyn Proposer> = vec![&mut folder];
         let mut slot = None;
-        attach_model(None, None, None, None, &mut slot, &mut proposers).unwrap();
+        attach_model(None, None, None, None, None, &mut slot, &mut proposers).unwrap();
         assert_eq!(proposers.len(), 1);
         assert!(slot.is_none());
 
@@ -1073,6 +1078,7 @@ mod tests {
             Some("local"),
             None,
             Some("demo"),
+            None,
             None,
             &mut slot,
             &mut proposers,
@@ -1089,6 +1095,7 @@ mod tests {
             Some("http://api.openai.com/v1"),
             None,
             None,
+            None,
             &mut slot,
             &mut proposers,
         )
@@ -1099,8 +1106,16 @@ mod tests {
 
         let mut slot = None;
         let mut proposers: Vec<&mut dyn Proposer> = Vec::new();
-        let unknown =
-            attach_model(Some("mock"), None, None, None, &mut slot, &mut proposers).unwrap_err();
+        let unknown = attach_model(
+            Some("mock"),
+            None,
+            None,
+            None,
+            None,
+            &mut slot,
+            &mut proposers,
+        )
+        .unwrap_err();
         assert!(unknown.to_string().contains("unknown backend"), "{unknown}");
 
         let mut slot = None;
@@ -1108,6 +1123,7 @@ mod tests {
         let needs_backend = attach_model(
             None,
             Some("http://127.0.0.1:11434/v1"),
+            None,
             None,
             None,
             &mut slot,
