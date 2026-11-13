@@ -2,6 +2,8 @@
 
 One script that runs the search loop with local models on nuggets of rising difficulty and writes one table. It is meant to be run on a machine with a real GPU and sent back.
 
+The run that is due next, with the exact command and what to bring back, is in [NEXT-RUN.md](NEXT-RUN.md).
+
 ## What it answers
 
 1. **Which model size solves what.** On a laptop processor a 7.6B model solved the easy nugget in one request and stalled on the hard one. Does a 14B or 20B model on a GPU get further, and how many candidates does it take?
