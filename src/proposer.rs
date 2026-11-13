@@ -441,6 +441,47 @@ pub struct ModelProposer {
     seed: Option<u64>,
     /// Requests sent so far; added to the seed.
     requests: u64,
+    /// Where each request and its reply is written, one file per request.
+    prompt_log: Option<PromptLog>,
+}
+
+/// One text file per request in `dir`: `0001.txt`, `0002.txt`, and so on.
+struct PromptLog {
+    dir: PathBuf,
+    /// Number of the next file. Files already in `dir` are counted first, so
+    /// a run that continues an earlier one does not overwrite its files.
+    next: Option<usize>,
+}
+
+impl PromptLog {
+    /// Write one request and its reply. A failure to write is ignored: the
+    /// log is for a person reading the run afterwards, and the run goes on.
+    fn write(
+        &mut self,
+        system: &str,
+        user: &str,
+        temperature: f64,
+        seed: Option<u64>,
+        reply: &Result<String>,
+    ) {
+        if fs::create_dir_all(&self.dir).is_err() {
+            return;
+        }
+        let number = match self.next {
+            Some(number) => number,
+            None => fs::read_dir(&self.dir).map_or(0, |entries| entries.count()) + 1,
+        };
+        self.next = Some(number + 1);
+        let seed = seed.map_or("none".to_string(), |seed| seed.to_string());
+        let reply = match reply {
+            Ok(text) => format!("--- reply ---\n{text}"),
+            Err(error) => format!("--- no reply ---\n{error}"),
+        };
+        let text = format!(
+            "temperature: {temperature}\nseed: {seed}\n\n--- system ---\n{system}\n--- user ---\n{user}\n{reply}\n"
+        );
+        let _ = fs::write(self.dir.join(format!("{number:04}.txt")), text);
+    }
 }
 
 impl ModelProposer {
@@ -465,7 +506,16 @@ impl ModelProposer {
             second_opinion: None,
             seed: None,
             requests: 0,
+            prompt_log: None,
         })
+    }
+
+    /// Write every request to the model and its reply into `dir`, one file
+    /// each. A journal holds the candidates and their verdicts; this holds
+    /// what the model was told before it wrote each one.
+    pub fn with_prompt_log(mut self, dir: Option<PathBuf>) -> Self {
+        self.prompt_log = dir.map(|dir| PromptLog { dir, next: None });
+        self
     }
 
     /// Send a seed with every request, so a run can be repeated: the first
@@ -517,6 +567,9 @@ impl Proposer for ModelProposer {
                 temperature,
                 seed,
             );
+            if let Some(log) = self.prompt_log.as_mut() {
+                log.write(&system, &asked, temperature, seed, &raw);
+            }
             match self.memory.consume(raw) {
                 Step::Return(text) => return Ok(Proposal::Candidate(text)),
                 Step::Later => return Ok(Proposal::Later),
@@ -1166,10 +1219,11 @@ fn format_diagnostic(diagnostic: &Diagnostic) -> String {
 /// A [`SecondOpinion`] that checks the program with rustc, in `dir`.
 ///
 /// rustc only checks it (`--emit=metadata`), which takes a fraction of a
-/// build. When rustc rejects it too, the answer is rustc's errors, each with
-/// the source line it points at. When rustc accepts it, the answer says that
-/// lust does not support something in the lines. None when rustc is missing,
-/// times out, or the files cannot be written.
+/// build. When rustc rejects it too, the answer is rustc's first errors as
+/// rustc prints them, with the source lines and the `help:` it gives (see
+/// [`rustc_errors`]). When rustc accepts it, the answer says that lust does
+/// not support something in the lines. None when rustc is missing, times
+/// out, or the files cannot be written.
 pub fn rustc_second_opinion(dir: PathBuf) -> SecondOpinion {
     Box::new(move |program: &str| {
         let rustc = crate::lust::which("rustc")?;
@@ -1178,7 +1232,7 @@ pub fn rustc_second_opinion(dir: PathBuf) -> SecondOpinion {
         fs::write(&source, program).ok()?;
         let mut command = std::process::Command::new(rustc);
         command
-            .args(["--edition", "2021", "--error-format=short"])
+            .args(["--edition", "2021", "--color", "never"])
             .arg("--emit=metadata")
             .arg("-o")
             .arg(dir.join("second-opinion.rmeta"))
@@ -1195,12 +1249,12 @@ pub fn rustc_second_opinion(dir: PathBuf) -> SecondOpinion {
                     .to_string(),
             ),
             crate::supervisor::StopKind::Exited(_) => {
-                let summary = rustc_summary(&ran.stderr, program);
-                if summary.is_empty() {
+                let errors = rustc_errors(&ran.stderr);
+                if errors.is_empty() {
                     None
                 } else {
                     Some(format!(
-                        "rustc rejects these lines too. It says:\n{summary}"
+                        "rustc rejects these lines too. It says:\n{errors}"
                     ))
                 }
             }
@@ -1209,34 +1263,69 @@ pub fn rustc_second_opinion(dir: PathBuf) -> SecondOpinion {
     })
 }
 
-/// The errors in rustc's `--error-format=short` output, at most three: the
-/// message, then the source line of `program` it points at. A line there is
-/// `path:line:col: error[E0282]: message`.
-fn rustc_summary(stderr: &str, program: &str) -> String {
-    let source: Vec<&str> = program.lines().collect();
+/// Errors of one rustc run that go into the prompt.
+const RUSTC_ERRORS_SHOWN: usize = 2;
+/// Lines of rustc output that go into the prompt.
+const RUSTC_LINES_SHOWN: usize = 40;
+
+/// The first errors of rustc's ordinary output, as rustc prints them.
+///
+/// The one-line form (`--error-format=short`) leaves out what a model needs
+/// most: the `help:` with the changed line. For `c != "."` on a `&&str` it
+/// is "consider dereferencing here" and the line with `*c`.
+///
+/// rustc separates its messages with an empty line. Kept: the blocks that
+/// start with `error`, except its closing count. Left out of each block:
+/// the `-->` line (a path in a temporary folder) and the line numbers in
+/// the margin, which count the whole program, not the lines the model sees.
+fn rustc_errors(stderr: &str) -> String {
     let mut out = String::new();
     let mut errors = 0;
+    let mut lines = 0;
+    let mut keep = false;
+    let mut block_start = true;
     for line in stderr.lines() {
-        let Some(at) = line.find(": error") else {
+        if line.trim().is_empty() {
+            block_start = true;
             continue;
-        };
-        if errors == 3 {
+        }
+        if block_start {
+            block_start = false;
+            keep = line.starts_with("error")
+                && !line.starts_with("error: aborting")
+                && !line.starts_with("error: could not compile")
+                && errors < RUSTC_ERRORS_SHOWN;
+            if keep {
+                errors += 1;
+            }
+        }
+        if !keep || line.trim_start().starts_with("-->") {
+            continue;
+        }
+        if lines == RUSTC_LINES_SHOWN {
             break;
         }
-        errors += 1;
-        out.push_str(line[at + 2..].trim_end());
+        lines += 1;
+        out.push_str(&without_margin_number(line));
         out.push('\n');
-        // The path may hold a colon (`C:\...`), so read from the right.
-        let mut parts = line[..at].rsplit(':');
-        let _col = parts.next();
-        let number = parts.next().and_then(|n| n.parse::<usize>().ok());
-        if let Some(text) = number.and_then(|n| source.get(n.checked_sub(1)?)) {
-            out.push_str("  at: ");
-            out.push_str(text.trim());
-            out.push('\n');
-        }
     }
     out
+}
+
+/// `15 |     let x = 1;` becomes `   |     let x = 1;`: the same width, so
+/// the `^` marks under it still point at the same columns.
+fn without_margin_number(line: &str) -> String {
+    let indent = line.len() - line.trim_start().len();
+    let digits = line[indent..]
+        .bytes()
+        .take_while(u8::is_ascii_digit)
+        .count();
+    let rest = &line[indent + digits..];
+    if digits > 0 && rest.starts_with(" |") {
+        format!("{}{rest}", " ".repeat(indent + digits))
+    } else {
+        line.to_string()
+    }
 }
 
 fn accept_region(raw: &str) -> Result<String> {
@@ -2718,14 +2807,49 @@ mod tests {
     }
 
     #[test]
-    fn rustc_summary_keeps_the_message_and_the_source_line() {
-        let program = "fn main() {\n    let mut v = Vec::new();\n    v.len();\n}\n";
-        let stderr = "C:\\work\\second-opinion.rs:2:9: error[E0282]: type annotations needed for `Vec<_>`\nerror: aborting due to 1 previous error\n";
+    fn rustc_errors_keep_the_help_and_drop_the_path_and_the_line_numbers() {
+        let stderr = "\
+warning: unused variable: `x`
+ --> C:\\work\\second-opinion.rs:3:9
+  |
+3 |     let x = 1;
+  |         ^
+
+error[E0277]: can't compare `&str` with `str`
+  --> C:\\work\\second-opinion.rs:15:79
+   |
+15 | let v: Vec<&str> = p.split('/').filter(|c| c != \".\").collect();
+   |                                              ^^ no implementation for `&str == str`
+   |
+   = help: the trait `PartialEq<str>` is not implemented for `&str`
+help: consider dereferencing here
+   |
+15 | let v: Vec<&str> = p.split('/').filter(|c| *c != \".\").collect();
+   |                                            +
+
+error: aborting due to 1 previous error; 1 warning emitted
+
+For more information about this error, try `rustc --explain E0277`.
+";
         assert_eq!(
-            rustc_summary(stderr, program),
-            "error[E0282]: type annotations needed for `Vec<_>`\n  at: let mut v = Vec::new();\n"
+            rustc_errors(stderr),
+            "\
+error[E0277]: can't compare `&str` with `str`
+   |
+   | let v: Vec<&str> = p.split('/').filter(|c| c != \".\").collect();
+   |                                              ^^ no implementation for `&str == str`
+   |
+   = help: the trait `PartialEq<str>` is not implemented for `&str`
+help: consider dereferencing here
+   |
+   | let v: Vec<&str> = p.split('/').filter(|c| *c != \".\").collect();
+   |                                            +
+"
         );
-        assert_eq!(rustc_summary("warning: unused\n", program), "");
+        assert_eq!(rustc_errors("warning: unused\n"), "");
+        // Two errors are shown, a third is not.
+        let three = "error: one\n\nerror: two\n\nerror: three\n\nerror: aborting due to 3 previous errors\n";
+        assert_eq!(rustc_errors(three), "error: one\nerror: two\n");
     }
 
     #[test]
@@ -2741,7 +2865,18 @@ mod tests {
         let text = opinion(rejected).unwrap();
         assert!(text.starts_with("rustc rejects these lines too."), "{text}");
         assert!(text.contains("E0282"), "{text}");
-        assert!(text.contains("at: let mut merged = Vec::new();"), "{text}");
+        assert!(text.contains("let mut merged = Vec::new();"), "{text}");
+        // rustc's help names the binding to annotate. The path of the
+        // temporary file is not in the text.
+        assert!(text.contains("help: consider giving `merged`"), "{text}");
+        assert!(!text.contains("second-opinion.rs"), "{text}");
+
+        // The line that stopped a 7B model on `normalize-path` about forty
+        // times: the fix is in rustc's help and nowhere else.
+        let compare = "fn main() {\n    let p = \"a/./b\";\n    let v: Vec<&str> = p.split('/').filter(|c| c != \".\").collect();\n    println!(\"{}\", v.len());\n}\n";
+        let text = opinion(compare).unwrap();
+        assert!(text.contains("consider dereferencing here"), "{text}");
+        assert!(text.contains("filter(|c| *c != \".\")"), "{text}");
 
         let accepted = "fn main() {\n    println!(\"ok\");\n}\n";
         let text = opinion(accepted).unwrap();
@@ -2761,5 +2896,36 @@ mod tests {
         assert_eq!(seeded.request_seed(), Some(40));
         assert_eq!(seeded.request_seed(), Some(41));
         assert_eq!(seeded.request_seed(), Some(42));
+    }
+
+    #[test]
+    fn the_prompt_log_writes_one_numbered_file_per_request() {
+        let dir = scratch("prompt-log");
+        let mut log = PromptLog {
+            dir: dir.clone(),
+            next: None,
+        };
+        log.write("SYSTEM", "USER ONE", 0.2, Some(7), &Ok("REPLY".to_string()));
+        log.write("SYSTEM", "USER TWO", 0.8, None, &Err(err("timed out")));
+        let first = fs::read_to_string(dir.join("0001.txt")).unwrap();
+        assert!(first.starts_with("temperature: 0.2\nseed: 7\n"), "{first}");
+        assert!(first
+            .contains("--- system ---\nSYSTEM\n--- user ---\nUSER ONE\n--- reply ---\nREPLY\n"));
+        let second = fs::read_to_string(dir.join("0002.txt")).unwrap();
+        assert!(
+            second.starts_with("temperature: 0.8\nseed: none\n"),
+            "{second}"
+        );
+        assert!(second.contains("--- no reply ---\n"), "{second}");
+        assert!(second.contains("timed out"), "{second}");
+
+        // A run that continues in the same folder numbers on from there.
+        let mut again = PromptLog {
+            dir: dir.clone(),
+            next: None,
+        };
+        again.write("SYSTEM", "USER THREE", 0.2, None, &Ok("R".to_string()));
+        assert!(dir.join("0003.txt").is_file());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

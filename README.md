@@ -139,6 +139,7 @@ journal.jsonl     one verdict per line, with the proposer's name
 best.rs           the whole program with the best proven candidate in place
 best.region.rs    the candidate text alone
 work/             every candidate as <hash>.rs, its binary, and divergences/
+prompts/          with --backend local: each request to the model and its reply, 0001.txt onwards
 ```
 
 - **Only `proven` counts.** A candidate becomes the best only after `rustc` has built it and printed the same output as the fast build. A candidate whose `rustc` build disagrees with itself between two runs is rejected as nondeterministic.

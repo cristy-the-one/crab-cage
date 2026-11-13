@@ -508,6 +508,7 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
         args.model.as_deref(),
         args.lust_bin.as_deref(),
         args.seed,
+        Some(&args.out.join("prompts")),
         &mut model,
         &mut proposers,
     )?;
