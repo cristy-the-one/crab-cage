@@ -109,6 +109,7 @@ pub fn attach_tweak<'a>(
 /// proposer for the rest of the run.
 pub fn attach_repair<'a>(
     enabled: bool,
+    log: &crate::repair::RepairLog,
     slot: &'a mut Option<crate::repair::RepairProposer>,
     proposers: &mut Vec<&'a mut dyn Proposer>,
 ) {
@@ -117,9 +118,10 @@ pub fn attach_repair<'a>(
     }
     // Private to this process: two runs must not write the same file.
     let dir = std::env::temp_dir().join(format!("crab-cage-repair-{}", std::process::id()));
-    *slot = Some(crate::repair::RepairProposer::new(
-        crate::repair::rustc_diagnose(dir),
-    ));
+    *slot = Some(
+        crate::repair::RepairProposer::new(crate::repair::rustc_diagnose(dir))
+            .with_log(crate::repair::RepairLog::clone(log)),
+    );
     if let Some(proposer) = slot.as_mut() {
         proposers.push(proposer);
     }
@@ -141,6 +143,7 @@ pub fn attach_model<'a>(
     lust_bin: Option<&Path>,
     seed: Option<u64>,
     prompt_dir: Option<&Path>,
+    repairs: Option<&crate::repair::RepairLog>,
     slot: &'a mut Option<ModelProposer>,
     proposers: &mut Vec<&'a mut dyn Proposer>,
 ) -> Result<()> {
@@ -168,7 +171,8 @@ pub fn attach_model<'a>(
         ModelProposer::new(endpoint, model, capabilities)?
             .with_second_opinion(crate::proposer::rustc_second_opinion(opinion_dir))
             .with_seed(seed)
-            .with_prompt_log(prompt_dir.map(Path::to_path_buf)),
+            .with_prompt_log(prompt_dir.map(Path::to_path_buf))
+            .with_repairs(repairs.cloned()),
     );
     if let Some(proposer) = slot.as_mut() {
         proposers.push(proposer);
@@ -1063,7 +1067,7 @@ mod tests {
     fn repair_joins_after_the_proposers_already_there() {
         let mut slot = None;
         let mut proposers: Vec<&mut dyn Proposer> = Vec::new();
-        attach_repair(false, &mut slot, &mut proposers);
+        attach_repair(false, &Default::default(), &mut slot, &mut proposers);
         assert!(proposers.is_empty());
         drop(proposers);
         assert!(slot.is_none());
@@ -1071,7 +1075,7 @@ mod tests {
         let mut folder = crate::proposer::FolderProposer::new("unused");
         let mut slot = None;
         let mut proposers: Vec<&mut dyn Proposer> = vec![&mut folder];
-        attach_repair(true, &mut slot, &mut proposers);
+        attach_repair(true, &Default::default(), &mut slot, &mut proposers);
         assert_eq!(proposers.len(), 2);
         assert_eq!(proposers[1].name(), "repair");
     }
@@ -1115,6 +1119,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut slot,
             &mut proposers,
         )
@@ -1135,6 +1140,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut slot,
             &mut proposers,
         )
@@ -1148,6 +1154,7 @@ mod tests {
         let refused = attach_model(
             Some("local"),
             Some("http://api.openai.com/v1"),
+            None,
             None,
             None,
             None,
@@ -1169,6 +1176,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut slot,
             &mut proposers,
         )
@@ -1180,6 +1188,7 @@ mod tests {
         let needs_backend = attach_model(
             None,
             Some("http://127.0.0.1:11434/v1"),
+            None,
             None,
             None,
             None,

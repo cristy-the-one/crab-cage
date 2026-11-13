@@ -518,6 +518,12 @@ impl ModelProposer {
         self
     }
 
+    /// Read what the repair proposer did with this proposer's regions.
+    pub fn with_repairs(mut self, log: Option<crate::repair::RepairLog>) -> Self {
+        self.memory.repairs = log;
+        self
+    }
+
     /// Send a seed with every request, so a run can be repeated: the first
     /// request gets `seed`, the next `seed + 1`, and so on. One seed for
     /// every request would make a model that repeats a region repeat it
@@ -683,6 +689,11 @@ struct ModelMemory {
     /// The second opinion on the region with this hash, kept so that a batch
     /// of prompts asks once.
     opinion: Option<(String, Option<String>)>,
+    /// What the repair proposer has proposed, when the run has one.
+    repairs: Option<crate::repair::RepairLog>,
+    /// Set when `own` is not this proposer's reply itself but that reply
+    /// with rustc's fix applied: the lines the fix changed.
+    repaired: Option<Vec<String>>,
 }
 
 struct Tried {
@@ -718,6 +729,8 @@ impl Default for ModelMemory {
             last_code: None,
             same_code: 0,
             opinion: None,
+            repairs: None,
+            repaired: None,
         }
     }
 }
@@ -751,8 +764,10 @@ impl ModelMemory {
             }
             self.own = Some(verdict.clone());
             self.own_text = Some(region.clone());
+            self.repaired = None;
             self.remember_tried(hash, region, outcome_of(verdict));
         }
+        self.adopt_repair(feedback);
         // Still pending after its batch settled: never evaluated.
         let (stale, live): (Vec<Pending>, Vec<Pending>) =
             self.pending.drain(..).partition(|item| item.waited);
@@ -760,6 +775,68 @@ impl ModelMemory {
         for item in stale {
             self.remember_tried(item.hash, item.text, NOT_EVALUATED.to_string());
         }
+    }
+
+    /// When this proposer's last region did not compile and the repair
+    /// proposer's version of it compiled and has a verdict, that verdict
+    /// takes the place of the rejection.
+    ///
+    /// Without this the model is told about the compile error again, for a
+    /// line that is already fixed, and never learns what its lines do when
+    /// they run. In the fourth ladder run a 7B model wrote the same region
+    /// nine times in a run that way.
+    fn adopt_repair(&mut self, feedback: &Feedback) {
+        let Some(log) = &self.repairs else {
+            return;
+        };
+        let Some(own) = self
+            .own
+            .as_ref()
+            .filter(|own| own.status == Status::Rejected)
+        else {
+            return;
+        };
+        let Some(fixed) = log
+            .borrow()
+            .iter()
+            .rev()
+            .find(|(hash, _)| *hash == own.hash)
+            .map(|(_, text)| text.clone())
+        else {
+            return;
+        };
+        let fixed_hash = candidate_hash(&fixed);
+        let Some(verdict) = feedback
+            .recent
+            .iter()
+            .rev()
+            .find(|(text, _)| candidate_hash(text) == fixed_hash)
+            .map(|&(_, verdict)| verdict)
+            .filter(|verdict| verdict.status != Status::Rejected)
+        else {
+            return;
+        };
+        let original = self.own_text.clone().unwrap_or_default();
+        let before: HashSet<&str> = original.lines().collect();
+        let changed: Vec<String> = fixed
+            .lines()
+            .filter(|line| !before.contains(line))
+            .map(str::to_string)
+            .collect();
+        let original_hash = own.hash.clone();
+        if let Some(item) = self
+            .tried
+            .iter_mut()
+            .find(|item| item.hash == original_hash)
+        {
+            item.outcome = format!("did not compile; with rustc's fix: {}", outcome_of(verdict));
+        }
+        self.rejected_in_a_row = 0;
+        self.same_code = 0;
+        self.last_code = None;
+        self.own = Some(verdict.clone());
+        self.own_text = Some(fixed);
+        self.repaired = Some(changed);
     }
 
     fn remember_tried(&mut self, hash: String, text: String, outcome: String) {
@@ -926,6 +1003,7 @@ fn prepare_prompt(
         &base,
         base_verdict(&base, feedback),
         memory.own.as_ref(),
+        memory.repaired.as_deref(),
         second.as_deref(),
         best_score,
         &memory.tried,
@@ -965,6 +1043,7 @@ fn user_prompt(
     base: &str,
     base_verdict: Option<&Verdict>,
     own: Option<&Verdict>,
+    repaired: Option<&[String]>,
     second_opinion: Option<&str>,
     best_score: Option<f64>,
     tried: &[Tried],
@@ -991,6 +1070,15 @@ fn user_prompt(
             }
         }
     }
+    // A reply that only compiled with rustc's fix gets its own block, with
+    // the case it fails; the lines below then say nothing more about it.
+    let own = match (repaired, own) {
+        (Some(changed), Some(verdict)) => {
+            append_repaired(&mut out, changed, verdict);
+            None
+        }
+        _ => own,
+    };
     match base_verdict.filter(|verdict| fails_cases(verdict)) {
         Some(current) => append_current_scored(&mut out, current, own),
         None => {
@@ -1052,6 +1140,40 @@ fn append_current_scored(out: &mut String, current: &Verdict, own: Option<&Verdi
         current.total
     ));
     match &current.failure {
+        Some(failure) => {
+            out.push_str(" One of them:\n");
+            append_failure(out, failure);
+        }
+        None => out.push('\n'),
+    }
+}
+
+/// Lines of a repaired region shown in the prompt.
+const REPAIRED_LINES_SHOWN: usize = 6;
+
+/// What became of the proposer's last region after rustc's fix: the lines
+/// the fix changed, and the case the repaired region fails.
+fn append_repaired(out: &mut String, changed: &[String], verdict: &Verdict) {
+    out.push_str("Your last region did not compile. rustc's fix was applied to it");
+    if changed.is_empty() {
+        out.push_str(".\n");
+    } else {
+        out.push_str(". The fixed lines:\n");
+        for line in changed.iter().take(REPAIRED_LINES_SHOWN) {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !fails_cases(verdict) {
+        out.push_str("With the fix it compiled and ran.\n");
+        return;
+    }
+    let failed = verdict.total.saturating_sub(verdict.passed);
+    out.push_str(&format!(
+        "With the fix it ran and failed {failed} of {} cases.",
+        verdict.total
+    ));
+    match &verdict.failure {
         Some(failure) => {
             out.push_str(" One of them:\n");
             append_failure(out, failure);
@@ -2927,5 +3049,98 @@ help: consider dereferencing here
         again.write("SYSTEM", "USER THREE", 0.2, None, &Ok("R".to_string()));
         assert!(dir.join("0003.txt").is_file());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_repaired_region_is_reported_with_the_case_it_fails() {
+        let nugget = region_nugget(nugget::Objective::PassAll);
+        let log = crate::repair::RepairLog::default();
+        let mut proposer = MockModelProposer::new(
+            vec![
+                "let a = c != 1;\n".to_string(),
+                "two\n".to_string(),
+                "three\n".to_string(),
+            ],
+            "",
+        );
+        proposer.memory.repairs = Some(crate::repair::RepairLog::clone(&log));
+        let first = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
+
+        // Rejected, and no repair yet: the prompt reports the rejection.
+        let mut refused = rejected("L0113", 1, "");
+        refused.hash = candidate_hash(&first);
+        let recent = [(first.as_str(), &refused)];
+        let feedback = Feedback {
+            best: None,
+            last: None,
+            recent: &recent,
+            best_verdict: None,
+        };
+        proposer.next(&nugget, &feedback).unwrap();
+        assert!(proposer.prompts[1].user.contains("L0113"));
+        assert!(!proposer.prompts[1].user.contains("rustc's fix was applied"));
+
+        // A fresh proposer in the same state, now with the repair settled:
+        // the repaired region ran and failed a case.
+        let mut proposer = MockModelProposer::new(
+            vec!["let a = c != 1;\n".to_string(), "two\n".to_string()],
+            "",
+        );
+        proposer.memory.repairs = Some(crate::repair::RepairLog::clone(&log));
+        let first = proposer
+            .next(&nugget, &quiet())
+            .unwrap()
+            .into_text()
+            .unwrap();
+        let fixed = "let a = *c != 1;";
+        log.borrow_mut()
+            .push((candidate_hash(&first), fixed.to_string()));
+        let mut ran = scored(
+            1,
+            3,
+            2.0,
+            Some(CaseFailure {
+                id: "c1".to_string(),
+                input: "IN\n".to_string(),
+                expected: "WANT\n".to_string(),
+                actual: "GOT\n".to_string(),
+            }),
+        );
+        ran.hash = candidate_hash(fixed);
+        let recent = [(first.as_str(), &refused), (fixed, &ran)];
+        let feedback = Feedback {
+            best: None,
+            last: None,
+            recent: &recent,
+            best_verdict: None,
+        };
+        proposer.next(&nugget, &feedback).unwrap();
+        let prompt = &proposer.prompts[1].user;
+        assert!(
+            prompt.contains(
+                "Your last region did not compile. rustc's fix was applied to it. The fixed lines:\nlet a = *c != 1;\nWith the fix it ran and failed 2 of 3 cases. One of them:\ncase c1\ninput:\nIN\nexpected:\nWANT\nactual:\nGOT\n"
+            ),
+            "{prompt}"
+        );
+        // The compile error is not reported again, and the list of tried
+        // regions says what became of the reply.
+        assert!(
+            !prompt.contains("L0113 expected a semicolon. Hint"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("did not compile; with rustc's fix: ran, failed 2 of 3 cases"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.ends_with("Reply with the complete new lines that replace them.\n"),
+            "{prompt}"
+        );
+        assert_eq!(proposer.memory.same_code, 0);
+        assert_eq!(proposer.memory.rejected_in_a_row, 0);
     }
 }

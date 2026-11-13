@@ -22,6 +22,11 @@ use crate::proposer::{Feedback, Proposal, Proposer};
 /// Wall-clock limit of one rustc check.
 const RUSTC_TIMEOUT: Duration = Duration::from_secs(60);
 
+/// What the repair proposer has proposed, oldest first: the hash of the
+/// candidate it repaired, and the repaired text. The model proposer reads
+/// it to find out what became of a region of its own that did not compile.
+pub type RepairLog = std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>;
+
 /// Given a whole program, rustc's diagnostics for it as JSON lines
 /// (`--error-format=json`). None when rustc accepts the program or cannot
 /// be run.
@@ -39,6 +44,7 @@ pub struct RepairProposer {
     diagnose: Diagnose,
     /// Hashes of the candidates already given to rustc.
     examined: HashSet<String>,
+    log: Option<RepairLog>,
 }
 
 impl RepairProposer {
@@ -46,7 +52,14 @@ impl RepairProposer {
         Self {
             diagnose,
             examined: HashSet::new(),
+            log: None,
         }
+    }
+
+    /// Record every repair in `log`.
+    pub fn with_log(mut self, log: RepairLog) -> Self {
+        self.log = Some(log);
+        self
     }
 }
 
@@ -69,6 +82,9 @@ impl Proposer for RepairProposer {
             let start = nugget.prefix.len();
             let region = start..start + text.len();
             if let Some(fixed) = apply_fixes(&program, &diagnostics, region) {
+                if let Some(log) = &self.log {
+                    log.borrow_mut().push((candidate_hash(text), fixed.clone()));
+                }
                 return Ok(Proposal::Candidate(fixed));
             }
         }
@@ -311,11 +327,13 @@ mod tests {
         let nugget = nugget();
         let asked: Rc<RefCell<Vec<String>>> = Rc::new(RefCell::new(Vec::new()));
         let record = Rc::clone(&asked);
+        let log = RepairLog::default();
         let mut proposer = RepairProposer::new(Box::new(move |program: &str| {
             record.borrow_mut().push(program.to_string());
             let at = program.find("c != ")?;
             Some(error_with_fix(at, at, "*", "MachineApplicable"))
-        }));
+        }))
+        .with_log(RepairLog::clone(&log));
         assert_eq!(proposer.name(), "repair");
 
         // Nothing settled yet, and a candidate that ran: nothing to repair.
@@ -348,6 +366,9 @@ mod tests {
         assert!(fixed.contains("|c| *c != "), "{fixed}");
         assert_eq!(asked.borrow().len(), 1);
         assert_eq!(asked.borrow()[0], nugget.splice(BAD));
+
+        // The repair is in the log, under the hash of what it repaired.
+        assert_eq!(*log.borrow(), vec![(candidate_hash(BAD), fixed.clone())]);
 
         // The same candidate is not given to rustc a second time.
         assert_eq!(proposer.next(&nugget, &feedback).unwrap(), Proposal::Later);
