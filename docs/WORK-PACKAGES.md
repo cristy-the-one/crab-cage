@@ -50,7 +50,7 @@ Phase 3:  L-03 … L-11, any order
 | WP-18 | done | crab-cage #15; the proposer has run against a mock and a scripted stand-in server, not yet a real model |
 | WP-18b | done | crab-cage #18: an "already tried" list, the failing case, verdicts by hash |
 | The model prompt, tuned against a real model | done | see "First run against a real model" below |
-| The model ladder, an experiment to run on a GPU machine | run once, 2026-11-12 | `experiments/model-ladder/`; results in `experiments/model-ladder/results/2026-11-12-rtx5080/`; see "The model ladder on a GPU machine" below |
+| The model ladder, an experiment to run on a GPU machine | run twice, 2026-11-12 and 2026-11-13 | `experiments/model-ladder/`; results in `experiments/model-ladder/results/`; see "The model ladder on a GPU machine" and "The second ladder run" below |
 | WP-19 | docs done; the tank port is not planned | README and DESIGN.md |
 | WP-20 | done | crab-cage #23. Exercised with zig 0.14.1 on `PATH` (the version lust's CI uses): the optimised build is used, `note` is empty, and `ms.opt` is real. Also exercised: no compiler at all (the TinyCC build is timed, with a note), `LUST_CC=gcc` under mingw (fails to link; falls back, with the error in the note), and two stand-in lusts in the tests. See "What the zig run showed" under WP-20 |
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
@@ -61,6 +61,7 @@ Phase 3:  L-03 … L-11, any order
 | L-07 | measured; see the package | |
 | L-10 | done | lust-lang [#39](https://github.com/cristy-the-one/lust-lang/pull/39); it also closes the same leak for file descriptors on Unix |
 | L-11 | open; needs a decision first | below |
+| L-13 | new, open | below |
 | L-12 | done | lust-lang [#41](https://github.com/cristy-the-one/lust-lang/pull/41) |
 | lust 0.3.1 | released 2026-11-12 | [v0.3.1](https://github.com/cristy-the-one/lust-lang/releases/tag/v0.3.1): L-01 to L-04, L-06, L-08, L-10 and L-12 |
 
@@ -149,6 +150,36 @@ Follow-ups, all three done. None has been measured on the GPU machine yet: the l
 1. **lust: say "type annotations needed" for a field on a type that is not yet known**, in place of L0103's "no field". Done as L-12, lust-lang #41: the message is now `L0610`, with the fix "Annotate the binding it comes from".
 2. **crab-cage: when the same lust code rejects a proposer's region twice in a row, add rustc's message for that program to the prompt.** Done in crab-cage #26. rustc only checks the program (`--emit=metadata`), once per program. It has run in tests and never with a real model.
 3. **crab-cage: do not retire the model on the first repeats.** Done in crab-cage #26: a repeated reply is asked again at temperature 0.8, then 1.0, then 1.2, with a note that the last reply was the same. On the work laptop's 7.6B model, one of two runs of `run-lengths` went from 2 candidates to 9; the other still stopped at 2.
+
+## The second ladder run (2026-11-13)
+
+The same machine, models, budget and three runs each, with lust 0.3.1 (L-12) and crab-cage `106eddc` (rustc's message after two rejections with the same code, and a repeated reply asked again hotter). `gpt-oss:20b` and `sum-squares` were not run again. The files are in `experiments/model-ladder/results/2026-11-13-rtx5080/`.
+
+| Model | Nugget | First run | Second run |
+|---|---|---|---|
+| qwen2.5-coder:7b | run-lengths | 2/3 | 1/3 |
+| qwen2.5-coder:7b | merge-ranges | 3/3 | 3/3 |
+| qwen2.5-coder:7b | normalize-path | 0/3 | 0/3 |
+| qwen2.5-coder:14b | run-lengths | 3/3 | 3/3 |
+| qwen2.5-coder:14b | merge-ranges | 0/3 | 3/3 |
+| qwen2.5-coder:14b | normalize-path | 1/3 | 1/3 |
+
+With three runs in a cell, 2/3 against 1/3 says nothing. The change for the 14b model on `merge-ranges` is the one clear result.
+
+What it showed:
+
+- **No divergence and no oracle rejection in 128 candidates.**
+- **Runs use the budget now.** Four of the seven unsolved runs reached 18 or 19 candidates of 20. In the first run every unsolved run stopped on repeats after 1 to 16. The 7b model still stops after 5 candidates on `run-lengths`.
+- **The 14b model solved `merge-ranges` without doing what the message says.** Two of its three runs were rejected with `L0610` 8 and 10 times first. It never annotated `let mut merged_ranges = Vec::new();`. It solved the nugget when it rewrote the loop to take the tuple apart in a pattern, which reads no field.
+- **The 7b model lost `normalize-path` to one line.** It wrote `.filter(|c| !c.is_empty() && c != ".")` in almost every candidate, about forty times in two runs. lust says `L0113: cannot apply != to &&str and &str`, fix "Both operands must have the same type, and the type must support this operator." rustc rejects the line too, and its message ends with `help: consider dereferencing here` and the line with `*c != "."`.
+- **rustc's message in the prompt was the one-line form, which has no help.** For that line it is `can't compare &str with str` and nothing more. So the fix never reached the model.
+- **The prompts were not saved**, so the results cannot show which prompts held rustc's message.
+
+Follow-ups:
+
+1. **crab-cage: put rustc's whole first error into the prompt, with its help, and save every prompt and reply under `<out>/prompts/`.** Done in the pull request after this run.
+2. **lust: make the fix of L0113 name the dereference** when the two sides differ by one reference. New item L-13.
+3. **Run the ladder a third time** with both, and with `-Seed 1`, so the run can be repeated.
 
 # Phase 0: make what exists true
 
@@ -641,3 +672,9 @@ Options: say so in lust's docs and keep it; or randomise the seed as rustc does;
 Done in lust-lang #41 for a field read, named or by index; a method call already said so. What follows is the item as it was written.
 
 `let mut v = Vec::new(); if let Some(last) = v.last_mut() { last.1 = 0; }` is rejected by rustc with `E0282: type annotations needed for Vec<_>`. lust rejects it with `L0103: no field 1 on type &mut _` and the fix "Check the field index", which sends a model to the wrong line. In the model ladder of 2026-11-12 this one message cost `qwen2.5-coder:14b` all three runs of `merge-ranges` (32 rejected candidates). When a field access or method call is on a type that still holds an inference variable, report that annotations are needed, pointing at the `let`, as rustc does. An example program is `experiments/model-ladder/results/2026-11-12-rtx5080/needs-annotation.rs` in crab-cage.
+
+## L-13 L0113 should say "dereference" when the sides differ by one reference (T2)
+
+`path.split('/').filter(|c| c != ".")` is rejected by rustc and by lust: `c` is a `&&str` and `"."` is a `&str`. rustc says `E0277: can't compare &str with str` and then `help: consider dereferencing here`, with the line changed to `*c != "."`. lust says `L0113: cannot apply != to &&str and &str`, with the fix "Both operands must have the same type, and the type must support this operator." In the ladder run of 2026-11-13 `qwen2.5-coder:7b` wrote this line about forty times on `normalize-path` and solved none of its three runs.
+
+When the operator is a comparison and one side's type is the other's behind one more `&`, the fix should say which side to dereference and show it: "Dereference the left side: `*c != "."`." The program stays rejected and the code stays L0113; only the fix text changes. An example program is `experiments/model-ladder/results/2026-11-13-rtx5080/needs-deref.rs` in crab-cage.
