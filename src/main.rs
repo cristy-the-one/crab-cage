@@ -144,6 +144,13 @@ struct RunArgs {
     /// Maximum number of candidates to evaluate, including the seed.
     #[arg(long, default_value_t = 200)]
     budget: usize,
+    /// Measure lust against rustc: ask rustc about every candidate lust
+    /// refuses to compile, and compare every candidate that runs with its
+    /// rustc build, not only a new best. A program rustc accepts and lust
+    /// refuses is copied to `<out>/lust-only/`. Slower: one rustc run more
+    /// for most candidates. Needs --lust-bin.
+    #[arg(long)]
+    coverage: bool,
     /// With `--backend local`, a candidate that does not compile is given
     /// to rustc, and the fixes rustc marks as safe to apply are applied and
     /// tried as a candidate named `repair`. This flag turns that off.
@@ -535,6 +542,7 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
             jobs: args.jobs,
             out_dir: args.out,
             lust_daemon: args.lust_bin.is_some() && !args.no_lust_daemon,
+            coverage: args.coverage,
             lust_bin: args.lust_bin,
         },
         &mut proposers,

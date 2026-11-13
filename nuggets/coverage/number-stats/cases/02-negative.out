@@ -1,0 +1,4 @@
+evens=68 steps=-5,7,-13 neg=1
+evens=0 steps=- neg=0
+evens=0 steps=- neg=-
+evens=0 steps=- neg=-

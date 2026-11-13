@@ -1,0 +1,4 @@
+ones=0 lead=32 trail=32 swapped=00000000
+ones=32 lead=0 trail=0 swapped=ffffffff
+ones=1 lead=0 trail=31 swapped=00000080
+ones=13 lead=3 trail=3 swapped=78563412

@@ -1176,3 +1176,47 @@ fn example_nuggets_have_a_wrong_seed_and_a_right_reference() {
         assert_eq!(solved.passed, cases, "{name}");
     }
 }
+
+/// Every coverage nugget is consistent: its seed fails every case and its
+/// `reference.rs` passes every case. One rustc build per nugget, so the
+/// seed is checked on the first nugget only (they all share it).
+#[test]
+fn coverage_nuggets_have_a_reference_that_passes() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("nuggets")
+        .join("coverage");
+    let mut names: Vec<String> = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names.len(), 26, "{names:?}");
+    for (index, name) in names.iter().enumerate() {
+        let dir = root.join(name);
+        let nugget = nugget::load(&dir).unwrap();
+        assert_eq!(nugget.cases.len(), 3, "{name}");
+        assert!(nugget.seed.contains("String::new()"), "{name}");
+        if index == 0 {
+            let seed = evaluate(
+                &nugget,
+                &nugget.seed,
+                &no_lust(),
+                &options(&format!("coverage-{name}-seed")),
+            )
+            .unwrap();
+            assert_eq!(seed.score, Some(3.0), "{name}: {seed:?}");
+        }
+        let reference = fs::read_to_string(dir.join("reference.rs"))
+            .unwrap()
+            .replace("\r\n", "\n");
+        let solved = evaluate(
+            &nugget,
+            &reference,
+            &no_lust(),
+            &options(&format!("coverage-{name}-reference")),
+        )
+        .unwrap();
+        assert_eq!(solved.status, Status::Scored, "{name}: {solved:?}");
+        assert_eq!(solved.score, Some(0.0), "{name}: {solved:?}");
+    }
+}
