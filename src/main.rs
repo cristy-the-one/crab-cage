@@ -144,6 +144,11 @@ struct RunArgs {
     /// Maximum number of candidates to evaluate, including the seed.
     #[arg(long, default_value_t = 200)]
     budget: usize,
+    /// With `--backend local`, a candidate that does not compile is given
+    /// to rustc, and the fixes rustc marks as safe to apply are applied and
+    /// tried as a candidate named `repair`. This flag turns that off.
+    #[arg(long)]
+    no_repair: bool,
     /// Makes a run repeatable. `--tweak` draws its changes from it
     /// (default 1). With `--backend local`, each request to the model
     /// carries a seed counted up from it; without the flag the model
@@ -512,6 +517,12 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
         &mut model,
         &mut proposers,
     )?;
+    let mut repair = None;
+    run::attach_repair(
+        args.backend.is_some() && !args.no_repair,
+        &mut repair,
+        &mut proposers,
+    );
     let output = run::execute(
         &run::RunOptions {
             nugget_dir: args.nugget_dir,
