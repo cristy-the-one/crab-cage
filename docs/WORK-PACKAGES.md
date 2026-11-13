@@ -36,7 +36,7 @@ Phase 2:  WP-15 → WP-16 → WP-17 → WP-18 → WP-19;  WP-20 any time after W
 Phase 3:  L-03 … L-11, any order
 ```
 
-## Status (2026-11-11)
+## Status (2026-11-13)
 
 | Item | State | Where |
 |---|---|---|
@@ -56,10 +56,13 @@ Phase 3:  L-03 … L-11, any order
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
 | L-02 | done for literal bounds; variable bounds open | lust-lang #37 |
 | L-03 | done | lust-lang #36 |
-| L-04, L-05, L-06, L-08, L-09 | open | |
+| L-04, L-06, L-08 | done | lust-lang [#40](https://github.com/cristy-the-one/lust-lang/pull/40). Crab Cage still reads the usage text for its probe, not the `interface` object |
+| L-05, L-09 | open | |
 | L-07 | measured; see the package | |
-| L-10 | in review | lust-lang [#39](https://github.com/cristy-the-one/lust-lang/pull/39); it also closes the same leak for file descriptors on Unix |
-| L-11 | new, open | below |
+| L-10 | done | lust-lang [#39](https://github.com/cristy-the-one/lust-lang/pull/39); it also closes the same leak for file descriptors on Unix |
+| L-11 | open; needs a decision first | below |
+| L-12 | done | lust-lang [#41](https://github.com/cristy-the-one/lust-lang/pull/41) |
+| lust 0.3.1 | released 2026-11-12 | [v0.3.1](https://github.com/cristy-the-one/lust-lang/releases/tag/v0.3.1): L-01 to L-04, L-06, L-08, L-10 and L-12 |
 
 ## First run against a real model (2026-11-11)
 
@@ -141,11 +144,11 @@ What it showed:
 - **The 14b model lost `merge-ranges` to one message, 0 of 3.** It wrote `let mut merged = Vec::new();` and then `merged.last_mut()` with `last.1`. rustc rejects that too, and says what to do: `E0282: type annotations needed for Vec<_>`. lust says `L0103: no field 1 on type &mut _`, with the fix "Check the field index". The model then changed the field access 32 times and never the declaration. 96 of the 104 diagnostics in the whole experiment are this one.
 - **Runs end long before the budget.** Every unsolved run ended with "3 proposal errors in a row: the local model repeated a region it already tried", after 1 to 16 candidates of 20. One `normalize-path` run of the 14b model went 8, 4, 3, 2 failing cases in four candidates and was then stopped by three repeats.
 
-Follow-ups, not started:
+Follow-ups, all three done. None has been measured on the GPU machine yet: the ladder has to be run again there, with lust 0.3.1.
 
-1. **lust: say "type annotations needed" for a field or method on a type that is not yet known**, in place of L0103's "no field". (New item L-12.)
-2. **crab-cage: when the same lust code rejects a proposer's region twice in a row, add rustc's message for that program to the prompt** (`lust check --rustc`, or the oracle's rustc). rustc's messages are the ones models were trained on. It costs one rustc run, only on a repeated rejection.
-3. **crab-cage: do not retire the model on repeats while the budget is not spent and it has made progress.** Raise the temperature in steps on each repeat (0.8, 1.0, 1.2) and say in the prompt that the last reply was the same as the current lines.
+1. **lust: say "type annotations needed" for a field on a type that is not yet known**, in place of L0103's "no field". Done as L-12, lust-lang #41: the message is now `L0610`, with the fix "Annotate the binding it comes from".
+2. **crab-cage: when the same lust code rejects a proposer's region twice in a row, add rustc's message for that program to the prompt.** Done in crab-cage #26. rustc only checks the program (`--emit=metadata`), once per program. It has run in tests and never with a real model.
+3. **crab-cage: do not retire the model on the first repeats.** Done in crab-cage #26: a repeated reply is asked again at temperature 0.8, then 1.0, then 1.2, with a note that the last reply was the same. On the work laptop's 7.6B model, one of two runs of `run-lengths` went from 2 candidates to 9; the other still stopped at 2.
 
 # Phase 0: make what exists true
 
@@ -634,5 +637,7 @@ A program that folds over `HashMap::iter()` printed three different results in t
 Options: say so in lust's docs and keep it; or randomise the seed as rustc does; or reject order-dependent uses (hard). Crab Cage's oracle already handles the candidate side: it runs the rustc binary twice on a mismatch and rejects the candidate as nondeterministic instead of filing a divergence.
 
 ## L-12 "Type annotations needed" when the type is not known yet (T2)
+
+Done in lust-lang #41 for a field read, named or by index; a method call already said so. What follows is the item as it was written.
 
 `let mut v = Vec::new(); if let Some(last) = v.last_mut() { last.1 = 0; }` is rejected by rustc with `E0282: type annotations needed for Vec<_>`. lust rejects it with `L0103: no field 1 on type &mut _` and the fix "Check the field index", which sends a model to the wrong line. In the model ladder of 2026-11-12 this one message cost `qwen2.5-coder:14b` all three runs of `merge-ranges` (32 rejected candidates). When a field access or method call is on a type that still holds an inference variable, report that annotations are needed, pointing at the `let`, as rustc does. An example program is `experiments/model-ladder/results/2026-11-12-rtx5080/needs-annotation.rs` in crab-cage.
