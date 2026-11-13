@@ -101,6 +101,30 @@ pub fn attach_tweak<'a>(
     }
 }
 
+/// Append the repair proposer: rustc's own fixes for a candidate that did
+/// not compile, applied without a model (see [`crate::repair`]).
+///
+/// It goes after the proposers already in the list, so it takes its turn
+/// right after the model whose candidate it repairs. `slot` owns the
+/// proposer for the rest of the run.
+pub fn attach_repair<'a>(
+    enabled: bool,
+    slot: &'a mut Option<crate::repair::RepairProposer>,
+    proposers: &mut Vec<&'a mut dyn Proposer>,
+) {
+    if !enabled {
+        return;
+    }
+    // Private to this process: two runs must not write the same file.
+    let dir = std::env::temp_dir().join(format!("crab-cage-repair-{}", std::process::id()));
+    *slot = Some(crate::repair::RepairProposer::new(
+        crate::repair::rustc_diagnose(dir),
+    ));
+    if let Some(proposer) = slot.as_mut() {
+        proposers.push(proposer);
+    }
+}
+
 /// Append the local-model proposer when `--backend local` is set.
 ///
 /// Proposers already in the list stay ahead of it. `slot` owns the proposer
@@ -1033,6 +1057,23 @@ mod tests {
             ("one".to_string(), "c".to_string())
         );
         assert_eq!(pull(&mut proposers), None);
+    }
+
+    #[test]
+    fn repair_joins_after_the_proposers_already_there() {
+        let mut slot = None;
+        let mut proposers: Vec<&mut dyn Proposer> = Vec::new();
+        attach_repair(false, &mut slot, &mut proposers);
+        assert!(proposers.is_empty());
+        drop(proposers);
+        assert!(slot.is_none());
+
+        let mut folder = crate::proposer::FolderProposer::new("unused");
+        let mut slot = None;
+        let mut proposers: Vec<&mut dyn Proposer> = vec![&mut folder];
+        attach_repair(true, &mut slot, &mut proposers);
+        assert_eq!(proposers.len(), 2);
+        assert_eq!(proposers[1].name(), "repair");
     }
 
     #[test]

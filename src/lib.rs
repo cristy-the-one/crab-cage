@@ -18,6 +18,7 @@ pub mod nugget;
 pub mod pipeline;
 pub mod plant;
 pub mod proposer;
+pub mod repair;
 pub mod report;
 pub mod rng;
 pub mod run;

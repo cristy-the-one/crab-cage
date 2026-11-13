@@ -115,6 +115,7 @@ crab-cage run my-nugget --backend local --model qwen2.5-coder:7b --lust-bin /pat
 | `--candidates DIR` | every `*.rs` file in `DIR`, once, in name order. Files added during the run are picked up. Any model or script can feed a run this way. |
 | `--tweak` | changes one numeric literal of the best candidate per proposal: a float by about ±20%, an integer by 1 or 2. No model needed. |
 | `--backend local` | asks a local model for the region, and sends lust's diagnostics back to it when a reply is rejected. `--endpoint` and `--model` choose the server. |
+| (with `--backend local`) | `repair`: when a candidate does not compile, rustc is asked about it, and the fixes rustc marks as safe to apply (`MachineApplicable`, such as a missing `*` in a comparison) are applied and tried as a candidate of its own. No model involved. `--no-repair` turns it off. |
 
 Several can be given; they take turns.
 
