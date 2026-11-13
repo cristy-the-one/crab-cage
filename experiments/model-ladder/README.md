@@ -2,7 +2,7 @@
 
 One script that runs the search loop with local models on nuggets of rising difficulty and writes one table. It is meant to be run on a machine with a real GPU and sent back.
 
-The run that is due next, with the exact command and what to bring back, is in [NEXT-RUN.md](NEXT-RUN.md).
+The run that is due next, with the exact command and what to bring back, is in [NEXT-RUN.md](NEXT-RUN.md). The coverage run, which measures lust against rustc over 26 small tasks (`-NuggetSet coverage -Coverage`), is in [COVERAGE-RUN.md](COVERAGE-RUN.md).
 
 ## What it answers
 

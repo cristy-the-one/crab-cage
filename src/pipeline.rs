@@ -298,6 +298,85 @@ pub fn evaluate(
     Ok(verdict)
 }
 
+/// How a verdict's `note` begins when lust refused to compile a program
+/// that rustc accepts. Written in coverage mode only (see [`note_lust_only`]).
+pub const LUST_ONLY: &str = "lust-only: rustc accepts this program";
+
+/// Coverage mode: when lust refused to compile the candidate (`check` or
+/// `build`), ask rustc about the same program. If rustc accepts it, the
+/// rejection is lust's alone: the verdict's note says so, and the program
+/// and lust's diagnostics are copied to `<out_dir>/lust-only/`.
+///
+/// rustc only checks the program (`--emit=metadata`), a fraction of a
+/// build. Nothing changes when rustc rejects it too, when rustc cannot be
+/// run, or when the verdict is not such a rejection. `source` is the
+/// spliced program of this verdict, `<hash>.rs` in the work directory.
+pub fn note_lust_only(
+    verdict: &mut Verdict,
+    source: &Path,
+    out_dir: &Path,
+) -> crate::error::Result<bool> {
+    let refused =
+        verdict.status == Status::Rejected && matches!(verdict.gate, Gate::Check | Gate::Build);
+    if !refused || !source.is_file() || !rustc_accepts(source) {
+        return Ok(false);
+    }
+    verdict.note = if verdict.note.is_empty() {
+        LUST_ONLY.to_string()
+    } else {
+        format!("{LUST_ONLY}; lust: {}", verdict.note)
+    };
+    let dir = out_dir.join("lust-only");
+    fs::create_dir_all(&dir)?;
+    fs::copy(source, dir.join(format!("{}.rs", verdict.hash)))?;
+    let mut said = format!("rejected at {}\n", verdict.gate.as_str());
+    for diagnostic in &verdict.diagnostics {
+        // Lines count from the first line after `// CRAB:BEGIN`.
+        said.push_str(&format!(
+            "{} region line {} col {}: {}\n",
+            diagnostic.code, diagnostic.line, diagnostic.col, diagnostic.message
+        ));
+    }
+    said.push_str(&verdict.note);
+    said.push('\n');
+    fs::write(dir.join(format!("{}.txt", verdict.hash)), said)?;
+    Ok(true)
+}
+
+/// Whether rustc accepts `source`, checking only (`--emit=metadata`).
+/// Edition 2024 first, then 2021 for a rustc that has no 2024. False when
+/// rustc is missing or does not finish.
+fn rustc_accepts(source: &Path) -> bool {
+    let Some(rustc) = lust::which("rustc") else {
+        return false;
+    };
+    let metadata = source.with_extension("lust-only.rmeta");
+    let limits = supervisor::Limits {
+        wall: Duration::from_secs(60),
+        memory_bytes: None,
+        scrub_env: false,
+    };
+    let mut accepted = false;
+    for edition in ["2024", "2021"] {
+        let mut command = Command::new(&rustc);
+        command
+            .args(["--edition", edition, "--emit=metadata", "-o"])
+            .arg(&metadata)
+            .arg(source);
+        match supervisor::run_capture(command, &limits, b"") {
+            Ok(ran) if matches!(ran.kind, StopKind::Exited(0)) => {
+                accepted = true;
+                break;
+            }
+            // An old rustc refuses the edition, not the program: try the next.
+            Ok(ran) if ran.stderr.contains("edition") && edition == "2024" => {}
+            _ => break,
+        }
+    }
+    let _ = fs::remove_file(&metadata);
+    accepted
+}
+
 /// Three lines: outcome, score, then the note, the first diagnostic, or the times.
 pub fn format_verdict(verdict: &Verdict) -> String {
     let score = match verdict.score {
@@ -1115,5 +1194,59 @@ mod tests {
         let second = pass_all_failure(&later, "0\n").unwrap();
         assert_eq!(second.id, "range");
         assert_eq!(second.actual, "0\n");
+    }
+
+    #[test]
+    fn a_rejection_rustc_does_not_share_is_noted_and_saved() {
+        if lust::which("rustc").is_none() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("crab-cage-lust-only-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("work")).unwrap();
+        let rejected = |hash: &str, gate: Gate, status: Status| Verdict {
+            hash: hash.to_string(),
+            gate,
+            status,
+            score: None,
+            passed: 0,
+            total: 1,
+            diagnostics: vec![Diagnostic {
+                code: "L0505".to_string(),
+                message: "not supported yet".to_string(),
+                line: 2,
+                col: 5,
+                fix: String::new(),
+            }],
+            ms: Ms::default(),
+            note: String::new(),
+            failure: None,
+        };
+
+        // rustc accepts this program: the rejection is lust's alone.
+        let good = dir.join("work").join("aaaa.rs");
+        fs::write(&good, "fn main() {\n    println!(\"ok\");\n}\n").unwrap();
+        let mut verdict = rejected("aaaa", Gate::Check, Status::Rejected);
+        assert!(note_lust_only(&mut verdict, &good, &dir).unwrap());
+        assert_eq!(verdict.note, LUST_ONLY);
+        assert!(dir.join("lust-only").join("aaaa.rs").is_file());
+        let said = fs::read_to_string(dir.join("lust-only").join("aaaa.txt")).unwrap();
+        assert_eq!(
+            said,
+            "rejected at check\nL0505 region line 2 col 5: not supported yet\nlust-only: rustc accepts this program\n"
+        );
+
+        // rustc rejects this one too: nothing is noted or saved.
+        let bad = dir.join("work").join("bbbb.rs");
+        fs::write(&bad, "fn main() {\n    let x: i32 = \"no\";\n}\n").unwrap();
+        let mut verdict = rejected("bbbb", Gate::Check, Status::Rejected);
+        assert!(!note_lust_only(&mut verdict, &bad, &dir).unwrap());
+        assert_eq!(verdict.note, "");
+        assert!(!dir.join("lust-only").join("bbbb.rs").exists());
+
+        // A candidate that ran is not a rejection of the compiler.
+        let mut verdict = rejected("aaaa", Gate::Run, Status::Scored);
+        assert!(!note_lust_only(&mut verdict, &good, &dir).unwrap());
+        let _ = fs::remove_dir_all(&dir);
     }
 }

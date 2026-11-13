@@ -2672,6 +2672,7 @@ mod tests {
                 out_dir: out.clone(),
                 lust_bin: None,
                 lust_daemon: false,
+                coverage: false,
             },
             &mut proposers,
         )
@@ -2715,6 +2716,7 @@ mod tests {
                 out_dir: out,
                 lust_bin: None,
                 lust_daemon: false,
+                coverage: false,
             },
             &mut proposers,
         )

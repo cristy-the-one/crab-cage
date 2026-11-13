@@ -62,6 +62,7 @@ Phase 3:  L-03 … L-11, any order
 | L-10 | done | lust-lang [#39](https://github.com/cristy-the-one/lust-lang/pull/39); it also closes the same leak for file descriptors on Unix |
 | L-11 | open; needs a decision first | below |
 | L-13 | new, open | below |
+| Coverage run: lust against rustc over 26 small tasks | ready, not yet run on the GPU machine | `crab-cage run --coverage`, `nuggets/coverage/`, `experiments/model-ladder/COVERAGE-RUN.md`. Five gaps in lust 0.3.1 were found while the tasks were written; they are listed in that file |
 | L-12 | done | lust-lang [#41](https://github.com/cristy-the-one/lust-lang/pull/41) |
 | lust 0.3.1 | released 2026-11-12 | [v0.3.1](https://github.com/cristy-the-one/lust-lang/releases/tag/v0.3.1): L-01 to L-04, L-06, L-08, L-10 and L-12 |
 

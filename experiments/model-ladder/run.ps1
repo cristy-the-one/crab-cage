@@ -48,6 +48,13 @@ param(
     # `--seed (Seed + N - 1)` to crab-cage. 0 (the default) passes no seed,
     # and the model server picks its own each time.
     [int]$Seed = 0,
+    # Run every nugget in a folder under nuggets/, for example `coverage`
+    # for nuggets/coverage/*. Replaces -Nuggets.
+    [string]$NuggetSet = '',
+    # Measure lust against rustc (`crab-cage run --coverage`): rustc is asked
+    # about every candidate lust refuses to compile, and every candidate that
+    # runs is compared with its rustc build. Needs -LustBin.
+    [switch]$Coverage,
     # One model's first nugget, one run, budget 6: a two-minute check that
     # everything is wired up.
     [switch]$Quick
@@ -88,6 +95,12 @@ if (-not $Models -or $Models.Count -eq 0) {
 # `powershell -File run.ps1 -Nuggets a,b` passes one string, 'a,b'. Split it.
 $Models = @($Models | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
 $Nuggets = @($Nuggets | ForEach-Object { $_ -split ',' } | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+if ($NuggetSet) {
+    $setDir = Join-Path $repo (Join-Path 'nuggets' $NuggetSet)
+    if (-not (Test-Path $setDir)) { throw "no nugget folder '$NuggetSet' under $repo\nuggets" }
+    $Nuggets = @(Get-ChildItem -Directory $setDir | Sort-Object Name | ForEach-Object { "$NuggetSet/$($_.Name)" })
+}
+if ($Coverage -and -not $LustBin) { throw '-Coverage compares lust with rustc and needs -LustBin' }
 if ($Quick) {
     $Models = @($Models[0])
     $Nuggets = @($Nuggets[0])
@@ -219,6 +232,7 @@ function Invoke-Run([string]$Model, [string]$Nugget, [int]$Rep) {
     if ($LustBin) { $arguments += @('--lust-bin', $LustBin) }
     if ($Tweak) { $arguments += '--tweak' }
     if ($Seed -ne 0) { $arguments += @('--seed', "$($Seed + $Rep - 1)") }
+    if ($Coverage) { $arguments += '--coverage' }
 
     $watch = [System.Diagnostics.Stopwatch]::StartNew()
     $previous = $ErrorActionPreference
@@ -252,7 +266,22 @@ function Invoke-Run([string]$Model, [string]$Nugget, [int]$Rep) {
         }
     }
     $stop = @($log | Where-Object { $_ -match '^(stopped:|local proposer finished:)' }) | Select-Object -First 1
+    # Coverage mode: the candidates lust refused and rustc accepts. Each is
+    # also a file, <run>/lust-only/<hash>.rs.
+    $lustOnly = @()
+    foreach ($row in $model_rows) {
+        if ("$($row.note)".StartsWith('lust-only')) {
+            $first = @($row.diagnostics) | Select-Object -First 1
+            $lustOnly += [ordered]@{
+                hash    = $row.hash
+                gate    = $row.gate
+                code    = $(if ($first) { "$($first.code)" } else { '' })
+                message = $(if ($first) { "$($first.message)" } else { "$($row.note)" })
+            }
+        }
+    }
     return [ordered]@{
+        lust_only           = $lustOnly
         model               = $Model
         nugget              = $Nugget
         rep                 = $Rep
@@ -267,6 +296,7 @@ function Invoke-Run([string]$Model, [string]$Nugget, [int]$Rep) {
         candidates          = $model_rows.Count
         solved_at_candidate = $solvedAt
         diverged            = @($rows | Where-Object { $_.status -eq 'diverged' }).Count
+        proven              = @($model_rows | Where-Object { $_.status -eq 'proven' }).Count
         rejected            = $gates
         codes               = $codes
         wall_s              = [math]::Round($watch.Elapsed.TotalSeconds, 1)
@@ -353,22 +383,32 @@ $lines += ''
 $passAll = @($Nuggets | Where-Object { $objective[$_] -eq 'pass_all' })
 # minimize and fastest: no "solved", only a best proven score (lower is better).
 $minimize = @($Nuggets | Where-Object { $objective[$_] -ne 'pass_all' })
-$lines += '| Model | ' + ($passAll -join ' | ') + ' |'
-$lines += '|---|' + (($passAll | ForEach-Object { '---' }) -join '|') + '|'
-foreach ($item in $loaded) {
-    $cells = @()
-    foreach ($nugget in $passAll) {
-        $runs = @($results | Where-Object { $_.model -eq $item.model -and $_.nugget -eq $nugget })
-        $won = @($runs | Where-Object { $_.solved })
-        $cell = "$($won.Count)/$($runs.Count)"
-        if ($won.Count -gt 0) {
-            $candidates = Get-Median ([double[]]@($won | ForEach-Object { $_.solved_at_candidate }))
-            $seconds = Get-Median ([double[]]@($won | ForEach-Object { $_.wall_s }))
-            $cell += "; $candidates cand.; $seconds s"
-        }
-        $cells += $cell
+function Get-SolvedCell([string]$Model, [string]$Nugget) {
+    $runs = @($results | Where-Object { $_.model -eq $Model -and $_.nugget -eq $Nugget })
+    $won = @($runs | Where-Object { $_.solved })
+    $cell = "$($won.Count)/$($runs.Count)"
+    if ($won.Count -gt 0) {
+        $candidates = Get-Median ([double[]]@($won | ForEach-Object { $_.solved_at_candidate }))
+        $seconds = Get-Median ([double[]]@($won | ForEach-Object { $_.wall_s }))
+        $cell += "; $candidates cand.; $seconds s"
     }
-    $lines += "| $($item.model) | " + ($cells -join ' | ') + ' |'
+    return $cell
+}
+if ($passAll.Count -le 8) {
+    $lines += '| Model | ' + ($passAll -join ' | ') + ' |'
+    $lines += '|---|' + (($passAll | ForEach-Object { '---' }) -join '|') + '|'
+    foreach ($item in $loaded) {
+        $cells = @($passAll | ForEach-Object { Get-SolvedCell $item.model $_ })
+        $lines += "| $($item.model) | " + ($cells -join ' | ') + ' |'
+    }
+} else {
+    # Many nuggets: one row per nugget, one column per model.
+    $lines += '| Nugget | ' + (($loaded | ForEach-Object { $_.model }) -join ' | ') + ' |'
+    $lines += '|---|' + (($loaded | ForEach-Object { '---' }) -join '|') + '|'
+    foreach ($nugget in $passAll) {
+        $cells = @($loaded | ForEach-Object { Get-SolvedCell $_.model $nugget })
+        $lines += "| $nugget | " + ($cells -join ' | ') + ' |'
+    }
 }
 $lines += ''
 $lines += '## Unsolved runs'
@@ -421,6 +461,50 @@ if ($all.Count -eq 0) {
     $lines += '| Code | Candidates |'
     $lines += '|---|---:|'
     foreach ($entry in ($all.GetEnumerator() | Sort-Object -Property Value -Descending)) { $lines += "| $($entry.Key) | $($entry.Value) |" }
+}
+if ($Coverage) {
+    $lines += ''
+    $lines += '## Rejected by lust only'
+    $lines += ''
+    $lines += 'Candidates that lust refused to compile and rustc accepts. Each is a gap in lust: valid Rust that a model wrote and lust does not take. Sorted by how many candidates hit it. The example is a file under this directory.'
+    $lines += ''
+    $groups = @{}
+    foreach ($run in $results) {
+        foreach ($item in @($run.lust_only)) {
+            $key = "$($item.code)|$($item.message)"
+            if (-not $groups.ContainsKey($key)) {
+                $groups[$key] = [ordered]@{ code = $item.code; message = $item.message; count = 0; models = @{}; example = "$($run.out)/lust-only/$($item.hash).rs" }
+            }
+            $groups[$key].count++
+            $groups[$key].models[$run.model] = $true
+        }
+    }
+    if ($groups.Count -eq 0) {
+        $lines += 'None.'
+    } else {
+        $lines += '| Code | Message | Candidates | Models | Example |'
+        $lines += '|---|---|---:|---|---|'
+        foreach ($group in ($groups.Values | Sort-Object -Property { $_.count } -Descending)) {
+            $message = "$($group.message)".Replace('|', '\|')
+            $example = "$($group.example)".Replace('\', '/')
+            $lines += "| $($group.code) | $message | $($group.count) | $(($group.models.Keys | Sort-Object) -join ', ') | ``$example`` |"
+        }
+    }
+    $lines += ''
+    $lines += '## Coverage totals'
+    $lines += ''
+    $lines += '| Model | Candidates | Ran and matched rustc | Rejected by lust only | Rejected by lust and rustc | Rejected by rustc only | Diverged |'
+    $lines += '|---|---:|---:|---:|---:|---:|---:|'
+    foreach ($item in $loaded) {
+        $runs = @($results | Where-Object { $_.model -eq $item.model })
+        $count = ($runs | ForEach-Object { $_.candidates } | Measure-Object -Sum).Sum
+        $only = ($runs | ForEach-Object { @($_.lust_only).Count } | Measure-Object -Sum).Sum
+        $refused = ($runs | ForEach-Object { $_.rejected['check'] + $_.rejected['build'] } | Measure-Object -Sum).Sum
+        $oracle = ($runs | ForEach-Object { $_.rejected['oracle'] } | Measure-Object -Sum).Sum
+        $diverged = ($runs | ForEach-Object { $_.diverged } | Measure-Object -Sum).Sum
+        $proven = ($runs | ForEach-Object { $_.proven } | Measure-Object -Sum).Sum
+        $lines += "| $($item.model) | $count | $proven | $only | $($refused - $only) | $oracle | $diverged |"
+    }
 }
 $lines += ''
 $lines += 'Every run keeps its journal, its candidates and any `divergences/` under this directory.'

@@ -185,6 +185,7 @@ fn real_lust_run_uses_the_daemon_and_stops_it() {
             out_dir: out.clone(),
             lust_bin: Some(bin),
             lust_daemon: true,
+            coverage: false,
         },
         &mut proposers,
     )

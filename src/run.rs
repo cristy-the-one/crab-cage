@@ -48,6 +48,12 @@ pub struct RunOptions {
     /// `<out>/work`, every candidate is compiled as `slot.rs` there, and it
     /// is stopped when the run ends. Ignored without `lust_bin`.
     pub lust_daemon: bool,
+    /// Coverage mode, for measuring lust against rustc and not for finding
+    /// the best candidate fast. rustc is asked about every candidate lust
+    /// refuses to compile (see [`pipeline::note_lust_only`]), and every
+    /// candidate that runs goes to the oracle, not only a new best. Each
+    /// costs one rustc run. Ignored without `lust_bin`.
+    pub coverage: bool,
 }
 
 /// Whether this run's journal meets the objective's exit rule.
@@ -246,6 +252,7 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
             &tools,
             &work_dir,
             &options.out_dir,
+            options.coverage && tools.lust.is_some(),
             &mut journal,
             &journal_path,
             &mut best,
@@ -256,7 +263,7 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
             evaluated += 1;
         }
         if outcome.stop {
-            return finish(&journal_path, nugget.objective);
+            return finish(&journal_path, nugget.objective, options.coverage);
         }
     }
 
@@ -329,6 +336,7 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
                 &tools,
                 &work_dir,
                 &options.out_dir,
+                options.coverage && tools.lust.is_some(),
                 &mut journal,
                 &journal_path,
                 &mut best,
@@ -350,7 +358,7 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
         }
     }
 
-    finish(&journal_path, nugget.objective)
+    finish(&journal_path, nugget.objective, options.coverage)
 }
 
 /// One candidate through the funnel without the oracle, on `slot`.
@@ -413,13 +421,36 @@ fn unjournaled_stop_line() -> String {
     format!("stopped: {UNJOURNALED_LIMIT} proposals in a row left no journal line")
 }
 
-fn finish(journal_path: &Path, objective: Objective) -> Result<RunOutput> {
+fn finish(journal_path: &Path, objective: Objective, coverage: bool) -> Result<RunOutput> {
     let summary = Journal::summary(journal_path)?;
     crate::console::print(&summary);
+    if coverage {
+        crate::console::line(&format!("lust-only {}", count_lust_only(journal_path)?));
+    }
     let proven = scan_proven(journal_path)?;
     Ok(RunOutput {
         solved: exit_solved(objective, &proven),
     })
+}
+
+/// Journal lines whose note says lust refused what rustc accepts.
+fn count_lust_only(path: &Path) -> Result<usize> {
+    if !path.is_file() {
+        return Ok(0);
+    }
+    let mut count = 0;
+    for line in fs::read_to_string(path)?.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value["note"]
+            .as_str()
+            .is_some_and(|note| note.starts_with(pipeline::LUST_ONLY))
+        {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 fn exit_solved(objective: Objective, proven: &ProvenScan) -> bool {
@@ -591,6 +622,7 @@ fn settle(
     tools: &Toolchain,
     work_dir: &Path,
     out_dir: &Path,
+    coverage: bool,
     journal: &mut Journal,
     journal_path: &Path,
     best: &mut Option<Best>,
@@ -603,7 +635,9 @@ fn settle(
     };
     // Oracle is the same `evaluate` call with the flag set. Journal the
     // verdict from that call only, never a scored line plus a second line.
-    let verdict = if would_improve(&verdict, best) {
+    // In coverage mode every candidate that ran goes to the oracle.
+    let to_oracle = would_improve(&verdict, best) || (coverage && verdict.status == Status::Scored);
+    let mut verdict = if to_oracle {
         match pipeline::evaluate(nugget, candidate, tools, &eval_options(work_dir, true, 0)) {
             Ok(verdict) => verdict,
             Err(error) => return unevaluated(seed, error),
@@ -611,6 +645,10 @@ fn settle(
     } else {
         verdict
     };
+    if coverage {
+        let source = work_dir.join(format!("{}.rs", verdict.hash));
+        pipeline::note_lust_only(&mut verdict, &source, out_dir)?;
+    }
 
     journal.append(&verdict, proposer)?;
     let n = last_journal_n(journal_path)?;
@@ -1274,6 +1312,7 @@ mod tests {
                 out_dir: out,
                 lust_bin: None,
                 lust_daemon: false,
+                coverage: false,
             },
             &mut proposers,
         )
@@ -1407,6 +1446,7 @@ mod tests {
                 out_dir: out.clone(),
                 lust_bin: None,
                 lust_daemon: false,
+                coverage: false,
             },
             &mut proposers,
         )
