@@ -506,6 +506,9 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
     }
     let mut tweak = None;
     run::attach_tweak(args.tweak, args.seed, &mut tweak, &mut proposers);
+    // Shared by the repair proposer, which writes it, and the model
+    // proposer, which reads what became of its own regions.
+    let repairs = crab_cage::repair::RepairLog::default();
     let mut model = None;
     run::attach_model(
         args.backend.as_deref(),
@@ -514,12 +517,14 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
         args.lust_bin.as_deref(),
         args.seed,
         Some(&args.out.join("prompts")),
+        Some(&repairs),
         &mut model,
         &mut proposers,
     )?;
     let mut repair = None;
     run::attach_repair(
         args.backend.is_some() && !args.no_repair,
+        &repairs,
         &mut repair,
         &mut proposers,
     );
