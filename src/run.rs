@@ -108,13 +108,15 @@ pub fn attach_tweak<'a>(
 /// capability summary is read once here. It is empty with no `--lust-bin`,
 /// and empty when lust runs but the summary command fails. A `--lust-bin`
 /// that cannot be probed is an error. `seed` is `--seed`: with it, each
-/// request to the model carries a seed.
+/// request to the model carries a seed. Each request and its reply is
+/// written into `prompt_dir`, one file each, when there is one.
 pub fn attach_model<'a>(
     backend: Option<&str>,
     endpoint: Option<&str>,
     model: Option<&str>,
     lust_bin: Option<&Path>,
     seed: Option<u64>,
+    prompt_dir: Option<&Path>,
     slot: &'a mut Option<ModelProposer>,
     proposers: &mut Vec<&'a mut dyn Proposer>,
 ) -> Result<()> {
@@ -141,7 +143,8 @@ pub fn attach_model<'a>(
     *slot = Some(
         ModelProposer::new(endpoint, model, capabilities)?
             .with_second_opinion(crate::proposer::rustc_second_opinion(opinion_dir))
-            .with_seed(seed),
+            .with_seed(seed)
+            .with_prompt_log(prompt_dir.map(Path::to_path_buf)),
     );
     if let Some(proposer) = slot.as_mut() {
         proposers.push(proposer);
@@ -1064,7 +1067,17 @@ mod tests {
         };
         let mut proposers: Vec<&mut dyn Proposer> = vec![&mut folder];
         let mut slot = None;
-        attach_model(None, None, None, None, None, &mut slot, &mut proposers).unwrap();
+        attach_model(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            &mut slot,
+            &mut proposers,
+        )
+        .unwrap();
         assert_eq!(proposers.len(), 1);
         assert!(slot.is_none());
 
@@ -1080,6 +1093,7 @@ mod tests {
             Some("demo"),
             None,
             None,
+            None,
             &mut slot,
             &mut proposers,
         )
@@ -1093,6 +1107,7 @@ mod tests {
         let refused = attach_model(
             Some("local"),
             Some("http://api.openai.com/v1"),
+            None,
             None,
             None,
             None,
@@ -1112,6 +1127,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             &mut slot,
             &mut proposers,
         )
@@ -1123,6 +1139,7 @@ mod tests {
         let needs_backend = attach_model(
             None,
             Some("http://127.0.0.1:11434/v1"),
+            None,
             None,
             None,
             None,
