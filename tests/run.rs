@@ -610,6 +610,98 @@ fn jobs_do_not_spend_more_than_the_budget() {
     assert_eq!(records[0]["proposer"], "seed");
 }
 
+#[test]
+fn proving_a_new_best_does_not_rebuild_with_lust_a_second_time() {
+    let root = scratch("no-double-build");
+    let log = root.join("calls.log");
+    let src = root.join("counting_lust.rs");
+    let standin_src = r##"
+use std::env;
+use std::fs;
+use std::io::Write;
+use std::process::{self, Command};
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(__LOG_PATH__) {
+        let _ = writeln!(f, "{}", args.join(" "));
+    }
+    match args.first().map(String::as_str) {
+        Some("capabilities") if args.get(1).map(String::as_str) == Some("--json") => {
+            println!("{}", r#"{"interface":{"version":"0.3.2","build":"test","commands":["check","build","capabilities"],"flags":{"build":["--json","--sandbox","--max-memory","--time-limit"],"capabilities":["--json","--summary","--sandbox"]}}}"#);
+        }
+        Some("build") => {
+            let out = args.iter().position(|a| a == "-o").and_then(|i| args.get(i + 1)).cloned().unwrap();
+            let file = args.iter().rev().find(|a| a.ends_with(".rs")).cloned().unwrap();
+            let status = Command::new("rustc")
+                .args(["--edition", "2021", "-o", &out, &file])
+                .status()
+                .unwrap();
+            if !status.success() {
+                process::exit(1);
+            }
+        }
+        _ => process::exit(2),
+    }
+}
+"##
+    .replace("__LOG_PATH__", &format!("{:?}", log.display().to_string()));
+    fs::write(&src, standin_src).unwrap();
+    let fake_bin = root.join(if cfg!(windows) {
+        "counting_lust.exe"
+    } else {
+        "counting_lust"
+    });
+    let compiled = Command::new("rustc")
+        .args(["--edition", "2021", "-o"])
+        .arg(&fake_bin)
+        .arg(&src)
+        .status()
+        .unwrap();
+    assert!(compiled.success());
+
+    let candidates = root.join("candidates");
+    fs::create_dir_all(&candidates).unwrap();
+    fs::write(
+        candidates.join("01_right.rs"),
+        "    xs.iter().map(|x| x * x).sum()\n",
+    )
+    .unwrap();
+    let out = root.join("out");
+    let output = run(
+        &root,
+        &[
+            "run",
+            demo_dir().to_str().unwrap(),
+            "--candidates",
+            candidates.to_str().unwrap(),
+            "--lust-bin",
+            fake_bin.to_str().unwrap(),
+            "--no-lust-daemon",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let calls = fs::read_to_string(&log).unwrap();
+    let build_calls = calls
+        .lines()
+        .filter(|line| line.starts_with("build "))
+        .count();
+    let check_calls = calls
+        .lines()
+        .filter(|line| line.starts_with("check "))
+        .count();
+    // 2 candidates (seed + 01_right), both become new bests:
+    // exactly 2 fused `build --json` calls and 0 separate `check` calls.
+    assert_eq!(check_calls, 0, "unexpected check calls:\n{calls}");
+    assert_eq!(build_calls, 2, "expected 1 build per candidate:\n{calls}");
+}
+
 fn write_probe(dir: &std::path::Path, objective: &str, seed: &str, expected: Option<&str>) {
     fs::create_dir_all(dir.join("cases")).unwrap();
     fs::write(

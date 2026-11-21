@@ -62,6 +62,12 @@ impl Journal {
         self.seen.contains(hash)
     }
 
+    /// The `n` of the most recently appended (or loaded) record, or 0 when
+    /// the journal is empty.
+    pub fn last_n(&self) -> u64 {
+        self.next_n.saturating_sub(1)
+    }
+
     /// Write one JSON line — the verdict plus `proposer` and `n` — and flush.
     pub fn append(&mut self, verdict: &Verdict, proposer: &str) -> Result<()> {
         let n = self.next_n;

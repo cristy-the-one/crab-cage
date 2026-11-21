@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::lust::{self, LustTool, RunClass};
+use crate::lust::{self, BuildOutcome, LustTool, RunClass};
 use crate::nugget::{Nugget, Objective};
 use crate::supervisor::{self, StopKind};
 
@@ -160,20 +160,46 @@ pub struct Verdict {
     pub failure: Option<CaseFailure>,
 }
 
+/// Result of the fast gates (prefilter, check, build, run, and `fastest`
+/// timing), kept so [`prove_first_pass`] can run only the rustc oracle
+/// without rebuilding or re-running the fast binary.
+pub struct FirstPass {
+    pub verdict: Verdict,
+    source: PathBuf,
+    binary: PathBuf,
+    runs: Vec<CaseCapture>,
+}
+
 /// Evaluate `candidate` against `nugget`.
 ///
 /// The hash is FNV-1a 64 of the candidate bytes, written as 16 hex digits.
-/// A lust check failure carries the diagnostics from [`lust::check`]: line
-/// numbers are moved so line 1 is the first line after `// CRAB:BEGIN`, and
-/// a line outside the candidate is 0. That parser already keeps `code` and
-/// `message` when a JSON field has the wrong type; this function does not
-/// parse the diagnostic text again.
+/// A lust check failure carries the diagnostics from [`lust::check`] (or a
+/// fused `lust build --json` on lust 0.3.1+ / 0.3.2): line numbers are moved
+/// so line 1 is the first line after `// CRAB:BEGIN`, and a line outside the
+/// candidate is 0.
 pub fn evaluate(
     nugget: &Nugget,
     candidate: &str,
     tools: &Toolchain,
     opts: &EvalOptions,
 ) -> crate::error::Result<Verdict> {
+    let pass = evaluate_first_pass(nugget, candidate, tools, opts)?;
+    if opts.oracle && pass.verdict.status == Status::Scored {
+        prove_first_pass(nugget, pass, tools, opts)
+    } else {
+        Ok(pass.verdict)
+    }
+}
+
+/// Run the fast gates (everything except the rustc oracle) and retain the
+/// compiled artifact and captured case outputs so [`prove_first_pass`] can
+/// prove a new best without redoing the fast pass.
+pub fn evaluate_first_pass(
+    nugget: &Nugget,
+    candidate: &str,
+    tools: &Toolchain,
+    opts: &EvalOptions,
+) -> crate::error::Result<FirstPass> {
     let hash = candidate_hash(candidate);
     let mut verdict = Verdict {
         hash: hash.clone(),
@@ -188,9 +214,16 @@ pub fn evaluate(
         failure: None,
     };
 
+    let empty = |verdict| FirstPass {
+        verdict,
+        source: PathBuf::new(),
+        binary: PathBuf::new(),
+        runs: Vec::new(),
+    };
+
     if let Err(message) = crate::emit::sandbox_prefilter(candidate) {
         verdict.note = message;
-        return Ok(verdict);
+        return Ok(empty(verdict));
     }
 
     fs::create_dir_all(&opts.work_dir)?;
@@ -209,46 +242,93 @@ pub fn evaluate(
         _ => source.clone(),
     };
 
-    if let Some(tool) = &tools.lust {
-        verdict.gate = Gate::Check;
-        let started = Instant::now();
-        let checked = lust::check(tool, &fast_source, opts.compile_timeout)?;
-        verdict.ms.check = elapsed_ms(started);
-        if !checked.ok {
-            verdict.diagnostics = map_diagnostics(&checked.diagnostics, nugget, candidate);
-            if verdict.diagnostics.is_empty() {
-                verdict.note = "lust check failed".to_string();
-            }
-            return Ok(verdict);
-        }
-    }
-
-    verdict.gate = Gate::Build;
     let binary = opts.work_dir.join(bin_name(&hash));
-    let started = Instant::now();
-    let built = if let Some(tool) = &tools.lust {
-        lust::build(
-            tool,
-            &fast_source,
-            &binary,
-            nugget.max_memory,
-            Some(nugget.timeout),
-            opts.compile_timeout,
-            false,
-        )
-    } else {
-        lust::compile_rustc_any_edition(&source, &binary, opts.compile_timeout)
-            .map(|_| ())
-            .map_err(crate::error::Error::from)
-    };
-    verdict.ms.build = elapsed_ms(started);
-    if let Err(problem) = built {
-        verdict.note = problem.message;
-        return Ok(verdict);
-    }
-    if !binary.is_file() {
-        verdict.note = format!("compiler exited 0 but did not write {}", binary.display());
-        return Ok(verdict);
+    match &tools.lust {
+        Some(tool) if tool.supports_build_json => {
+            // lust 0.3.1+ / 0.3.2: fuse check and build into one invocation
+            // (`lust build --json --sandbox`), saving a process spawn, daemon
+            // round-trip, and front-end re-check on every valid candidate.
+            let started = Instant::now();
+            match lust::build_json(
+                tool,
+                &fast_source,
+                &binary,
+                nugget.max_memory,
+                Some(nugget.timeout),
+                opts.compile_timeout,
+                false,
+            )? {
+                BuildOutcome::Built => {
+                    verdict.gate = Gate::Build;
+                    verdict.ms.build = elapsed_ms(started);
+                }
+                BuildOutcome::CheckFailed(diagnostics) => {
+                    verdict.gate = Gate::Check;
+                    verdict.ms.check = elapsed_ms(started);
+                    verdict.diagnostics = map_diagnostics(&diagnostics, nugget, candidate);
+                    if verdict.diagnostics.is_empty() {
+                        verdict.note = "lust check failed".to_string();
+                    }
+                    return Ok(empty(verdict));
+                }
+                BuildOutcome::BuildFailed(message) => {
+                    verdict.gate = Gate::Build;
+                    verdict.ms.build = elapsed_ms(started);
+                    verdict.note = message;
+                    return Ok(empty(verdict));
+                }
+            }
+        }
+        Some(tool) => {
+            verdict.gate = Gate::Check;
+            let started = Instant::now();
+            let checked = lust::check(tool, &fast_source, opts.compile_timeout)?;
+            verdict.ms.check = elapsed_ms(started);
+            if !checked.ok {
+                verdict.diagnostics = map_diagnostics(&checked.diagnostics, nugget, candidate);
+                if verdict.diagnostics.is_empty() {
+                    verdict.note = "lust check failed".to_string();
+                }
+                return Ok(empty(verdict));
+            }
+
+            verdict.gate = Gate::Build;
+            let started = Instant::now();
+            let built = lust::build(
+                tool,
+                &fast_source,
+                &binary,
+                nugget.max_memory,
+                Some(nugget.timeout),
+                opts.compile_timeout,
+                false,
+            );
+            verdict.ms.build = elapsed_ms(started);
+            if let Err(problem) = built {
+                verdict.note = problem.message;
+                return Ok(empty(verdict));
+            }
+            if !binary.is_file() {
+                verdict.note = format!("compiler exited 0 but did not write {}", binary.display());
+                return Ok(empty(verdict));
+            }
+        }
+        None => {
+            verdict.gate = Gate::Build;
+            let started = Instant::now();
+            let built = lust::compile_rustc_any_edition(&source, &binary, opts.compile_timeout)
+                .map(|_| ())
+                .map_err(crate::error::Error::from);
+            verdict.ms.build = elapsed_ms(started);
+            if let Err(problem) = built {
+                verdict.note = problem.message;
+                return Ok(empty(verdict));
+            }
+            if !binary.is_file() {
+                verdict.note = format!("compiler exited 0 but did not write {}", binary.display());
+                return Ok(empty(verdict));
+            }
+        }
     }
 
     verdict.gate = Gate::Run;
@@ -259,7 +339,7 @@ pub fn evaluate(
     verdict.failure = outcome.failure;
     if let Some(note) = outcome.stop {
         verdict.note = note;
-        return Ok(verdict);
+        return Ok(empty(verdict));
     }
     verdict.status = Status::Scored;
     verdict.score = Some(outcome.score);
@@ -277,25 +357,41 @@ pub fn evaluate(
         time_candidate(&mut verdict, nugget, &timed, tools, opts)?;
         verdict.ms.opt = elapsed_ms(started);
         if verdict.status != Status::Scored {
-            return Ok(verdict);
+            return Ok(empty(verdict));
         }
     }
 
-    // Rejections returned above, so the status here is `scored`.
-    if opts.oracle {
-        let started = Instant::now();
-        run_oracle(
-            &mut verdict,
-            nugget,
-            &source,
-            &binary,
-            &outcome.runs,
-            tools,
-            opts,
-        )?;
-        verdict.ms.oracle = elapsed_ms(started);
+    Ok(FirstPass {
+        verdict,
+        source,
+        binary,
+        runs: outcome.runs,
+    })
+}
+
+/// Run only the rustc oracle on a scored [`FirstPass`], reusing the already
+/// built fast binary and its captured case runs.
+pub fn prove_first_pass(
+    nugget: &Nugget,
+    mut pass: FirstPass,
+    tools: &Toolchain,
+    opts: &EvalOptions,
+) -> crate::error::Result<Verdict> {
+    if pass.verdict.status != Status::Scored {
+        return Ok(pass.verdict);
     }
-    Ok(verdict)
+    let started = Instant::now();
+    run_oracle(
+        &mut pass.verdict,
+        nugget,
+        &pass.source,
+        &pass.binary,
+        &pass.runs,
+        tools,
+        opts,
+    )?;
+    pass.verdict.ms.oracle = elapsed_ms(started);
+    Ok(pass.verdict)
 }
 
 /// How a verdict's `note` begins when lust refused to compile a program
@@ -730,6 +826,13 @@ fn time_candidate(
     let Some(tool) = &tools.lust else {
         return time_fast_build(verdict, nugget, build.fast_bin, opts);
     };
+    if tool.opt_known_unavailable() {
+        time_fast_build(verdict, nugget, build.fast_bin, opts)?;
+        if verdict.status == Status::Scored {
+            verdict.note = OPT_UNAVAILABLE.to_string();
+        }
+        return Ok(());
+    }
     let opt_bin = opts
         .work_dir
         .join(bin_name(&format!("{}.opt", verdict.hash)));
@@ -745,9 +848,13 @@ fn time_candidate(
     if let Err(problem) = built {
         // A host without a usable C compiler must not fail the run, and must
         // not turn every candidate into a divergence: time the tcc build.
+        let missing_cc = lust::is_no_c_compiler(&problem.message);
+        if missing_cc {
+            tool.mark_opt_unavailable();
+        }
         time_fast_build(verdict, nugget, build.fast_bin, opts)?;
         if verdict.status == Status::Scored {
-            verdict.note = if lust::is_no_c_compiler(&problem.message) {
+            verdict.note = if missing_cc {
                 OPT_UNAVAILABLE.to_string()
             } else {
                 format!(

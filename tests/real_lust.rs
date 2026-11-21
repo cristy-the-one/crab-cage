@@ -53,13 +53,81 @@ fn real_lust_probe_returns_quickly() {
     let tool = lust::probe(&bin, Duration::from_secs(10)).expect("probe a real lust");
     let elapsed = started.elapsed();
     println!(
-        "{} max_memory={} time_limit={}",
-        tool.version, tool.supports_max_memory, tool.supports_time_limit
+        "{} max_memory={} time_limit={} build_json={} sandbox_summary={} fix_sandbox={} opt={}",
+        tool.version,
+        tool.supports_max_memory,
+        tool.supports_time_limit,
+        tool.supports_build_json,
+        tool.supports_sandbox_summary,
+        tool.supports_fix_sandbox,
+        tool.supports_opt
     );
     assert!(
         elapsed < Duration::from_secs(15),
         "probe took {elapsed:?}, limit 15 s"
     );
+    assert!(tool.supports_max_memory, "expected --max-memory on lust");
+    assert!(tool.supports_time_limit, "expected --time-limit on lust");
+    assert!(
+        tool.supports_build_json,
+        "expected build --json on lust 0.3.1+ / 0.3.2"
+    );
+    assert!(
+        tool.supports_sandbox_summary,
+        "expected capabilities --sandbox --summary on lust 0.3.1+ / 0.3.2"
+    );
+    assert!(
+        tool.supports_fix_sandbox,
+        "expected fix --sandbox on lust 0.3.1+ / 0.3.2"
+    );
+    let summary = lust::capabilities_summary(&tool);
+    assert!(
+        summary.contains("--sandbox"),
+        "expected sandbox capability summary, got: {summary}"
+    );
+}
+
+/// lust 0.3.2 accepts `f64::clamp` with non-literal bounds (lust-lang #44).
+#[test]
+fn real_lust_032_supports_float_clamp_with_variable_bounds() {
+    use crab_cage::nugget::{Case, Nugget, Objective};
+    use crab_cage::pipeline::{evaluate, EvalOptions, Status, Toolchain};
+
+    let Some(bin) = real_lust() else { return };
+    let tool = lust::probe(&bin, Duration::from_secs(15)).expect("probe");
+    let work = std::env::temp_dir().join(format!("crab-cage-real-clamp-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&work);
+    let nugget = Nugget {
+        name: "clamp-vars".to_string(),
+        objective: Objective::PassAll,
+        timeout: Duration::from_secs(2),
+        max_memory: 64 * 1024 * 1024,
+        prefix: "fn clamp_val(x: f64, lo: f64, hi: f64) -> f64 {\n// CRAB:BEGIN\n".to_string(),
+        seed: "    x\n".to_string(),
+        suffix: "// CRAB:END\n}\nfn main() {\n    println!(\"{} {} {}\", clamp_val(-2.0, -1.0, 3.0), clamp_val(1.5, -1.0, 3.0), clamp_val(9.0, -1.0, 3.0));\n}\n".to_string(),
+        region_first_line: 3,
+        cases: vec![Case {
+            id: "one".to_string(),
+            input: String::new(),
+            expected: Some("-1 1.5 3\n".to_string()),
+        }],
+    };
+    let verdict = evaluate(
+        &nugget,
+        "    x.clamp(lo, hi)\n",
+        &Toolchain { lust: Some(tool) },
+        &EvalOptions {
+            work_dir: work.clone(),
+            host_memory: 1024 * 1024 * 1024,
+            compile_timeout: Duration::from_secs(60),
+            oracle: true,
+            slot: 0,
+        },
+    )
+    .expect("evaluate clamp with variable bounds");
+    assert_eq!(verdict.status, Status::Proven, "{verdict:?}");
+    assert_eq!(verdict.score, Some(0.0));
+    let _ = std::fs::remove_dir_all(&work);
 }
 
 /// With the daemon on, every candidate is compiled as `slot.rs` in the work

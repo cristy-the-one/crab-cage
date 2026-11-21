@@ -32,3 +32,47 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check
+
+  real-lust:
+    name: real-lust v0.3.2 (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            asset: lust-0.3.2-x86_64-linux.tar.gz
+            sha256: 0b50970459bd07a8c275047ed9290b0bea501a6de9d1050a66a33db21344f96a
+            bin: lust-0.3.2-x86_64-linux/bin/lust
+          - os: windows-latest
+            asset: lust-0.3.2-x86_64-windows.zip
+            sha256: 7682f99f1bf94494ef2735c8a559eb6b50b1a4aa417df62a34d82c14b09603e2
+            bin: lust-0.3.2-x86_64-windows/bin/lust.exe
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: fetch lust v0.3.2 (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/lust"
+          curl -fsSL -o "$RUNNER_TEMP/lust/${{ matrix.asset }}" \
+            "https://github.com/cristy-the-one/lust-lang/releases/download/v0.3.2/${{ matrix.asset }}"
+          echo "${{ matrix.sha256 }}  $RUNNER_TEMP/lust/${{ matrix.asset }}" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/lust/${{ matrix.asset }}" -C "$RUNNER_TEMP/lust"
+          echo "CRAB_LUST_BIN=$RUNNER_TEMP/lust/${{ matrix.bin }}" >> "$GITHUB_ENV"
+      - name: fetch lust v0.3.2 (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP "lust"
+          New-Item -ItemType Directory -Force -Path $dir | Out-Null
+          $archive = Join-Path $dir "${{ matrix.asset }}"
+          Invoke-WebRequest -Uri "https://github.com/cristy-the-one/lust-lang/releases/download/v0.3.2/${{ matrix.asset }}" -OutFile $archive
+          $actual = (Get-FileHash -Path $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actual -ne "${{ matrix.sha256 }}") { throw "sha256 mismatch: $actual" }
+          Expand-Archive -Path $archive -DestinationPath $dir -Force
+          $bin = Join-Path $dir "${{ matrix.bin }}"
+          "CRAB_LUST_BIN=$bin" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+      - name: test real_lust
+        run: cargo test --locked --test real_lust -- --nocapture

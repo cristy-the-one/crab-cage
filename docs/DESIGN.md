@@ -67,7 +67,7 @@ A process has many measured signals and a few things worth driving or predicting
 
 ## What lust is, here
 
-Lust compiles a subset of Rust. A program it accepts is valid Rust and, on that subset, matches `rustc`. Crab Cage relies on the surface in lust-lang v0.3.0 / main (pull request 29, merged: lust fix, reject rewrites, `--max-memory`, and the release setup) and on `docs/sandbox.md` there.
+Lust compiles a subset of Rust. A program it accepts is valid Rust and, on that subset, matches `rustc`. Crab Cage targets lust-lang [v0.3.2](https://github.com/cristy-the-one/lust-lang/releases/tag/v0.3.2) (and falls back gracefully for older 0.3.0 / 0.2.0 builds).
 
 | Command | What Crab Cage uses it for |
 |---|---|
