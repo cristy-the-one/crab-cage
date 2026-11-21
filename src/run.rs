@@ -121,15 +121,35 @@ pub fn attach_repair<'a>(
     slot: &'a mut Option<crate::repair::RepairProposer>,
     proposers: &mut Vec<&'a mut dyn Proposer>,
 ) {
+    attach_repair_with_lust(enabled, None, log, slot, proposers);
+}
+
+/// Like [`attach_repair`], and when `lust_bin` is given and supports
+/// `lust fix --sandbox`, tries `lust`'s own `auto` edits first (milliseconds)
+/// before falling back to `rustc`.
+pub fn attach_repair_with_lust<'a>(
+    enabled: bool,
+    lust_bin: Option<&Path>,
+    log: &crate::repair::RepairLog,
+    slot: &'a mut Option<crate::repair::RepairProposer>,
+    proposers: &mut Vec<&'a mut dyn Proposer>,
+) {
     if !enabled {
         return;
     }
     // Private to this process: two runs must not write the same file.
     let dir = std::env::temp_dir().join(format!("crab-cage-repair-{}", std::process::id()));
-    *slot = Some(
-        crate::repair::RepairProposer::new(crate::repair::rustc_diagnose(dir))
-            .with_log(crate::repair::RepairLog::clone(log)),
-    );
+    let mut proposer =
+        crate::repair::RepairProposer::new(crate::repair::rustc_diagnose(dir.clone()))
+            .with_log(crate::repair::RepairLog::clone(log));
+    if let Some(path) = lust_bin {
+        if let Ok(tool) = lust::probe(path, PROBE_TIMEOUT) {
+            if tool.supports_fix_sandbox {
+                proposer = proposer.with_fast_fix(crate::repair::lust_auto_fix(tool, dir));
+            }
+        }
+    }
+    *slot = Some(proposer);
     if let Some(proposer) = slot.as_mut() {
         proposers.push(proposer);
     }

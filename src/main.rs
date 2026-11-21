@@ -590,8 +590,9 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
         &mut proposers,
     )?;
     let mut repair = None;
-    run::attach_repair(
+    run::attach_repair_with_lust(
         args.backend.is_some() && !args.no_repair,
+        lust_bin.as_deref(),
         &repairs,
         &mut repair,
         &mut proposers,
@@ -701,9 +702,14 @@ fn probe(lust_bin: Option<PathBuf>, json: bool) -> Result<()> {
     if json {
         let payload = serde_json::json!({
             "version": tool.version,
+            "build": tool.build,
             "path": tool.bin.display().to_string(),
             "supports_max_memory": tool.supports_max_memory,
             "supports_time_limit": tool.supports_time_limit,
+            "supports_build_json": tool.supports_build_json,
+            "supports_fix_sandbox": tool.supports_fix_sandbox,
+            "supports_sandbox_summary": tool.supports_sandbox_summary,
+            "supports_opt": tool.supports_opt,
         });
         crab_cage::console::line(&serde_json::to_string(&payload)?);
         return Ok(());
@@ -720,6 +726,34 @@ fn probe(lust_bin: Option<PathBuf>, json: bool) -> Result<()> {
     } else {
         println!("--time-limit: no (host wall clock still applies)");
     }
+    println!(
+        "build --json: {}",
+        if tool.supports_build_json {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "fix --sandbox: {}",
+        if tool.supports_fix_sandbox {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "capabilities --sandbox --summary: {}",
+        if tool.supports_sandbox_summary {
+            "yes"
+        } else {
+            "no"
+        }
+    );
+    println!(
+        "build --opt: {}",
+        if tool.supports_opt { "yes" } else { "no" }
+    );
     Ok(())
 }
 

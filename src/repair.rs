@@ -33,17 +33,21 @@ pub type RepairLog = std::rc::Rc<std::cell::RefCell<Vec<(String, String)>>>;
 /// be run.
 pub type Diagnose = Box<dyn Fn(&str) -> Option<String>>;
 
-/// Proposes a rejected candidate again with rustc's fixes applied.
+/// Fast compiler-native auto-fix (e.g. `lust fix --sandbox` without `--all`),
+/// returning the updated region text when safe auto-edits changed only lines
+/// inside the marked region.
+pub type FastFix = Box<dyn Fn(&Nugget, &str) -> Option<String>>;
+
+/// Proposes a rejected candidate again with compiler fixes applied.
 ///
-/// It looks at the settled candidates the run shows it, newest first, and
-/// takes the first one that was rejected at the check or the build, that it
-/// has not looked at before, and for which rustc has a fix inside the
-/// region. Each candidate is looked at once, so a candidate rustc cannot
-/// fix costs one rustc check and no more. Its own candidates are looked at
-/// like any other: a second error is fixed in a second step.
+/// When a fast auto-fixer (`lust fix --sandbox`) is attached, it is tried
+/// first (milliseconds) before falling back to `rustc --error-format=json`
+/// (`MachineApplicable` edits). Each candidate is looked at once, so a
+/// candidate neither compiler can fix costs one check and no more.
 pub struct RepairProposer {
+    fast_fix: Option<FastFix>,
     diagnose: Diagnose,
-    /// Hashes of the candidates already given to rustc.
+    /// Hashes of the candidates already given to repair.
     examined: HashSet<String>,
     log: Option<RepairLog>,
 }
@@ -51,10 +55,18 @@ pub struct RepairProposer {
 impl RepairProposer {
     pub fn new(diagnose: Diagnose) -> Self {
         Self {
+            fast_fix: None,
             diagnose,
             examined: HashSet::new(),
             log: None,
         }
+    }
+
+    /// Try a fast auto-fixer (such as `lust fix --sandbox`) before invoking
+    /// `rustc`.
+    pub fn with_fast_fix(mut self, fix: FastFix) -> Self {
+        self.fast_fix = Some(fix);
+        self
     }
 
     /// Record every repair in `log`.
@@ -76,6 +88,14 @@ impl Proposer for RepairProposer {
             if !failed_to_compile || !self.examined.insert(candidate_hash(text)) {
                 continue;
             }
+            if let Some(fast) = &self.fast_fix {
+                if let Some(fixed) = fast(nugget, text) {
+                    if let Some(log) = &self.log {
+                        log.borrow_mut().push((candidate_hash(text), fixed.clone()));
+                    }
+                    return Ok(Proposal::Candidate(fixed));
+                }
+            }
             let program = nugget.splice(text);
             let Some(diagnostics) = (self.diagnose)(&program) else {
                 continue;
@@ -92,6 +112,36 @@ impl Proposer for RepairProposer {
         // Nothing to repair now. A later rejection may bring something.
         Ok(Proposal::Later)
     }
+}
+
+/// A [`FastFix`] backed by `lust fix --sandbox` (applying only `auto: true`
+/// edits). Returns `Some(new_region)` only if the file's prefix and suffix
+/// outside `// CRAB:BEGIN`..`// CRAB:END` are untouched and the region changed.
+pub fn lust_auto_fix(tool: crate::lust::LustTool, dir: PathBuf) -> FastFix {
+    Box::new(move |nugget: &Nugget, region: &str| {
+        fs::create_dir_all(&dir).ok()?;
+        let source = dir.join("lust-fix.rs");
+        let original = nugget.splice(region);
+        fs::write(&source, &original).ok()?;
+        let _ = crate::lust::fix_auto(&tool, &source, RUSTC_TIMEOUT).ok()?;
+        let updated = fs::read_to_string(&source).ok()?.replace("\r\n", "\n");
+        if updated == original {
+            return None;
+        }
+        let body = updated.strip_prefix(&nugget.prefix)?;
+        let body = body.strip_suffix(&nugget.suffix)?;
+        // Match the candidate's original trailing newline convention if `splice` added one.
+        let fixed = if !region.ends_with('\n') {
+            body.strip_suffix('\n').unwrap_or(body)
+        } else {
+            body
+        };
+        if fixed == region {
+            None
+        } else {
+            Some(fixed.to_string())
+        }
+    })
 }
 
 /// One replacement in the program text.
@@ -449,5 +499,59 @@ mod tests {
         // rustc accepts the repaired program.
         assert!(rustc_diagnose(dir.clone())(&nugget.splice(&fixed)).is_none());
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fast_fix_skips_rustc_when_it_repairs_the_region() {
+        let nugget = nugget();
+        let rustc_calls: Rc<RefCell<usize>> = Rc::new(RefCell::new(0));
+        let count = Rc::clone(&rustc_calls);
+        let log = RepairLog::default();
+        let mut proposer = RepairProposer::new(Box::new(move |_program: &str| {
+            *count.borrow_mut() += 1;
+            None
+        }))
+        .with_fast_fix(Box::new(|_nugget: &Nugget, region: &str| {
+            if region.contains("c != ") {
+                Some(region.replace("c != ", "*c != "))
+            } else {
+                None
+            }
+        }))
+        .with_log(RepairLog::clone(&log));
+
+        let rejected = verdict(BAD, Gate::Check, Status::Rejected);
+        let recent = [(BAD, &rejected)];
+        let feedback = Feedback {
+            best: None,
+            last: None,
+            recent: &recent,
+            best_verdict: None,
+        };
+        let fixed = proposer
+            .next(&nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
+        assert!(fixed.contains("|c| *c != "), "{fixed}");
+        assert_eq!(
+            *rustc_calls.borrow(),
+            0,
+            "rustc must not run when fast_fix succeeds"
+        );
+        assert_eq!(*log.borrow(), vec![(candidate_hash(BAD), fixed)]);
+
+        // When fast_fix returns None, RepairProposer falls back to rustc.
+        let other = "    let parts: Vec<&str> = unknown_fn();\n";
+        let rejected2 = verdict(other, Gate::Check, Status::Rejected);
+        let recent2 = [(BAD, &rejected), (other, &rejected2)];
+        let feedback2 = Feedback {
+            best: None,
+            last: None,
+            recent: &recent2,
+            best_verdict: None,
+        };
+        assert_eq!(proposer.next(&nugget, &feedback2).unwrap(), Proposal::Later);
+        assert_eq!(*rustc_calls.borrow(), 1);
     }
 }
