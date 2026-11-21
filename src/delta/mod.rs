@@ -32,5 +32,7 @@ pub use encode::{
     encode_strategy_b_local, proposal_cross_sector, search_family, FamilyParams, Planned,
 };
 pub use image::{Image, Sector};
-pub use kernel::{case_input, eval_candidate, score_stdout, KernelOracle};
+pub use kernel::{
+    case_input, eval_candidate, eval_candidate_with_lust, score_stdout, KernelOracle,
+};
 pub use pack::{add_header_bytes, crc32, ls_header_bytes, SECTOR};
