@@ -22,6 +22,7 @@
 
 use std::io::{self, Read, Write};
 use std::process::Command;
+use std::time::{Duration, Instant};
 
 pub(crate) type ChildIn = Box<dyn Write + Send>;
 pub(crate) type ChildOut = Box<dyn Read + Send>;
@@ -66,6 +67,41 @@ impl Proc {
         }
     }
 
+    /// Wait up to `timeout` for the child to exit.
+    ///
+    /// On Windows (`Proc::Raw`) this blocks directly on `WaitForSingleObject`,
+    /// waking up immediately when the process exits instead of polling on a
+    /// 15.6 ms system timer tick. For `Proc::Std` (Unix and `.cmd`/`.bat`),
+    /// it starts with a 1 ms poll and backs off exponentially up to 10 ms.
+    pub fn wait_timeout(&mut self, timeout: Duration) -> io::Result<Option<Exit>> {
+        match self {
+            #[cfg(windows)]
+            Proc::Raw(process) => {
+                let ms = duration_to_wait_ms(timeout);
+                process.wait_timeout_ms(ms)
+            }
+            Proc::Std(child) => {
+                if let Some(status) = child.try_wait()? {
+                    return Ok(Some(exit_of(status)));
+                }
+                let deadline = Instant::now() + timeout;
+                let mut sleep = Duration::from_millis(1);
+                loop {
+                    let now = Instant::now();
+                    if now >= deadline {
+                        return Ok(child.try_wait()?.map(exit_of));
+                    }
+                    let left = deadline.saturating_duration_since(now);
+                    std::thread::sleep(sleep.min(left));
+                    if let Some(status) = child.try_wait()? {
+                        return Ok(Some(exit_of(status)));
+                    }
+                    sleep = (sleep * 2).min(Duration::from_millis(10));
+                }
+            }
+        }
+    }
+
     pub fn wait(&mut self) -> io::Result<Exit> {
         match self {
             Proc::Std(child) => child.wait().map(exit_of),
@@ -91,6 +127,23 @@ impl Proc {
             Proc::Std(child) => child.as_raw_handle() as *mut std::ffi::c_void,
             Proc::Raw(process) => process.handle(),
         }
+    }
+}
+
+#[cfg(windows)]
+fn duration_to_wait_ms(timeout: Duration) -> u32 {
+    if timeout.is_zero() {
+        return 0;
+    }
+    let ms = timeout.as_millis();
+    if ms == 0 {
+        // Sub-millisecond non-zero timeout: wait 1 ms rather than polling at 0.
+        1
+    } else if ms >= u128::from(u32::MAX) {
+        // Reserve u32::MAX (INFINITE) for unbounded waits.
+        u32::MAX - 1
+    } else {
+        ms as u32
     }
 }
 
@@ -256,6 +309,10 @@ pub(crate) mod raw {
 
         pub fn try_wait(&mut self) -> io::Result<Option<Exit>> {
             self.wait_for(0)
+        }
+
+        pub fn wait_timeout_ms(&mut self, milliseconds: u32) -> io::Result<Option<Exit>> {
+            self.wait_for(milliseconds)
         }
 
         pub fn wait(&mut self) -> io::Result<Exit> {
