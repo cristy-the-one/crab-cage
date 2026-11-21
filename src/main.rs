@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -7,9 +8,10 @@ use clap::{Parser, Subcommand};
 
 use crab_cage::error::{err, Result};
 use crab_cage::evolve::{execute, format_summary, BackendChoice, EvalMode, RunOptions};
+use crab_cage::journal::Journal;
 use crab_cage::lust;
 use crab_cage::models;
-use crab_cage::nugget;
+use crab_cage::nugget::{self, Objective};
 use crab_cage::pipeline::{self, Status};
 use crab_cage::proposer::{FolderProposer, Proposer};
 use crab_cage::run;
@@ -35,11 +37,21 @@ enum Command {
     Evolve(EvolveArgs),
     /// Print local coding models that fit a 16 GB GPU.
     Models,
-    /// Locate lust and report whether --max-memory is available.
+    /// Locate lust and report its version and supported flags.
     LustProbe {
+        /// lust binary (defaults to $CRAB_LUST_BIN or `lust` on PATH).
         #[arg(long)]
         lust_bin: Option<PathBuf>,
+        /// Print probe results as one JSON object.
+        #[arg(long)]
+        json: bool,
     },
+    /// Inspect a nugget (metadata, objective, seed, template, sample case).
+    Inspect(InspectArgs),
+    /// Summarize a run's journal.jsonl (counts, top L-codes, best score, stage timings).
+    Summary(SummaryArgs),
+    /// Scaffold a new runnable nugget directory.
+    Init(InitArgs),
     /// Evaluate one candidate against a nugget.
     Eval(EvalArgs),
     /// Evaluate the seed and folder snippets, and journal each verdict.
@@ -93,6 +105,36 @@ struct EvolveArgs {
     /// Skip rustc / lust replay of the winner.
     #[arg(long)]
     no_verify: bool,
+}
+
+#[derive(Parser, Debug)]
+struct InspectArgs {
+    /// Directory with nugget.json, template.rs, and cases/.
+    nugget_dir: PathBuf,
+    /// Print the nugget briefing as one JSON object (ideal for LLM agents).
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser, Debug)]
+struct SummaryArgs {
+    /// Run output directory containing `journal.jsonl`, or path to a journal file.
+    path: PathBuf,
+    /// Print counts, top L-codes, best score, and stage timings as JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Parser, Debug)]
+struct InitArgs {
+    /// Directory to create the nugget in.
+    dir: PathBuf,
+    /// Nugget name (defaults to the directory name).
+    #[arg(long)]
+    name: Option<String>,
+    /// Objective: `pass_all`, `minimize`, or `fastest`.
+    #[arg(long, default_value = "pass_all")]
+    objective: String,
 }
 
 #[derive(Parser, Debug)]
@@ -208,6 +250,9 @@ enum DeltaCommand {
     Eval {
         #[arg(long, default_value = "nuggets/delta-kernel")]
         nugget: PathBuf,
+        /// lust binary (defaults to $CRAB_LUST_BIN; without it, rustc runs the fast gates).
+        #[arg(long)]
+        lust_bin: Option<PathBuf>,
         /// Candidate file. The seed is `nuggets/delta-kernel/template.rs`'s region;
         /// pass a file of replacement lines, as with `crab-cage eval`.
         candidate: PathBuf,
@@ -226,7 +271,12 @@ fn main() -> ExitCode {
             print!("{}", models::recommended());
             Ok(ExitCode::SUCCESS)
         }
-        Some(Command::LustProbe { lust_bin }) => probe(lust_bin).map(|()| ExitCode::SUCCESS),
+        Some(Command::LustProbe { lust_bin, json }) => {
+            probe(lust_bin, json).map(|()| ExitCode::SUCCESS)
+        }
+        Some(Command::Inspect(args)) => inspect_cmd(args).map(|()| ExitCode::SUCCESS),
+        Some(Command::Summary(args)) => summary_cmd(args).map(|()| ExitCode::SUCCESS),
+        Some(Command::Init(args)) => init_cmd(args).map(|()| ExitCode::SUCCESS),
         Some(Command::Evolve(args)) => evolve(args).map(|()| ExitCode::SUCCESS),
         Some(Command::Eval(args)) => eval_cmd(args),
         Some(Command::Run(args)) => run_cmd(args),
@@ -341,10 +391,11 @@ fn resolve_options(args: &EvolveArgs, file: Option<&FileConfig>) -> Result<RunOp
             .or(file.and_then(|f| f.model.clone()))
             .unwrap_or(defaults.model),
         llm_timeout: Duration::from_secs(180),
-        lust_bin: args
-            .lust_bin
-            .clone()
-            .or(file.and_then(|f| f.lust_bin.clone())),
+        lust_bin: resolve_lust_bin(
+            args.lust_bin
+                .clone()
+                .or(file.and_then(|f| f.lust_bin.clone())),
+        ),
         eval,
         max_memory,
         host_memory,
@@ -487,8 +538,17 @@ fn delta_cmd(args: DeltaArgs) -> Result<()> {
             println!("bytes {total}");
             println!("{params:?}");
         }
-        DeltaCommand::Eval { nugget, candidate } => {
-            let report = crab_cage::delta::eval_candidate(&nugget, &candidate)?;
+        DeltaCommand::Eval {
+            nugget,
+            lust_bin,
+            candidate,
+        } => {
+            let lust_bin = resolve_lust_bin(lust_bin);
+            let report = crab_cage::delta::eval_candidate_with_lust(
+                &nugget,
+                &candidate,
+                lust_bin.as_deref(),
+            )?;
             println!("{}", serde_json::to_string_pretty(&report)?);
             if !report.ok {
                 return Err(crab_cage::error::err(if report.note.is_empty() {
@@ -503,6 +563,7 @@ fn delta_cmd(args: DeltaArgs) -> Result<()> {
 }
 
 fn run_cmd(args: RunArgs) -> Result<ExitCode> {
+    let lust_bin = resolve_lust_bin(args.lust_bin);
     let mut folder = args
         .candidates
         .as_ref()
@@ -521,7 +582,7 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
         args.backend.as_deref(),
         args.endpoint.as_deref(),
         args.model.as_deref(),
-        args.lust_bin.as_deref(),
+        lust_bin.as_deref(),
         args.seed,
         Some(&args.out.join("prompts")),
         Some(&repairs),
@@ -541,9 +602,9 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
             budget: args.budget,
             jobs: args.jobs,
             out_dir: args.out,
-            lust_daemon: args.lust_bin.is_some() && !args.no_lust_daemon,
+            lust_daemon: lust_bin.is_some() && !args.no_lust_daemon,
             coverage: args.coverage,
-            lust_bin: args.lust_bin,
+            lust_bin,
         },
         &mut proposers,
     )?;
@@ -557,7 +618,8 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
 fn eval_cmd(args: EvalArgs) -> Result<ExitCode> {
     let nugget = nugget::load(&args.nugget_dir)?;
     let candidate = read_candidate(&args.candidate)?;
-    let mut lust = match &args.lust_bin {
+    let lust_bin = resolve_lust_bin(args.lust_bin);
+    let mut lust = match &lust_bin {
         Some(path) => Some(lust::probe(path, Duration::from_secs(10))?),
         None => None,
     };
@@ -619,14 +681,33 @@ fn fresh_work_dir() -> PathBuf {
     std::env::temp_dir().join(format!("crab-cage-eval-{}-{nanos}", std::process::id()))
 }
 
-fn probe(lust_bin: Option<PathBuf>) -> Result<()> {
-    let path = match lust_bin {
+fn resolve_lust_bin(flag: Option<PathBuf>) -> Option<PathBuf> {
+    if flag.is_some() {
+        return flag;
+    }
+    std::env::var_os("CRAB_LUST_BIN")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn probe(lust_bin: Option<PathBuf>, json: bool) -> Result<()> {
+    let path = match resolve_lust_bin(lust_bin) {
         Some(path) => path,
         None => lust::which("lust").ok_or_else(|| {
-            err("lust is not on PATH. Pass --lust-bin, or set lust_bin in crab-cage.toml. A 0.2.0 build has no --max-memory; that flag is in lust-lang v0.3.0 / main.")
+            err("lust is not on PATH. Pass --lust-bin, set CRAB_LUST_BIN, or set lust_bin in crab-cage.toml.")
         })?,
     };
     let tool = lust::probe(&path, Duration::from_secs(10))?;
+    if json {
+        let payload = serde_json::json!({
+            "version": tool.version,
+            "path": tool.bin.display().to_string(),
+            "supports_max_memory": tool.supports_max_memory,
+            "supports_time_limit": tool.supports_time_limit,
+        });
+        crab_cage::console::line(&serde_json::to_string(&payload)?);
+        return Ok(());
+    }
     println!("{}", tool.version);
     println!("path: {}", tool.bin.display());
     if tool.supports_max_memory {
@@ -639,5 +720,350 @@ fn probe(lust_bin: Option<PathBuf>) -> Result<()> {
     } else {
         println!("--time-limit: no (host wall clock still applies)");
     }
+    Ok(())
+}
+
+const SAMPLE_CLIP: usize = 1000;
+
+fn clip_sample(text: &str) -> String {
+    let mut count = 0usize;
+    for (byte, _) in text.char_indices() {
+        if count == SAMPLE_CLIP {
+            return format!("{}...(truncated)", &text[..byte]);
+        }
+        count += 1;
+    }
+    text.to_string()
+}
+
+fn objective_rule(objective: Objective) -> &'static str {
+    match objective {
+        Objective::PassAll => {
+            "Lower is better; score is the number of failed cases (0 is solved)."
+        }
+        Objective::Minimize => {
+            "Lower is better; each case prints `score: <number>` on its last stdout line and the score is the sum."
+        }
+        Objective::Fastest => {
+            "Lower is better; every case must match its expected output, then the score is the sum of median run times in ms."
+        }
+    }
+}
+
+fn inspect_cmd(args: InspectArgs) -> Result<()> {
+    let loaded = nugget::load(&args.nugget_dir)?;
+    let case_ids: Vec<&str> = loaded.cases.iter().map(|c| c.id.as_str()).collect();
+    let sample = loaded.cases.first().map(|case| {
+        serde_json::json!({
+            "id": case.id,
+            "input": clip_sample(&case.input),
+            "expected": case.expected.as_deref().map(clip_sample),
+        })
+    });
+    if args.json {
+        let payload = serde_json::json!({
+            "name": loaded.name,
+            "objective": loaded.objective.as_str(),
+            "objective_rule": objective_rule(loaded.objective),
+            "timeout_ms": loaded.timeout.as_millis() as u64,
+            "max_memory": loaded.max_memory,
+            "region_first_line": loaded.region_first_line,
+            "seed": loaded.seed,
+            "template": loaded.splice(&loaded.seed),
+            "cases_count": loaded.cases.len(),
+            "case_ids": case_ids,
+            "sample_case": sample,
+        });
+        crab_cage::console::line(&serde_json::to_string(&payload)?);
+        return Ok(());
+    }
+    println!("nugget: {}", loaded.name);
+    println!("objective: {}", loaded.objective.as_str());
+    println!("rule: {}", objective_rule(loaded.objective));
+    println!(
+        "limits: timeout_ms={} max_memory={}",
+        loaded.timeout.as_millis(),
+        loaded.max_memory
+    );
+    println!("region_first_line: {}", loaded.region_first_line);
+    println!("cases ({}): {}", loaded.cases.len(), case_ids.join(", "));
+    println!("--- seed ---");
+    print!("{}", loaded.seed);
+    if !loaded.seed.ends_with('\n') {
+        println!();
+    }
+    Ok(())
+}
+
+fn summary_cmd(args: SummaryArgs) -> Result<()> {
+    let (journal_path, out_dir) = if args.path.is_dir() {
+        (args.path.join("journal.jsonl"), Some(args.path.as_path()))
+    } else {
+        (args.path.clone(), args.path.parent())
+    };
+    if !journal_path.is_file() {
+        return Err(err(format!(
+            "{}: journal file not found",
+            journal_path.display()
+        )));
+    }
+    let stats = parse_journal_stats(&journal_path)?;
+    if args.json {
+        let best_region = out_dir
+            .map(|dir| dir.join("best.region.rs"))
+            .filter(|path| path.is_file())
+            .and_then(|path| fs::read_to_string(path).ok());
+        let top_codes: Vec<serde_json::Value> = stats
+            .top_codes
+            .iter()
+            .map(|(code, count)| serde_json::json!({ "code": code, "count": count }))
+            .collect();
+        let best = stats
+            .best
+            .as_ref()
+            .map(|(score, hash)| serde_json::json!({ "score": score, "hash": hash }));
+        let payload = serde_json::json!({
+            "journal": journal_path.display().to_string(),
+            "candidates": stats.candidates,
+            "status": {
+                "rejected": stats.rejected,
+                "scored": stats.scored,
+                "proven": stats.proven,
+                "diverged": stats.diverged,
+            },
+            "rejected_gates": {
+                "prefilter": stats.gate_prefilter,
+                "check": stats.gate_check,
+                "build": stats.gate_build,
+                "run": stats.gate_run,
+                "oracle": stats.gate_oracle,
+            },
+            "top_codes": top_codes,
+            "best": best,
+            "ms_total": {
+                "check": stats.ms_check,
+                "build": stats.ms_build,
+                "run": stats.ms_run,
+                "opt": stats.ms_opt,
+                "oracle": stats.ms_oracle,
+            },
+            "best_region": best_region,
+        });
+        crab_cage::console::line(&serde_json::to_string(&payload)?);
+        return Ok(());
+    }
+    let text = Journal::summary(&journal_path)?;
+    crab_cage::console::print(&text);
+    crab_cage::console::line(&format!(
+        "ms total check={} build={} run={} opt={} oracle={}",
+        stats.ms_check, stats.ms_build, stats.ms_run, stats.ms_opt, stats.ms_oracle
+    ));
+    Ok(())
+}
+
+#[derive(Default)]
+struct JournalStats {
+    candidates: u64,
+    rejected: u64,
+    scored: u64,
+    proven: u64,
+    diverged: u64,
+    gate_prefilter: u64,
+    gate_check: u64,
+    gate_build: u64,
+    gate_run: u64,
+    gate_oracle: u64,
+    ms_check: u64,
+    ms_build: u64,
+    ms_run: u64,
+    ms_opt: u64,
+    ms_oracle: u64,
+    top_codes: Vec<(String, u64)>,
+    best: Option<(f64, String)>,
+}
+
+fn parse_journal_stats(path: &Path) -> Result<JournalStats> {
+    let text = fs::read_to_string(path)?;
+    let ends_with_newline = text.ends_with('\n');
+    let segments: Vec<&str> = text.split('\n').collect();
+    let mut stats = JournalStats::default();
+    let mut codes: HashMap<String, u64> = HashMap::new();
+    for (index, raw) in segments.iter().enumerate() {
+        let line = raw.trim_end_matches('\r').trim();
+        if line.is_empty() {
+            continue;
+        }
+        let is_last = index + 1 == segments.len();
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(_) if is_last && !ends_with_newline => continue,
+            Err(error) => {
+                return Err(err(format!(
+                    "{}: journal line {}: {error}",
+                    path.display(),
+                    index + 1
+                )));
+            }
+        };
+        stats.candidates += 1;
+        let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
+        let gate = value.get("gate").and_then(|v| v.as_str()).unwrap_or("");
+        match status {
+            "rejected" => {
+                stats.rejected += 1;
+                match gate {
+                    "prefilter" => stats.gate_prefilter += 1,
+                    "check" => stats.gate_check += 1,
+                    "build" => stats.gate_build += 1,
+                    "run" => stats.gate_run += 1,
+                    "oracle" => stats.gate_oracle += 1,
+                    _ => {}
+                }
+            }
+            "scored" => stats.scored += 1,
+            "proven" => stats.proven += 1,
+            "diverged" => stats.diverged += 1,
+            _ => {}
+        }
+        if let Some(diags) = value.get("diagnostics").and_then(|v| v.as_array()) {
+            for diag in diags {
+                if let Some(code) = diag.get("code").and_then(|v| v.as_str()) {
+                    if !code.is_empty() {
+                        *codes.entry(code.to_string()).or_default() += 1;
+                    }
+                }
+            }
+        }
+        if let Some(ms) = value.get("ms") {
+            stats.ms_check += ms.get("check").and_then(|v| v.as_u64()).unwrap_or(0);
+            stats.ms_build += ms.get("build").and_then(|v| v.as_u64()).unwrap_or(0);
+            stats.ms_run += ms.get("run").and_then(|v| v.as_u64()).unwrap_or(0);
+            stats.ms_opt += ms.get("opt").and_then(|v| v.as_u64()).unwrap_or(0);
+            stats.ms_oracle += ms.get("oracle").and_then(|v| v.as_u64()).unwrap_or(0);
+        }
+        if matches!(status, "scored" | "proven") {
+            if let (Some(score), Some(hash)) = (
+                value
+                    .get("score")
+                    .and_then(|v| v.as_f64())
+                    .filter(|s| s.is_finite()),
+                value.get("hash").and_then(|v| v.as_str()),
+            ) {
+                let take = match &stats.best {
+                    Some((best_score, _)) => score < *best_score,
+                    None => true,
+                };
+                if take {
+                    stats.best = Some((score, hash.to_string()));
+                }
+            }
+        }
+    }
+    let mut ranked: Vec<(String, u64)> = codes.into_iter().collect();
+    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    ranked.truncate(10);
+    stats.top_codes = ranked;
+    Ok(stats)
+}
+
+fn init_cmd(args: InitArgs) -> Result<()> {
+    let objective = match args.objective.as_str() {
+        "pass_all" => Objective::PassAll,
+        "minimize" => Objective::Minimize,
+        "fastest" => Objective::Fastest,
+        other => {
+            return Err(err(format!(
+                "unknown objective `{other}`; expected pass_all, minimize or fastest"
+            )));
+        }
+    };
+    let spec_path = args.dir.join("nugget.json");
+    let template_path = args.dir.join("template.rs");
+    if spec_path.exists() || template_path.exists() {
+        return Err(err(format!(
+            "{}: nugget files already exist; choose an empty directory",
+            args.dir.display()
+        )));
+    }
+    let name = match args.name {
+        Some(name) if !name.trim().is_empty() => name,
+        _ => args
+            .dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("my-nugget")
+            .to_string(),
+    };
+    let cases_dir = args.dir.join("cases");
+    fs::create_dir_all(&cases_dir)?;
+    let spec = serde_json::json!({
+        "name": name,
+        "objective": objective.as_str(),
+        "timeout_ms": 2000,
+        "max_memory": "64M",
+    });
+    fs::write(
+        &spec_path,
+        format!("{}\n", serde_json::to_string_pretty(&spec)?),
+    )?;
+    let (template, sample_in, sample_out) = match objective {
+        Objective::PassAll | Objective::Fastest => (
+            "\
+use std::io::{self, Read};
+
+fn solve(xs: &[i64]) -> i64 {
+    // CRAB:BEGIN
+    xs.iter().sum()
+    // CRAB:END
+}
+
+fn main() {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
+    let xs: Vec<i64> = input
+        .split_whitespace()
+        .map(|s| s.parse::<i64>().unwrap())
+        .collect();
+    println!(\"{}\", solve(&xs));
+}
+",
+            "1 2 3\n",
+            Some("6\n"),
+        ),
+        Objective::Minimize => (
+            "\
+use std::io::{self, Read};
+
+fn cost(xs: &[i64]) -> f64 {
+    // CRAB:BEGIN
+    xs.iter().map(|&x| (x * x) as f64).sum()
+    // CRAB:END
+}
+
+fn main() {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input).unwrap();
+    let xs: Vec<i64> = input
+        .split_whitespace()
+        .map(|s| s.parse::<i64>().unwrap())
+        .collect();
+    println!(\"score: {}\", cost(&xs));
+}
+",
+            "1 2 3\n",
+            None,
+        ),
+    };
+    fs::write(&template_path, template)?;
+    fs::write(cases_dir.join("01.in"), sample_in)?;
+    if let Some(expected) = sample_out {
+        fs::write(cases_dir.join("01.out"), expected)?;
+    }
+    println!(
+        "created {} nugget in {}",
+        objective.as_str(),
+        args.dir.display()
+    );
     Ok(())
 }

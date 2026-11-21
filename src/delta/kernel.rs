@@ -258,9 +258,20 @@ fn parse_u32(text: &str) -> Result<u32> {
     text.parse().map_err(|_| err(format!("bad integer {text}")))
 }
 
-/// Compile `candidate` through the nugget funnel, then grade its transcript
-/// with the reference decoder. A kernel that fails either gate has no score.
+/// Compile `candidate` through the nugget funnel (with `rustc` only), then
+/// grade its transcript with the reference decoder.
 pub fn eval_candidate(nugget_dir: &Path, candidate_path: &Path) -> Result<KernelOracle> {
+    eval_candidate_with_lust(nugget_dir, candidate_path, None)
+}
+
+/// Compile `candidate` through the nugget funnel (using `lust_bin` when given,
+/// then proving against `rustc`), and grade its transcript with the reference
+/// decoder. A kernel that fails either gate has no score.
+pub fn eval_candidate_with_lust(
+    nugget_dir: &Path,
+    candidate_path: &Path,
+    lust_bin: Option<&Path>,
+) -> Result<KernelOracle> {
     let nugget = nugget::load(nugget_dir)?;
     if nugget.objective != Objective::Minimize {
         return Err(err("delta nugget objective must be minimize"));
@@ -268,6 +279,10 @@ pub fn eval_candidate(nugget_dir: &Path, candidate_path: &Path) -> Result<Kernel
     let candidate = fs::read_to_string(candidate_path)
         .map_err(|error| err(format!("{}: {error}", candidate_path.display())))?
         .replace("\r\n", "\n");
+    let lust = match lust_bin {
+        Some(path) => Some(crate::lust::probe(path, Duration::from_secs(10))?),
+        None => None,
+    };
     let work = std::env::temp_dir().join(format!(
         "crab-cage-delta-{}-{}",
         std::process::id(),
@@ -279,7 +294,7 @@ pub fn eval_candidate(nugget_dir: &Path, candidate_path: &Path) -> Result<Kernel
     let verdict = pipeline::evaluate(
         &nugget,
         &candidate,
-        &pipeline::Toolchain { lust: None },
+        &pipeline::Toolchain { lust },
         &pipeline::EvalOptions {
             work_dir: work.clone(),
             host_memory: 1024 * 1024 * 1024,
