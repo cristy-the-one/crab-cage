@@ -350,14 +350,34 @@ pub fn check(tool: &LustTool, source: &Path, timeout: Duration) -> Result<CheckR
 }
 
 pub fn fix(tool: &LustTool, source: &Path, timeout: Duration) -> Result<ExecResult> {
+    fix_with_flags(tool, source, timeout, true)
+}
+
+/// Apply only `auto: true` safe edits via `lust fix --sandbox` (without `--all`).
+pub fn fix_auto(tool: &LustTool, source: &Path, timeout: Duration) -> Result<ExecResult> {
+    fix_with_flags(tool, source, timeout, false)
+}
+
+fn fix_with_flags(
+    tool: &LustTool,
+    source: &Path,
+    timeout: Duration,
+    all: bool,
+) -> Result<ExecResult> {
+    let source_str = source.display().to_string();
+    let args_sandbox: Vec<&str> = if all {
+        vec!["fix", "--all", "--sandbox", &source_str]
+    } else {
+        vec!["fix", "--sandbox", &source_str]
+    };
     let with_sandbox = tool_output(
         &tool.bin,
-        &["fix", "--all", "--sandbox", &source.display().to_string()],
+        &args_sandbox,
         timeout,
         &[("LUST_NO_DAEMON", "1")],
         None,
     )?;
-    if with_sandbox.success() {
+    if with_sandbox.success() || tool.supports_fix_sandbox {
         return Ok(with_sandbox);
     }
     let combined = format!("{}{}", with_sandbox.stderr, with_sandbox.stdout);
@@ -367,9 +387,14 @@ pub fn fix(tool: &LustTool, source: &Path, timeout: Duration) -> Result<ExecResu
     if !rejected {
         return Ok(with_sandbox);
     }
+    let args_plain: Vec<&str> = if all {
+        vec!["fix", "--all", &source_str]
+    } else {
+        vec!["fix", &source_str]
+    };
     tool_output(
         &tool.bin,
-        &["fix", "--all", &source.display().to_string()],
+        &args_plain,
         timeout,
         &[("LUST_NO_DAEMON", "1")],
         None,
