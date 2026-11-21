@@ -5,15 +5,15 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crab_cage::lust::{self, RunClass};
 use crab_cage::supervisor::{self, Limits, StopKind};
 
 fn compile_probe(name: &str) -> PathBuf {
-    static LOCK: OnceLock<()> = OnceLock::new();
-    let _ = LOCK.get_or_init(|| ());
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = root.join("tests/probes").join(format!("{name}.rs"));
     let out_dir = root.join("target").join("probes");
