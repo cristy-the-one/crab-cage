@@ -5,15 +5,15 @@
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
 use crab_cage::lust::{self, RunClass};
 use crab_cage::supervisor::{self, Limits, StopKind};
 
 fn compile_probe(name: &str) -> PathBuf {
-    static LOCK: OnceLock<()> = OnceLock::new();
-    let _ = LOCK.get_or_init(|| ());
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    let _guard = LOCK.get_or_init(|| Mutex::new(())).lock().unwrap();
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let source = root.join("tests/probes").join(format!("{name}.rs"));
     let out_dir = root.join("target").join("probes");
@@ -242,4 +242,31 @@ fn a_child_gets_its_arguments_environment_directory_and_streams_exactly() {
     assert_eq!(rest[4], "stdin=[from the host]");
     assert_eq!(result.stderr.trim_end(), "to stderr");
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn fast_child_exits_without_polling_tick_quantization() {
+    let probe = compile_probe("echo_args");
+    let limits = Limits {
+        wall: Duration::from_secs(10),
+        memory_bytes: None,
+        scrub_env: false,
+    };
+    // Warm the OS file cache with one run, then time 10 consecutive empty-stdin runs.
+    let _ = supervisor::run_capture(Command::new(&probe), &limits, b"").unwrap();
+    let mut durations = Vec::with_capacity(10);
+    for _ in 0..10 {
+        let result = supervisor::run_capture(Command::new(&probe), &limits, b"").unwrap();
+        assert_eq!(result.kind, StopKind::Exited(7));
+        durations.push(result.elapsed);
+    }
+    durations.sort();
+    let median = durations[durations.len() / 2];
+    eprintln!("fast child median elapsed: {median:?}");
+    // With 10ms (15.6ms Windows tick) polling, even a ~2ms child frequently took
+    // >= 15ms. Event-driven WaitForSingleObject / 1ms backoff finishes promptly.
+    assert!(
+        median < Duration::from_millis(100),
+        "fast child median took {median:?}"
+    );
 }

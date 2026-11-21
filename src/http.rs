@@ -14,6 +14,7 @@ const MAX_BODY: usize = 1024 * 1024;
 pub fn post_json(url: &str, body: &str, timeout: Duration) -> Result<String> {
     let parsed = parse_http_url(url)?;
     let mut stream = connect(&parsed, timeout)?;
+    let _ = stream.set_nodelay(true);
     stream.set_read_timeout(Some(timeout))?;
     stream.set_write_timeout(Some(timeout))?;
     let request = format!(

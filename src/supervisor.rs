@@ -58,13 +58,19 @@ pub fn run_capture(mut cmd: Command, limits: &Limits, input: &[u8]) -> Result<Ex
         stderr,
     } = spawn::spawn_piped(cmd)?;
     let _job = apply_windows_job(&child, limits)?;
-    let input = input.to_vec();
-    // Not joined: a grandchild that inherited stdin can keep the write
-    // blocked after the child is gone.
-    thread::spawn(move || {
-        let _ = stdin.write_all(&input);
-        let _ = stdin.flush();
-    });
+    if input.is_empty() {
+        // Close stdin immediately without allocating a buffer or spawning a
+        // writer thread on every compiler/tool invocation.
+        drop(stdin);
+    } else {
+        let input = input.to_vec();
+        // Not joined: a grandchild that inherited stdin can keep the write
+        // blocked after the child is gone.
+        thread::spawn(move || {
+            let _ = stdin.write_all(&input);
+            let _ = stdin.flush();
+        });
+    }
     let stdout_rx = spawn_reader(stdout);
     let stderr_rx = spawn_reader(stderr);
     let start = Instant::now();
@@ -307,15 +313,19 @@ fn harden_env(cmd: &mut Command) {
 
 fn wait_child(child: &mut Proc, limits: &Limits, start: Instant) -> Result<StopKind> {
     loop {
-        if start.elapsed() > limits.wall {
+        let elapsed = start.elapsed();
+        if elapsed >= limits.wall {
+            if let Some(exit) = child.try_wait()? {
+                return Ok(status_kind(exit, limits.memory_bytes.is_some()));
+            }
             kill_tree(child);
             let _ = child.wait();
             return Ok(StopKind::TimedOut);
         }
-        if let Some(exit) = child.try_wait()? {
+        let remaining = limits.wall.saturating_sub(elapsed);
+        if let Some(exit) = child.wait_timeout(remaining)? {
             return Ok(status_kind(exit, limits.memory_bytes.is_some()));
         }
-        thread::sleep(Duration::from_millis(10));
     }
 }
 
