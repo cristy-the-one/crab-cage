@@ -7,10 +7,13 @@
 //! kills on the wall clock: a straight-line body is not probed, and a lust
 //! that predates the flag has no guest deadline.
 
+use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -18,12 +21,26 @@ use serde::Deserialize;
 use crate::error::{err, Result};
 use crate::supervisor::{self, ExecResult, Limits, Session, StopKind};
 
+/// Cached edition supported by `rustc` on `PATH` (`"2024"` or `"2021"`).
+static RUSTC_EDITION: OnceLock<&'static str> = OnceLock::new();
+
 #[derive(Clone, Debug)]
 pub struct LustTool {
     pub bin: PathBuf,
     pub version: String,
+    /// Short git build hash when reported by `lust capabilities --json`.
+    pub build: Option<String>,
     pub supports_max_memory: bool,
     pub supports_time_limit: bool,
+    /// Whether `lust build --json` is advertised (lust 0.3.1+ / 0.3.2).
+    /// When true, the funnel can check and build in one invocation.
+    pub supports_build_json: bool,
+    /// Whether `lust fix --sandbox` is advertised (lust 0.3.1+ / 0.3.2).
+    pub supports_fix_sandbox: bool,
+    /// Whether `lust capabilities --sandbox --summary` is advertised (lust 0.3.1+ / 0.3.2).
+    pub supports_sandbox_summary: bool,
+    /// Whether `lust build --opt` is advertised.
+    pub supports_opt: bool,
     /// Let `check` and `build` use lust's warm daemon. Off after `probe`.
     ///
     /// The daemon keeps one warm session per source path, so it pays only
@@ -32,6 +49,33 @@ pub struct LustTool {
     /// directory, which is where it puts its socket file and cache.
     /// `stop_daemon` on that directory ends the daemon.
     pub daemon: bool,
+    /// Set once `lust build --opt` reports that no C compiler is available,
+    /// so later candidates in the same run skip doomed `--opt` spawns.
+    opt_unavailable: Arc<AtomicBool>,
+}
+
+impl LustTool {
+    /// True once a `lust build --opt` call in this toolchain reported that
+    /// no optimising C compiler is installed.
+    pub fn opt_known_unavailable(&self) -> bool {
+        self.opt_unavailable.load(Ordering::Relaxed)
+    }
+
+    /// Record that no optimising C compiler is available for `--opt`.
+    pub fn mark_opt_unavailable(&self) {
+        self.opt_unavailable.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Result of a fused `lust build --json --sandbox` invocation.
+#[derive(Clone, Debug)]
+pub enum BuildOutcome {
+    /// Compiled cleanly and wrote the requested output binary.
+    Built,
+    /// Stopped at type/borrow/sandbox checking with structured diagnostics.
+    CheckFailed(Vec<Diagnostic>),
+    /// Failed during build/linking without structured check diagnostics.
+    BuildFailed(String),
 }
 
 #[derive(Clone, Debug)]
@@ -92,6 +136,26 @@ pub fn which(name: &str) -> Option<PathBuf> {
 }
 
 pub fn probe(bin: &Path, timeout: Duration) -> Result<LustTool> {
+    // lust 0.3.1+ / 0.3.2 exposes its version, build hash, commands, and
+    // per-command flags in `lust capabilities --json` under `interface`.
+    // Reading that in one call avoids two cold spawns and avoids grepping
+    // human usage text.
+    if let Ok(caps) = tool_output(
+        bin,
+        &["capabilities", "--json"],
+        timeout,
+        &[("LUST_NO_DAEMON", "1")],
+        None,
+    ) {
+        if caps.success() {
+            if let Some(tool) = tool_from_capabilities_json(bin, &caps.stdout) {
+                return Ok(tool);
+            }
+        }
+    }
+
+    // Fallback for lust <= 0.3.0 and test stand-ins: `--version` plus usage
+    // text when invoked with no arguments.
     let version = tool_output(
         bin,
         &["--version"],
@@ -122,12 +186,71 @@ pub fn probe(bin: &Path, timeout: Duration) -> Result<LustTool> {
         usage.stdout, usage.stderr
     );
     let (supports_max_memory, supports_time_limit) = flags_from_usage(&usage_text);
+    let supports_opt = usage_text.contains("--opt");
     Ok(LustTool {
         bin: bin.to_path_buf(),
         version,
+        build: None,
         daemon: false,
         supports_max_memory,
         supports_time_limit,
+        supports_build_json: false,
+        supports_fix_sandbox: false,
+        supports_sandbox_summary: false,
+        supports_opt,
+        opt_unavailable: Arc::new(AtomicBool::new(false)),
+    })
+}
+
+#[derive(Deserialize)]
+struct CapabilitiesJson {
+    #[serde(default)]
+    interface: Option<InterfaceJson>,
+}
+
+#[derive(Deserialize)]
+struct InterfaceJson {
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    build: String,
+    #[serde(default)]
+    flags: HashMap<String, Vec<String>>,
+}
+
+fn tool_from_capabilities_json(bin: &Path, json: &str) -> Option<LustTool> {
+    let parsed: CapabilitiesJson = serde_json::from_str(json).ok()?;
+    let interface = parsed.interface?;
+    let ver = interface.version.trim();
+    if ver.is_empty() {
+        return None;
+    }
+    let build_hash = interface.build.trim();
+    let version = if build_hash.is_empty() {
+        format!("lust {ver}")
+    } else {
+        format!("lust {ver} (build {build_hash})")
+    };
+    let has_flag = |cmd: &str, flag: &str| -> bool {
+        interface
+            .flags
+            .get(cmd)
+            .map(|list| list.iter().any(|item| item == flag))
+            .unwrap_or(false)
+    };
+    Some(LustTool {
+        bin: bin.to_path_buf(),
+        version,
+        build: (!build_hash.is_empty()).then(|| build_hash.to_string()),
+        supports_max_memory: has_flag("build", "--max-memory"),
+        supports_time_limit: has_flag("build", "--time-limit"),
+        supports_build_json: has_flag("build", "--json"),
+        supports_fix_sandbox: has_flag("fix", "--sandbox"),
+        supports_sandbox_summary: has_flag("capabilities", "--sandbox")
+            && has_flag("capabilities", "--summary"),
+        supports_opt: has_flag("build", "--opt"),
+        daemon: false,
+        opt_unavailable: Arc::new(AtomicBool::new(false)),
     })
 }
 
@@ -154,28 +277,44 @@ fn flags_from_usage(text: &str) -> (bool, bool) {
     )
 }
 
-/// Text of `lust capabilities --summary`.
+/// Text of `lust capabilities --sandbox --summary` (lust 0.3.1+ / 0.3.2),
+/// falling back to `lust capabilities --summary` for older binaries.
 ///
 /// The daemon is forced off for this call. Stdout is the summary; stderr is
 /// used when stdout is empty. A spawn failure, a timeout, or a non-zero exit
 /// is an empty string, so a missing summary does not stop a run.
 pub fn capabilities_summary(tool: &LustTool) -> String {
-    let Ok(result) = tool_output(
+    if tool.supports_sandbox_summary {
+        if let Some(text) =
+            run_capabilities_summary(tool, &["capabilities", "--sandbox", "--summary"])
+        {
+            return text;
+        }
+    }
+    run_capabilities_summary(tool, &["capabilities", "--summary"]).unwrap_or_default()
+}
+
+fn run_capabilities_summary(tool: &LustTool, args: &[&str]) -> Option<String> {
+    let result = tool_output(
         &tool.bin,
-        &["capabilities", "--summary"],
+        args,
         Duration::from_secs(10),
         &[("LUST_NO_DAEMON", "1")],
         None,
-    ) else {
-        return String::new();
-    };
+    )
+    .ok()?;
     if !result.success() {
-        return String::new();
+        return None;
     }
-    if result.stdout.trim().is_empty() {
+    let text = if result.stdout.trim().is_empty() {
         result.stderr
     } else {
         result.stdout
+    };
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 
@@ -250,24 +389,7 @@ pub fn build(
     timeout: Duration,
     opt: bool,
 ) -> Result<()> {
-    let memory = max_memory.to_string();
-    let mut args = vec!["build".to_string(), "--sandbox".to_string()];
-    if opt {
-        args.push("--opt".to_string());
-    }
-    if tool.supports_max_memory {
-        args.push("--max-memory".to_string());
-        args.push(memory);
-    }
-    if tool.supports_time_limit {
-        if let Some(limit) = time_limit {
-            args.push("--time-limit".to_string());
-            args.push(format_time_limit(limit));
-        }
-    }
-    args.push("-o".to_string());
-    args.push(output.display().to_string());
-    args.push(source.display().to_string());
+    let args = build_args(tool, source, output, max_memory, time_limit, opt, false);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
     let result = tool_output(
         &tool.bin,
@@ -290,6 +412,84 @@ pub fn build(
         )));
     }
     Ok(())
+}
+
+/// Fused check + build via `lust build --json --sandbox` (lust 0.3.1+ / 0.3.2).
+///
+/// On a valid candidate this produces the output binary in one process
+/// invocation and one daemon round-trip instead of separate `check` and
+/// `build` calls. On a check error it returns the same structured JSON
+/// diagnostics as [`check`].
+pub fn build_json(
+    tool: &LustTool,
+    source: &Path,
+    output: &Path,
+    max_memory: u64,
+    time_limit: Option<Duration>,
+    timeout: Duration,
+    opt: bool,
+) -> Result<BuildOutcome> {
+    let args = build_args(tool, source, output, max_memory, time_limit, opt, true);
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let result = tool_output(
+        &tool.bin,
+        &arg_refs,
+        timeout,
+        daemon_env(tool),
+        daemon_dir(tool, source),
+    )?;
+    if result.success() {
+        if !output.is_file() {
+            return Ok(BuildOutcome::BuildFailed(format!(
+                "lust build exited 0 but did not write {}",
+                output.display()
+            )));
+        }
+        return Ok(BuildOutcome::Built);
+    }
+    let combined = format!("{}{}", result.stdout, result.stderr);
+    let diagnostics = parse_diagnostics(&combined);
+    if diagnostics.iter().any(|d| !d.code.is_empty()) {
+        return Ok(BuildOutcome::CheckFailed(diagnostics));
+    }
+    Ok(BuildOutcome::BuildFailed(format!(
+        "lust build failed ({:?}): {}",
+        result.kind,
+        tail(&format!("{}{}", result.stderr, result.stdout))
+    )))
+}
+
+fn build_args(
+    tool: &LustTool,
+    source: &Path,
+    output: &Path,
+    max_memory: u64,
+    time_limit: Option<Duration>,
+    opt: bool,
+    json: bool,
+) -> Vec<String> {
+    let memory = max_memory.to_string();
+    let mut args = vec!["build".to_string(), "--sandbox".to_string()];
+    if json {
+        args.push("--json".to_string());
+    }
+    if opt {
+        args.push("--opt".to_string());
+    }
+    if tool.supports_max_memory {
+        args.push("--max-memory".to_string());
+        args.push(memory);
+    }
+    if tool.supports_time_limit {
+        if let Some(limit) = time_limit {
+            args.push("--time-limit".to_string());
+            args.push(format_time_limit(limit));
+        }
+    }
+    args.push("-o".to_string());
+    args.push(output.display().to_string());
+    args.push(source.display().to_string());
+    args
 }
 
 /// Whether a failed `lust build --opt` failed only because no optimising C
@@ -396,14 +596,22 @@ pub fn compile_rustc(
 }
 
 /// Edition 2024, then 2021 only when rustc rejects the edition itself.
-/// Returns the edition that worked.
+/// Returns the edition that worked, caching the toolchain's supported edition
+/// for subsequent calls in this process.
 pub fn compile_rustc_any_edition(
     source: &Path,
     output: &Path,
     timeout: Duration,
 ) -> std::result::Result<String, RustcError> {
+    if let Some(&cached) = RUSTC_EDITION.get() {
+        compile_rustc(source, output, cached, timeout)?;
+        return Ok(cached.to_string());
+    }
     match compile_rustc(source, output, "2024", timeout) {
-        Ok(()) => Ok("2024".to_string()),
+        Ok(()) => {
+            let _ = RUSTC_EDITION.set("2024");
+            Ok("2024".to_string())
+        }
         Err(problem) => {
             let edition_problem = match &problem {
                 RustcError::Rejected { message } => {
@@ -418,9 +626,13 @@ pub fn compile_rustc_any_edition(
                 _ => false,
             };
             if !edition_problem {
+                if matches!(problem, RustcError::Rejected { .. }) {
+                    let _ = RUSTC_EDITION.set("2024");
+                }
                 return Err(problem);
             }
             compile_rustc(source, output, "2021", timeout)?;
+            let _ = RUSTC_EDITION.set("2021");
             Ok("2021".to_string())
         }
     }
@@ -668,11 +880,47 @@ mod tests {
     fn tool(daemon: bool) -> LustTool {
         LustTool {
             bin: PathBuf::from("lust"),
-            version: "lust 0.3.0".into(),
+            version: "lust 0.3.2".into(),
+            build: Some("7976c47d".into()),
             supports_max_memory: true,
             supports_time_limit: true,
+            supports_build_json: true,
+            supports_fix_sandbox: true,
+            supports_sandbox_summary: true,
+            supports_opt: true,
             daemon,
+            opt_unavailable: Arc::new(AtomicBool::new(false)),
         }
+    }
+
+    #[test]
+    fn parses_lust_032_capabilities_interface_json() {
+        let json = r#"{
+            "interface": {
+                "version": "0.3.2",
+                "build": "7976c47d",
+                "commands": ["check", "build", "fix", "capabilities"],
+                "flags": {
+                    "build": ["--json", "--sandbox", "--max-memory", "--time-limit", "--opt"],
+                    "fix": ["--all", "--sandbox"],
+                    "capabilities": ["--json", "--summary", "--sandbox"]
+                }
+            }
+        }"#;
+        let parsed = tool_from_capabilities_json(Path::new("lust"), json).unwrap();
+        assert_eq!(parsed.version, "lust 0.3.2 (build 7976c47d)");
+        assert_eq!(parsed.build.as_deref(), Some("7976c47d"));
+        assert!(parsed.supports_max_memory);
+        assert!(parsed.supports_time_limit);
+        assert!(parsed.supports_build_json);
+        assert!(parsed.supports_fix_sandbox);
+        assert!(parsed.supports_sandbox_summary);
+        assert!(parsed.supports_opt);
+        assert!(!parsed.opt_known_unavailable());
+        parsed.mark_opt_unavailable();
+        assert!(parsed.opt_known_unavailable());
+        // Missing `interface` (older lust) returns None so probe falls back.
+        assert!(tool_from_capabilities_json(Path::new("lust"), r#"{"schema":1}"#).is_none());
     }
 
     #[test]
@@ -861,6 +1109,11 @@ fn main() {
         Ok(value) => value,
         Err(_) => "unset".to_string(),
     };
+    if args.len() == 3 && args[0] == "capabilities" && args[1] == "--sandbox" && args[2] == "--summary" {
+        println!("sandbox-summary-text");
+        println!("no_daemon={daemon}");
+        return;
+    }
     if args.len() == 2 && args[0] == "capabilities" && args[1] == "--summary" {
         println!("summary-text");
         println!("no_daemon={daemon}");
@@ -871,35 +1124,34 @@ fn main() {
 "#,
         );
         let failing = compile_probe(&dir, "failing", "fn main() { std::process::exit(1); }\n");
-        // `daemon: true` would omit LUST_NO_DAEMON for check and build.
-        // The summary call sets it itself.
-        let text = capabilities_summary(&LustTool {
-            bin: summary,
+        let make_tool = |bin: PathBuf, sandbox_summary: bool, daemon: bool| LustTool {
+            bin,
             version: "test".into(),
+            build: None,
             supports_max_memory: false,
             supports_time_limit: false,
-            daemon: true,
-        });
+            supports_build_json: false,
+            supports_fix_sandbox: false,
+            supports_sandbox_summary: sandbox_summary,
+            supports_opt: false,
+            daemon,
+            opt_unavailable: Arc::new(AtomicBool::new(false)),
+        };
+        // `daemon: true` would omit LUST_NO_DAEMON for check and build.
+        // The summary call sets it itself.
+        let text = capabilities_summary(&make_tool(summary.clone(), false, true));
         assert!(text.contains("summary-text"), "{text}");
         assert!(text.contains("no_daemon=1"), "{text}");
-        assert_eq!(
-            capabilities_summary(&LustTool {
-                bin: failing,
-                version: "test".into(),
-                supports_max_memory: false,
-                supports_time_limit: false,
-                daemon: false,
-            }),
-            ""
+        // When `--sandbox --summary` is advertised (lust 0.3.1+ / 0.3.2), prefer it.
+        let sandbox_text = capabilities_summary(&make_tool(summary, true, true));
+        assert!(
+            sandbox_text.contains("sandbox-summary-text"),
+            "{sandbox_text}"
         );
+        assert!(sandbox_text.contains("no_daemon=1"), "{sandbox_text}");
+        assert_eq!(capabilities_summary(&make_tool(failing, true, false)), "");
         assert_eq!(
-            capabilities_summary(&LustTool {
-                bin: dir.join("missing-lust"),
-                version: "test".into(),
-                supports_max_memory: false,
-                supports_time_limit: false,
-                daemon: false,
-            }),
+            capabilities_summary(&make_tool(dir.join("missing-lust"), false, false)),
             ""
         );
         let _ = fs::remove_dir_all(&dir);

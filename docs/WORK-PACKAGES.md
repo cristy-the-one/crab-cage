@@ -54,9 +54,9 @@ Phase 3:  L-03 … L-11, any order
 | WP-19 | docs done; the tank port is not planned | README and DESIGN.md |
 | WP-20 | done | crab-cage #23. Exercised with zig 0.14.1 on `PATH` (the version lust's CI uses): the optimised build is used, `note` is empty, and `ms.opt` is real. Also exercised: no compiler at all (the TinyCC build is timed, with a note), `LUST_CC=gcc` under mingw (fails to link; falls back, with the error in the note), and two stand-in lusts in the tests. See "What the zig run showed" under WP-20 |
 | L-01 | done for lust's own standard handles | lust-lang [#38](https://github.com/cristy-the-one/lust-lang/pull/38) |
-| L-02 | done for literal bounds; variable bounds open | lust-lang #37 |
+| L-02 | done (literal and variable bounds) | lust-lang #37, #44 |
 | L-03 | done | lust-lang #36 |
-| L-04, L-06, L-08 | done | lust-lang [#40](https://github.com/cristy-the-one/lust-lang/pull/40). Crab Cage still reads the usage text for its probe, not the `interface` object |
+| L-04, L-06, L-08 | done | lust-lang [#40](https://github.com/cristy-the-one/lust-lang/pull/40). Crab Cage reads the `interface` object from `capabilities --json`, sends `capabilities --sandbox --summary`, and fuses check+build via `build --json` |
 | L-05, L-09 | open | |
 | L-07 | measured; see the package | |
 | L-10 | done | lust-lang [#39](https://github.com/cristy-the-one/lust-lang/pull/39); it also closes the same leak for file descriptors on Unix |
@@ -65,6 +65,7 @@ Phase 3:  L-03 … L-11, any order
 | Coverage run: lust against rustc over 26 small tasks | ready, not yet run on the GPU machine | `crab-cage run --coverage`, `nuggets/coverage/`, `experiments/model-ladder/COVERAGE-RUN.md`. Five gaps in lust 0.3.1 were found while the tasks were written; they are listed in that file |
 | L-12 | done | lust-lang [#41](https://github.com/cristy-the-one/lust-lang/pull/41) |
 | lust 0.3.1 | released 2026-11-12 | [v0.3.1](https://github.com/cristy-the-one/lust-lang/releases/tag/v0.3.1): L-01 to L-04, L-06, L-08, L-10 and L-12 |
+| lust 0.3.2 | released 2026-11-21 | [v0.3.2](https://github.com/cristy-the-one/lust-lang/releases/tag/v0.3.2): float `clamp` with non-literal bounds (#44), parallel front-end discovery & warm `DirWatch` speedups (#46). Pinned in CI `real-lust` job |
 
 ## First run against a real model (2026-11-11)
 

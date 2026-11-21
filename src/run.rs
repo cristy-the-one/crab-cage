@@ -17,7 +17,9 @@ use crate::error::{err, Result};
 use crate::journal::Journal;
 use crate::lust;
 use crate::nugget::{self, Nugget, Objective};
-use crate::pipeline::{self, candidate_hash, EvalOptions, Gate, Status, Toolchain, Verdict};
+use crate::pipeline::{
+    self, candidate_hash, EvalOptions, FirstPass, Gate, Status, Toolchain, Verdict,
+};
 use crate::proposer::{Feedback, LiteralProposer, ModelProposer, Proposal, Proposer};
 
 /// Settled candidates kept for [`Feedback::recent`]. Older ones are dropped.
@@ -254,7 +256,6 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
             &options.out_dir,
             options.coverage && tools.lust.is_some(),
             &mut journal,
-            &journal_path,
             &mut best,
             &mut last,
             &mut recent,
@@ -338,7 +339,6 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
                 &options.out_dir,
                 options.coverage && tools.lust.is_some(),
                 &mut journal,
-                &journal_path,
                 &mut best,
                 &mut last,
                 &mut recent,
@@ -368,8 +368,8 @@ fn first_pass(
     tools: &Toolchain,
     work_dir: &Path,
     slot: usize,
-) -> Result<Verdict> {
-    pipeline::evaluate(
+) -> Result<FirstPass> {
+    pipeline::evaluate_first_pass(
         nugget,
         candidate,
         tools,
@@ -384,7 +384,7 @@ fn first_passes(
     batch: &[(String, String)],
     tools: &Toolchain,
     work_dir: &Path,
-) -> Vec<Result<Verdict>> {
+) -> Vec<Result<FirstPass>> {
     if batch.len() == 1 {
         return vec![first_pass(nugget, &batch[0].1, tools, work_dir, 0)];
     }
@@ -618,32 +618,33 @@ fn settle(
     candidate: &str,
     proposer: &str,
     seed: bool,
-    first: Result<Verdict>,
+    first: Result<FirstPass>,
     tools: &Toolchain,
     work_dir: &Path,
     out_dir: &Path,
     coverage: bool,
     journal: &mut Journal,
-    journal_path: &Path,
     best: &mut Option<Best>,
     last: &mut Option<(String, Verdict)>,
     recent: &mut Vec<(String, Verdict)>,
 ) -> Result<Outcome> {
-    let verdict = match first {
-        Ok(verdict) => verdict,
+    let pass = match first {
+        Ok(pass) => pass,
         Err(error) => return unevaluated(seed, error),
     };
-    // Oracle is the same `evaluate` call with the flag set. Journal the
-    // verdict from that call only, never a scored line plus a second line.
-    // In coverage mode every candidate that ran goes to the oracle.
-    let to_oracle = would_improve(&verdict, best) || (coverage && verdict.status == Status::Scored);
+    // Prove a new best (and in coverage mode every scored candidate) by
+    // running only the rustc oracle on the already-built fast binary and its
+    // captured case runs, rather than redoing check, build, fast runs, and
+    // `--opt` timing.
+    let to_oracle =
+        would_improve(&pass.verdict, best) || (coverage && pass.verdict.status == Status::Scored);
     let mut verdict = if to_oracle {
-        match pipeline::evaluate(nugget, candidate, tools, &eval_options(work_dir, true, 0)) {
+        match pipeline::prove_first_pass(nugget, pass, tools, &eval_options(work_dir, true, 0)) {
             Ok(verdict) => verdict,
             Err(error) => return unevaluated(seed, error),
         }
     } else {
-        verdict
+        pass.verdict
     };
     if coverage {
         let source = work_dir.join(format!("{}.rs", verdict.hash));
@@ -651,7 +652,7 @@ fn settle(
     }
 
     journal.append(&verdict, proposer)?;
-    let n = last_journal_n(journal_path)?;
+    let n = journal.last_n();
     crate::console::line(&format_candidate_line(n, &verdict, proposer));
     remember(nugget, candidate, &verdict, best, last, recent, out_dir)?;
     Ok(Outcome {
@@ -768,21 +769,6 @@ fn gate_name(gate: Gate) -> &'static str {
         Gate::Run => "run",
         Gate::Oracle => "oracle",
     }
-}
-
-fn last_journal_n(path: &Path) -> Result<u64> {
-    let text = fs::read_to_string(path)?;
-    let line = text
-        .lines()
-        .rev()
-        .find(|line| !line.trim().is_empty())
-        .ok_or_else(|| err(format!("{}: journal has no lines", path.display())))?;
-    let value: serde_json::Value = serde_json::from_str(line.trim_end_matches('\r'))
-        .map_err(|error| err(format!("{}: {error}", path.display())))?;
-    value
-        .get("n")
-        .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| err(format!("{}: journal line has no n", path.display())))
 }
 
 #[cfg(test)]

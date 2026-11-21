@@ -1220,3 +1220,149 @@ fn coverage_nuggets_have_a_reference_that_passes() {
         assert_eq!(solved.score, Some(0.0), "{name}: {solved:?}");
     }
 }
+
+/// Stand-in lust 0.3.2 binary that advertises `capabilities --json` with
+/// `build --json`, logs every invocation to `LUST_032_LOG`, and builds real
+/// executables via `rustc` (or emits a JSON L0110 diagnostic on `BAD_TYPE`).
+fn lust_032_standin() -> PathBuf {
+    static BIN: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    BIN.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("crab-cage-lust032-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let src = dir.join("lust_032_standin.rs");
+        fs::write(
+            &src,
+            r##"
+use std::env;
+use std::fs;
+use std::io::Write;
+use std::process::{self, Command};
+
+fn main() {
+    let args: Vec<String> = env::args().skip(1).collect();
+    if let Ok(log) = env::var("LUST_032_LOG") {
+        if let Ok(mut f) = fs::OpenOptions::new().create(true).append(true).open(log) {
+            let _ = writeln!(f, "{}", args.join(" "));
+        }
+    }
+    match args.first().map(String::as_str) {
+        Some("capabilities") if args.get(1).map(String::as_str) == Some("--json") => {
+            println!("{}", r#"{"interface":{"version":"0.3.2","build":"7976c47d","commands":["check","build","fix","capabilities"],"flags":{"build":["--json","--sandbox","--max-memory","--time-limit","--opt"],"fix":["--all","--sandbox"],"capabilities":["--json","--summary","--sandbox"]}}}"#);
+        }
+        Some("build") => {
+            if !args.iter().any(|a| a == "--json") {
+                eprintln!("expected fused build --json");
+                process::exit(3);
+            }
+            let out = args.iter().position(|a| a == "-o").and_then(|i| args.get(i + 1)).cloned().unwrap();
+            let file = args.iter().rev().find(|a| a.ends_with(".rs")).cloned().unwrap();
+            let text = fs::read_to_string(&file).unwrap_or_default();
+            if let Some(line_idx) = text.lines().position(|l| l.contains("BAD_TYPE")) {
+                let line = line_idx + 1;
+                println!(r#"{{"schema":1,"kind":"diagnostic","code":"L0110","severity":"error","message":"mismatched types","span":{{"line":{line},"col":5}},"fix":"fix the type","edits":[]}}"#);
+                process::exit(1);
+            }
+            let status = Command::new("rustc")
+                .args(["--edition", "2021", "-o", &out, &file])
+                .status()
+                .unwrap();
+            if !status.success() {
+                process::exit(1);
+            }
+        }
+        Some("check") => {
+            eprintln!("unexpected separate check call when build --json is advertised");
+            process::exit(9);
+        }
+        _ => process::exit(2),
+    }
+}
+"##,
+        )
+        .unwrap();
+        let exe = dir.join(if cfg!(windows) {
+            "lust_032_standin.exe"
+        } else {
+            "lust_032_standin"
+        });
+        let status = Command::new("rustc")
+            .args(["--edition", "2021", "-o"])
+            .arg(&exe)
+            .arg(&src)
+            .status()
+            .unwrap();
+        assert!(status.success(), "compile lust_032_standin");
+        exe
+    })
+    .clone()
+}
+
+#[test]
+fn lust_032_fused_build_json_skips_separate_check_and_maps_diagnostics() {
+    let nugget = nugget::load(&demo_dir()).unwrap();
+    let tool = lust::probe(&lust_032_standin(), Duration::from_secs(30)).unwrap();
+    assert_eq!(tool.version, "lust 0.3.2 (build 7976c47d)");
+    assert_eq!(tool.build.as_deref(), Some("7976c47d"));
+    assert!(tool.supports_build_json);
+    assert!(tool.supports_sandbox_summary);
+    assert!(tool.supports_fix_sandbox);
+    assert!(tool.supports_max_memory);
+    assert!(tool.supports_time_limit);
+    assert!(tool.supports_opt);
+
+    let tools = Toolchain { lust: Some(tool) };
+    // Passing candidate compiles in one fused `build --json` call.
+    let ok = evaluate(
+        &nugget,
+        "    xs.iter().map(|x| x * x).sum()\n",
+        &tools,
+        &options("fused-ok"),
+    )
+    .unwrap();
+    assert_eq!(ok.status, Status::Scored, "{ok:?}");
+    assert_eq!(ok.score, Some(0.0));
+    assert_eq!(ok.ms.check, 0);
+
+    // Check failure via fused `build --json` reports Gate::Check with relative line.
+    let bad = evaluate(
+        &nugget,
+        "    let x = 1;\n    BAD_TYPE\n",
+        &tools,
+        &options("fused-bad"),
+    )
+    .unwrap();
+    assert_eq!(bad.status, Status::Rejected, "{bad:?}");
+    assert_eq!(bad.gate, Gate::Check);
+    assert_eq!(bad.diagnostics.len(), 1);
+    assert_eq!(bad.diagnostics[0].code, "L0110");
+    assert_eq!(bad.diagnostics[0].line, 2);
+}
+
+#[test]
+fn fastest_caches_missing_c_compiler_across_evaluations() {
+    let nugget = nugget::load(&fast_sum_dir()).unwrap();
+    let tool = lust::probe(&no_cc_lust(), Duration::from_secs(30)).unwrap();
+    assert!(!tool.opt_known_unavailable());
+    let tools = Toolchain { lust: Some(tool) };
+
+    let first = evaluate(
+        &nugget,
+        &fast_sum_reference(),
+        &tools,
+        &options("fast-cache-1"),
+    )
+    .unwrap();
+    assert_eq!(first.status, Status::Scored);
+    assert_eq!(first.note, crab_cage::pipeline::OPT_UNAVAILABLE);
+    assert!(tools.lust.as_ref().unwrap().opt_known_unavailable());
+
+    let second = evaluate(
+        &nugget,
+        &fast_sum_reference(),
+        &tools,
+        &options("fast-cache-2"),
+    )
+    .unwrap();
+    assert_eq!(second.status, Status::Scored);
+    assert_eq!(second.note, crab_cage::pipeline::OPT_UNAVAILABLE);
+}

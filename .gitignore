@@ -3,4 +3,6 @@
 /agent-tools
 **/*.rs.bk
 .lust-cache
+.lust-daemon-*.sock
+.lust-daemon-*.sock.lock
 *.crabmode
