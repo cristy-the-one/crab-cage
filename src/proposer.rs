@@ -700,6 +700,10 @@ struct Tried {
     hash: String,
     text: String,
     outcome: String,
+    /// Trimmed source line cited by the first diagnostic when this region was
+    /// rejected at check/build. Used to collapse repeated attempts that fail
+    /// on the exact same broken line instead of repeating it in the prompt.
+    rejected_line: Option<String>,
 }
 
 struct Pending {
@@ -765,7 +769,8 @@ impl ModelMemory {
             self.own = Some(verdict.clone());
             self.own_text = Some(region.clone());
             self.repaired = None;
-            self.remember_tried(hash, region, outcome_of(verdict));
+            let bad_line = rejected_source_line(&region, verdict);
+            self.remember_tried(hash, region, outcome_of(verdict), bad_line);
         }
         self.adopt_repair(feedback);
         // Still pending after its batch settled: never evaluated.
@@ -773,7 +778,7 @@ impl ModelMemory {
             self.pending.drain(..).partition(|item| item.waited);
         self.pending = live;
         for item in stale {
-            self.remember_tried(item.hash, item.text, NOT_EVALUATED.to_string());
+            self.remember_tried(item.hash, item.text, NOT_EVALUATED.to_string(), None);
         }
     }
 
@@ -830,6 +835,7 @@ impl ModelMemory {
             .find(|item| item.hash == original_hash)
         {
             item.outcome = format!("did not compile; with rustc's fix: {}", outcome_of(verdict));
+            item.rejected_line = None;
         }
         self.rejected_in_a_row = 0;
         self.same_code = 0;
@@ -839,11 +845,18 @@ impl ModelMemory {
         self.repaired = Some(changed);
     }
 
-    fn remember_tried(&mut self, hash: String, text: String, outcome: String) {
+    fn remember_tried(
+        &mut self,
+        hash: String,
+        text: String,
+        outcome: String,
+        rejected_line: Option<String>,
+    ) {
         self.tried.push(Tried {
             hash,
             text,
             outcome,
+            rejected_line,
         });
         if self.tried.len() > TRIED_LIMIT {
             self.tried.remove(0);
@@ -1084,6 +1097,8 @@ fn user_prompt(
         None => {
             if let Some(verdict) = own.filter(|verdict| fails_cases(verdict)) {
                 append_scored(&mut out, verdict, best_score);
+            } else if nugget.objective != Objective::PassAll {
+                append_objective_score(&mut out, nugget.objective, base_verdict, own, best_score);
             }
         }
     }
@@ -1121,6 +1136,60 @@ fn objective_sentence(objective: Objective) -> &'static str {
 /// Ran and failed at least one case.
 fn fails_cases(verdict: &Verdict) -> bool {
     matches!(verdict.status, Status::Scored | Status::Proven) && verdict.passed < verdict.total
+}
+
+/// Report numeric scores for `minimize` and `fastest` nuggets when all cases
+/// passed (so [`fails_cases`] is false). Without this, the model is never
+/// told the current best score or how its own last attempt compared.
+fn append_objective_score(
+    out: &mut String,
+    objective: Objective,
+    base_verdict: Option<&Verdict>,
+    own: Option<&Verdict>,
+    best_score: Option<f64>,
+) {
+    let current_score = base_verdict
+        .filter(|verdict| matches!(verdict.status, Status::Scored | Status::Proven))
+        .and_then(|verdict| verdict.score)
+        .filter(|score| score.is_finite())
+        .or(best_score.filter(|score| score.is_finite()));
+    let current_hash = base_verdict.map(|verdict| verdict.hash.as_str());
+
+    if let Some(own) = own.filter(|verdict| {
+        matches!(verdict.status, Status::Scored | Status::Proven)
+            && verdict.passed == verdict.total
+            && current_hash != Some(verdict.hash.as_str())
+    }) {
+        if let Some(score) = own.score.filter(|score| score.is_finite()) {
+            match objective {
+                Objective::Minimize => {
+                    out.push_str(&format!("Your last region ran and scored {score}.\n"));
+                }
+                Objective::Fastest => {
+                    out.push_str(&format!(
+                        "Your last region passed all cases in {score:.2} ms.\n"
+                    ));
+                }
+                Objective::PassAll => {}
+            }
+        }
+    }
+
+    if let Some(score) = current_score {
+        match objective {
+            Objective::Minimize => {
+                out.push_str(&format!(
+                    "The current lines ran and scored {score}. Lower is better.\n"
+                ));
+            }
+            Objective::Fastest => {
+                out.push_str(&format!(
+                    "The current lines passed all cases in {score:.2} ms. Lower is better.\n"
+                ));
+            }
+            Objective::PassAll => {}
+        }
+    }
 }
 
 /// The failed count and the failing case of the region shown as current,
@@ -1215,19 +1284,66 @@ fn append_labeled(out: &mut String, label: &str, text: &str) {
     }
 }
 
+/// Trimmed source line inside `region` cited by the first diagnostic of a
+/// rejected verdict, or `None` when the verdict is not a rejection or has no
+/// in-region diagnostic line.
+fn rejected_source_line(region: &str, verdict: &Verdict) -> Option<String> {
+    if verdict.status != Status::Rejected {
+        return None;
+    }
+    let line_num = verdict.diagnostics.first()?.line;
+    if line_num == 0 {
+        return None;
+    }
+    let line = region.lines().nth(line_num as usize - 1)?.trim();
+    if line.is_empty() {
+        None
+    } else {
+        Some(line.to_string())
+    }
+}
+
 /// Each tried or pending region, then its outcome. `base` is the region the
 /// prompt shows as current. A region of at most [`WHOLE_REGION_LINES`] lines
 /// is quoted whole; a longer one only by its lines that are not in `base`,
 /// at most [`DIFF_LINES`] of them and [`TEXT_CLIP`] characters. Long regions
 /// often differ in one line, and quoted whole and cut they all look alike.
+///
+/// Multiple rejected attempts that failed on the exact same trimmed source
+/// line with the same rejection outcome are collapsed to the latest one with
+/// an attempt count, so the same broken line is not repeated across the prompt
+/// and working against compiler hints.
 fn append_tried(out: &mut String, tried: &[Tried], pending: &[Pending], base: &str) {
     if tried.is_empty() && pending.is_empty() {
         return;
     }
     out.push('\n');
     out.push_str("Already tried, do not repeat:\n");
+    let mut entries: Vec<(&str, &str, Option<&str>, usize)> = Vec::with_capacity(tried.len());
     for item in tried {
-        append_region_line(out, &item.text, base, &item.outcome);
+        if let Some(bad_line) = item.rejected_line.as_deref() {
+            if let Some(existing) = entries.iter_mut().find(|(_, outcome, prev_line, _)| {
+                *outcome == item.outcome.as_str() && *prev_line == Some(bad_line)
+            }) {
+                existing.0 = item.text.as_str();
+                existing.3 += 1;
+                continue;
+            }
+        }
+        entries.push((
+            item.text.as_str(),
+            item.outcome.as_str(),
+            item.rejected_line.as_deref(),
+            1,
+        ));
+    }
+    for (text, outcome, _, count) in entries {
+        if count > 1 {
+            let summary = format!("{outcome} ({count} attempts)");
+            append_region_line(out, text, base, &summary);
+        } else {
+            append_region_line(out, text, base, outcome);
+        }
     }
     for item in pending {
         append_region_line(out, &item.text, base, "proposed, awaiting result");
@@ -1352,19 +1468,13 @@ pub fn rustc_second_opinion(dir: PathBuf) -> SecondOpinion {
         fs::create_dir_all(&dir).ok()?;
         let source = dir.join("second-opinion.rs");
         fs::write(&source, program).ok()?;
-        let mut command = std::process::Command::new(rustc);
-        command
-            .args(["--edition", "2021", "--color", "never"])
-            .arg("--emit=metadata")
-            .arg("-o")
-            .arg(dir.join("second-opinion.rmeta"))
-            .arg(&source);
-        let limits = crate::supervisor::Limits {
-            wall: SECOND_OPINION_TIMEOUT,
-            memory_bytes: None,
-            scrub_env: false,
-        };
-        let ran = crate::supervisor::run_capture(command, &limits, b"").ok()?;
+        let ran = crate::repair::run_rustc_metadata(
+            &rustc,
+            &["--color", "never"],
+            &dir.join("second-opinion.rmeta"),
+            &source,
+            SECOND_OPINION_TIMEOUT,
+        )?;
         match ran.kind {
             crate::supervisor::StopKind::Exited(0) => Some(
                 "rustc accepts these lines, so they use something lust does not support. Write them another way, with simpler Rust.\n"
@@ -3142,5 +3252,133 @@ help: consider dereferencing here
         );
         assert_eq!(proposer.memory.same_code, 0);
         assert_eq!(proposer.memory.rejected_in_a_row, 0);
+    }
+
+    #[test]
+    fn minimize_and_fastest_prompts_show_current_and_last_scores() {
+        // Minimize: all cases pass (passed == total), so fails_cases is false,
+        // yet the model must see both the current best score and its last score.
+        let min_nugget = region_nugget(Objective::Minimize);
+        let mut seed_verdict = scored(3, 3, 1530.0, None);
+        seed_verdict.hash = candidate_hash(&min_nugget.seed);
+        seed_verdict.status = Status::Proven;
+        let mut proposer =
+            MockModelProposer::new(vec!["cand1".into(), "cand2".into()], String::new());
+        let recent = [(min_nugget.seed.as_str(), &seed_verdict)];
+        let feedback = Feedback {
+            best: Some((min_nugget.seed.as_str(), 1530.0)),
+            last: Some((min_nugget.seed.as_str(), &seed_verdict)),
+            recent: &recent,
+            best_verdict: Some(&seed_verdict),
+        };
+        let first = proposer
+            .next(&min_nugget, &feedback)
+            .unwrap()
+            .into_text()
+            .unwrap();
+        assert!(
+            proposer.prompts[0]
+                .user
+                .contains("The current lines ran and scored 1530. Lower is better."),
+            "{}",
+            proposer.prompts[0].user
+        );
+
+        let mut worse = scored(3, 3, 1600.0, None);
+        worse.hash = candidate_hash(&first);
+        let recent2 = [
+            (min_nugget.seed.as_str(), &seed_verdict),
+            (first.as_str(), &worse),
+        ];
+        let feedback2 = Feedback {
+            best: Some((min_nugget.seed.as_str(), 1530.0)),
+            last: Some((first.as_str(), &worse)),
+            recent: &recent2,
+            best_verdict: Some(&seed_verdict),
+        };
+        proposer.next(&min_nugget, &feedback2).unwrap();
+        let prompt = &proposer.prompts[1].user;
+        assert!(
+            prompt.contains("Your last region ran and scored 1600."),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("The current lines ran and scored 1530. Lower is better."),
+            "{prompt}"
+        );
+
+        // Fastest: passing candidates show elapsed milliseconds.
+        let fast_nugget = region_nugget(Objective::Fastest);
+        let mut fast_seed = scored(3, 3, 856.25, None);
+        fast_seed.hash = candidate_hash(&fast_nugget.seed);
+        fast_seed.status = Status::Proven;
+        let mut fast_proposer = MockModelProposer::new(vec!["fast1".into()], String::new());
+        let fast_recent = [(fast_nugget.seed.as_str(), &fast_seed)];
+        let fast_fb = Feedback {
+            best: Some((fast_nugget.seed.as_str(), 856.25)),
+            last: Some((fast_nugget.seed.as_str(), &fast_seed)),
+            recent: &fast_recent,
+            best_verdict: Some(&fast_seed),
+        };
+        fast_proposer.next(&fast_nugget, &fast_fb).unwrap();
+        assert!(
+            fast_proposer.prompts[0]
+                .user
+                .contains("The current lines passed all cases in 856.25 ms. Lower is better."),
+            "{}",
+            fast_proposer.prompts[0].user
+        );
+    }
+
+    #[test]
+    fn repeated_identical_rejections_collapse_in_already_tried() {
+        let base = "    path.to_string()\n";
+        let outcome = "rejected at check: L0113 cannot apply `!=` to `&&str` and `&str`";
+        let bad = Some("let a = c != \".\";".to_string());
+        let tried = vec![
+            Tried {
+                hash: "1".into(),
+                text: "let a = c != \".\";\nlet b = 1;\nlet d = 2;\nlet e = 3;\n".into(),
+                outcome: outcome.into(),
+                rejected_line: bad.clone(),
+            },
+            Tried {
+                hash: "2".into(),
+                text: "    let a = c != \".\";\nlet b = 1;\nlet d = 2;\nlet e = 4;\n".into(),
+                outcome: outcome.into(),
+                rejected_line: bad.clone(),
+            },
+            Tried {
+                hash: "3".into(),
+                text: "let a = c != \".\";\nlet b = 1;\nlet d = 2;\nlet e = 5;\n".into(),
+                outcome: outcome.into(),
+                rejected_line: bad,
+            },
+            Tried {
+                hash: "4".into(),
+                text: "let other = 1;\n".into(),
+                outcome: "rejected at check: L0110 mismatched types".into(),
+                rejected_line: Some("let other = 1;".into()),
+            },
+        ];
+        let mut out = String::new();
+        append_tried(&mut out, &tried, &[], base);
+        // The broken line is quoted once instead of three times, with attempt count.
+        assert_eq!(out.matches("c != \".\"").count(), 1, "{out}");
+        assert!(out.contains("let e = 5;"), "expected latest diff:\n{out}");
+        assert!(
+            out.contains(&format!("{outcome} (3 attempts)")),
+            "expected attempt count:\n{out}"
+        );
+        // A different rejection outcome stays separate.
+        assert!(out.contains("L0110 mismatched types"), "{out}");
+        assert!(!out.contains("L0110 mismatched types ("), "{out}");
+
+        // End-to-end check through rejected_source_line: 1-based line extracts trimmed text.
+        let v = rejected("L0113", 2, "cannot apply");
+        assert_eq!(
+            rejected_source_line("let x = 1;\n    let y = c != \".\";\n", &v).as_deref(),
+            Some("let y = c != \".\";")
+        );
     }
 }
