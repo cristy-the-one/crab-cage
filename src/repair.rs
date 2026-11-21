@@ -11,7 +11,8 @@
 use std::collections::HashSet;
 use std::fs;
 use std::ops::Range;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::Duration;
 
 use crate::error::Result;
@@ -184,6 +185,56 @@ fn fix_of(holder: &serde_json::Value, program: &str, region: &Range<usize>) -> O
     }
 }
 
+/// Run `rustc --emit=metadata` with edition 2024 (matching lust 0.3.2 and
+/// the oracle), falling back to 2021 once if this rustc predates 2024.
+pub(crate) fn run_rustc_metadata(
+    rustc: &Path,
+    extra_args: &[&str],
+    rmeta: &Path,
+    source: &Path,
+    timeout: Duration,
+) -> Option<crate::supervisor::ExecResult> {
+    static EDITION: OnceLock<&'static str> = OnceLock::new();
+    let invoke = |edition: &str| {
+        let mut command = std::process::Command::new(rustc);
+        command
+            .args(["--edition", edition])
+            .args(extra_args)
+            .arg("--emit=metadata")
+            .arg("-o")
+            .arg(rmeta)
+            .arg(source);
+        let limits = crate::supervisor::Limits {
+            wall: timeout,
+            memory_bytes: None,
+            scrub_env: false,
+        };
+        crate::supervisor::run_capture(command, &limits, b"").ok()
+    };
+    if let Some(&cached) = EDITION.get() {
+        return invoke(cached);
+    }
+    let first = invoke("2024")?;
+    if !matches!(first.kind, crate::supervisor::StopKind::Exited(0)) {
+        let lower = first.stderr.to_lowercase();
+        let edition_problem = lower.contains("edition")
+            && (lower.contains("unknown")
+                || lower.contains("invalid")
+                || lower.contains("must be one of")
+                || lower.contains("requires edition")
+                || lower.contains("latest edition supported"));
+        if edition_problem {
+            let fallback = invoke("2021")?;
+            let _ = EDITION.set("2021");
+            return Some(fallback);
+        }
+    }
+    if matches!(first.kind, crate::supervisor::StopKind::Exited(_)) {
+        let _ = EDITION.set("2024");
+    }
+    Some(first)
+}
+
 /// A [`Diagnose`] that checks the program with rustc, in `dir`.
 ///
 /// rustc only checks it (`--emit=metadata`). The program is written byte
@@ -194,19 +245,13 @@ pub fn rustc_diagnose(dir: PathBuf) -> Diagnose {
         fs::create_dir_all(&dir).ok()?;
         let source = dir.join("repair.rs");
         fs::write(&source, program).ok()?;
-        let mut command = std::process::Command::new(rustc);
-        command
-            .args(["--edition", "2021", "--error-format=json"])
-            .arg("--emit=metadata")
-            .arg("-o")
-            .arg(dir.join("repair.rmeta"))
-            .arg(&source);
-        let limits = crate::supervisor::Limits {
-            wall: RUSTC_TIMEOUT,
-            memory_bytes: None,
-            scrub_env: false,
-        };
-        let ran = crate::supervisor::run_capture(command, &limits, b"").ok()?;
+        let ran = run_rustc_metadata(
+            &rustc,
+            &["--error-format=json"],
+            &dir.join("repair.rmeta"),
+            &source,
+            RUSTC_TIMEOUT,
+        )?;
         match ran.kind {
             crate::supervisor::StopKind::Exited(0) => None,
             crate::supervisor::StopKind::Exited(_) => Some(ran.stderr),
