@@ -13,14 +13,16 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::breed::BreedProposer;
 use crate::error::{err, Result};
 use crate::journal::Journal;
 use crate::lust;
-use crate::nugget::{self, Nugget, Objective};
+use crate::nugget::{self, GoalSpec, Nugget, Objective};
 use crate::pipeline::{
     self, candidate_hash, EvalOptions, FirstPass, Gate, Status, Toolchain, Verdict,
 };
 use crate::proposer::{Feedback, LiteralProposer, ModelProposer, Proposal, Proposer};
+use crate::species::{SpeciesArchive, SpeciesHandle};
 
 /// Settled candidates kept for [`Feedback::recent`]. Older ones are dropped.
 const RECENT_LIMIT: usize = 32;
@@ -60,9 +62,54 @@ pub struct RunOptions {
 
 /// Whether this run's journal meets the objective's exit rule.
 ///
-/// `pass_all` needs a proven score of 0. `minimize` needs any proven candidate.
+/// `pass_all` needs a proven score of 0 (or `<= goal + tolerance`).
+/// `minimize` and `fastest` need `<= goal + tolerance` when a goal is set,
+/// and any proven candidate otherwise.
 pub struct RunOutput {
     pub solved: bool,
+}
+
+/// Evolutionary search controls layered onto [`RunOptions`] without altering
+/// its struct layout.
+#[derive(Clone, Debug)]
+pub struct EvolutionOptions {
+    /// Maximum proven species champions kept in the archive (`1` = single best).
+    pub species: usize,
+    /// Explicit experiment target (`--goal`), overriding `nugget.json`.
+    pub goal: Option<f64>,
+    /// Additive "close enough" margin (`--tolerance`): proven `score <= goal + tolerance`
+    /// stops the run and exits 0.
+    pub tolerance: Option<f64>,
+    /// Stop early after this many evaluated candidates without improving the
+    /// global best or updating the species archive.
+    pub patience: Option<usize>,
+    /// Optional pre-created species archive shared with [`BreedProposer`] and
+    /// [`ModelProposer`].
+    pub archive: Option<SpeciesHandle>,
+    /// Fast candidates [`BreedProposer`] may emit per round-robin turn (default `1`).
+    pub breed_burst: usize,
+}
+
+impl Default for EvolutionOptions {
+    fn default() -> Self {
+        Self {
+            species: 1,
+            goal: None,
+            tolerance: None,
+            patience: None,
+            archive: None,
+            breed_burst: 1,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ResolvedTarget {
+    /// Stop early and exit 0 when a proven score satisfies `spec.reached(score)`.
+    stop_spec: Option<GoalSpec>,
+    /// True when the user or `nugget.json` explicitly configured a goal/tolerance,
+    /// so reaching it prints a `goal reached:` line and governs exit status.
+    explicit: bool,
 }
 
 struct Best {
@@ -85,6 +132,7 @@ impl Drop for DaemonGuard {
 
 struct Outcome {
     recorded: bool,
+    progressed: bool,
     stop: bool,
 }
 
@@ -104,6 +152,28 @@ pub fn attach_tweak<'a>(
         return;
     }
     *slot = Some(LiteralProposer::new(seed.unwrap_or(TWEAK_SEED)));
+    if let Some(proposer) = slot.as_mut() {
+        proposers.push(proposer);
+    }
+}
+
+/// Append [`BreedProposer`] when `--breed` (`--mutate`) is enabled, sharing
+/// `species` so it selects across proven species and runs within-species DE.
+pub fn attach_breed<'a>(
+    enabled: bool,
+    seed: Option<u64>,
+    species: Option<&SpeciesHandle>,
+    slot: &'a mut Option<BreedProposer>,
+    proposers: &mut Vec<&'a mut dyn Proposer>,
+) {
+    if !enabled {
+        return;
+    }
+    let mut proposer = BreedProposer::new(seed.unwrap_or(TWEAK_SEED));
+    if let Some(handle) = species {
+        proposer = proposer.with_species(SpeciesHandle::clone(handle));
+    }
+    *slot = Some(proposer);
     if let Some(proposer) = slot.as_mut() {
         proposers.push(proposer);
     }
@@ -164,6 +234,7 @@ pub fn attach_repair_with_lust<'a>(
 /// that cannot be probed is an error. `seed` is `--seed`: with it, each
 /// request to the model carries a seed. Each request and its reply is
 /// written into `prompt_dir`, one file each, when there is one.
+#[allow(clippy::too_many_arguments)]
 pub fn attach_model<'a>(
     backend: Option<&str>,
     endpoint: Option<&str>,
@@ -172,6 +243,26 @@ pub fn attach_model<'a>(
     seed: Option<u64>,
     prompt_dir: Option<&Path>,
     repairs: Option<&crate::repair::RepairLog>,
+    slot: &'a mut Option<ModelProposer>,
+    proposers: &mut Vec<&'a mut dyn Proposer>,
+) -> Result<()> {
+    attach_model_with_species(
+        backend, endpoint, model, lust_bin, seed, prompt_dir, repairs, None, slot, proposers,
+    )
+}
+
+/// Like [`attach_model`], also wiring the shared [`SpeciesArchive`] so the
+/// local model guides evolution across proven species with per-case telemetry.
+#[allow(clippy::too_many_arguments)]
+pub fn attach_model_with_species<'a>(
+    backend: Option<&str>,
+    endpoint: Option<&str>,
+    model: Option<&str>,
+    lust_bin: Option<&Path>,
+    seed: Option<u64>,
+    prompt_dir: Option<&Path>,
+    repairs: Option<&crate::repair::RepairLog>,
+    species: Option<&SpeciesHandle>,
     slot: &'a mut Option<ModelProposer>,
     proposers: &mut Vec<&'a mut dyn Proposer>,
 ) -> Result<()> {
@@ -200,7 +291,8 @@ pub fn attach_model<'a>(
             .with_second_opinion(crate::proposer::rustc_second_opinion(opinion_dir))
             .with_seed(seed)
             .with_prompt_log(prompt_dir.map(Path::to_path_buf))
-            .with_repairs(repairs.cloned()),
+            .with_repairs(repairs.cloned())
+            .with_species(species.cloned()),
     );
     if let Some(proposer) = slot.as_mut() {
         proposers.push(proposer);
@@ -234,7 +326,18 @@ fn capability_text(lust_bin: Option<&Path>) -> Result<String> {
 /// [`RunOutput::solved`] is true for `pass_all` only when a proven score is 0,
 /// and for `minimize` when any candidate is proven.
 pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Result<RunOutput> {
+    execute_evolved(options, &EvolutionOptions::default(), proposers)
+}
+
+/// Like [`execute`], with multi-species oracle promotion, experiment goal /
+/// tolerance stopping, patience limits, and breeder burst scheduling.
+pub fn execute_evolved(
+    options: &RunOptions,
+    evo: &EvolutionOptions,
+    proposers: &mut [&mut dyn Proposer],
+) -> Result<RunOutput> {
     let nugget = nugget::load(&options.nugget_dir)?;
+    let target = resolve_target(&options.nugget_dir, nugget.objective, evo)?;
     let lust = match &options.lust_bin {
         Some(path) => Some(lust::probe(path, PROBE_TIMEOUT)?),
         None => None,
@@ -256,12 +359,47 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
     let mut journal = Journal::open(&journal_path)?;
 
     let mut best = restored_best(&options.out_dir, &journal_path)?;
+    let max_species = evo.species.max(1);
+    let restored_pair = best
+        .as_ref()
+        .and_then(|b| b.text.as_deref().map(|t| (t, b.score)));
+    let loaded_archive =
+        SpeciesArchive::load_or_init(&options.out_dir, max_species, restored_pair)?;
+    let archive: SpeciesHandle = match &evo.archive {
+        Some(existing) => {
+            *existing.borrow_mut() = loaded_archive;
+            SpeciesHandle::clone(existing)
+        }
+        None => std::rc::Rc::new(std::cell::RefCell::new(loaded_archive)),
+    };
+
+    // If a resumed run already satisfies an explicit goal, finish immediately.
+    if options.budget > 0 {
+        if let (Some(spec), Some(current_best)) = (target.stop_spec, best.as_ref()) {
+            if spec.reached(current_best.score) {
+                if target.explicit {
+                    print_goal_reached(current_best.score, spec);
+                }
+                return finish_evolved(
+                    &journal_path,
+                    nugget.objective,
+                    options.coverage,
+                    target,
+                    &archive,
+                );
+            }
+        }
+    }
+
     let mut last: Option<(String, Verdict)> = None;
     let mut recent: Vec<(String, Verdict)> = Vec::new();
     let mut evaluated = 0usize;
     let mut unjournaled = 0usize;
+    let mut since_progress = 0usize;
     let mut cursor = 0usize;
+    let mut burst_left = 0usize;
     let mut exhausted = vec![false; proposers.len()];
+    let breed_burst = evo.breed_burst.max(1);
 
     if options.budget > 0 && !journal.seen(&candidate_hash(&nugget.seed)) {
         let first = first_pass(&nugget, &nugget.seed, &tools, &work_dir, 0);
@@ -275,6 +413,8 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
             &work_dir,
             &options.out_dir,
             options.coverage && tools.lust.is_some(),
+            target,
+            &archive,
             &mut journal,
             &mut best,
             &mut last,
@@ -284,7 +424,13 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
             evaluated += 1;
         }
         if outcome.stop {
-            return finish(&journal_path, nugget.objective, options.coverage);
+            return finish_evolved(
+                &journal_path,
+                nugget.objective,
+                options.coverage,
+                target,
+                &archive,
+            );
         }
     }
 
@@ -305,9 +451,11 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
                     .map(|(text, verdict)| (text.as_str(), verdict))
                     .collect();
                 let feedback = feedback_of(&best, &last, &view);
-                next_candidate(
+                next_candidate_burst(
                     proposers,
                     &mut cursor,
+                    &mut burst_left,
+                    breed_burst,
                     &mut exhausted,
                     &mut waiting,
                     &nugget,
@@ -358,6 +506,8 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
                 &work_dir,
                 &options.out_dir,
                 options.coverage && tools.lust.is_some(),
+                target,
+                &archive,
                 &mut journal,
                 &mut best,
                 &mut last,
@@ -366,6 +516,19 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
             if outcome.recorded {
                 evaluated += 1;
                 unjournaled = 0;
+                if outcome.progressed {
+                    since_progress = 0;
+                } else {
+                    since_progress += 1;
+                    if let Some(limit) = evo.patience {
+                        if limit > 0 && since_progress >= limit {
+                            crate::console::line(&format!(
+                                "stopped: {limit} candidates without improvement"
+                            ));
+                            done = true;
+                        }
+                    }
+                }
             } else if note_unjournaled(&mut unjournaled) {
                 done = true;
             }
@@ -375,10 +538,19 @@ pub fn execute(options: &RunOptions, proposers: &mut [&mut dyn Proposer]) -> Res
                 done = true;
                 break;
             }
+            if done {
+                break;
+            }
         }
     }
 
-    finish(&journal_path, nugget.objective, options.coverage)
+    finish_evolved(
+        &journal_path,
+        nugget.objective,
+        options.coverage,
+        target,
+        &archive,
+    )
 }
 
 /// One candidate through the funnel without the oracle, on `slot`.
@@ -441,16 +613,106 @@ fn unjournaled_stop_line() -> String {
     format!("stopped: {UNJOURNALED_LIMIT} proposals in a row left no journal line")
 }
 
-fn finish(journal_path: &Path, objective: Objective, coverage: bool) -> Result<RunOutput> {
+fn resolve_target(
+    nugget_dir: &Path,
+    objective: Objective,
+    evo: &EvolutionOptions,
+) -> Result<ResolvedTarget> {
+    if let Some(tol) = evo.tolerance {
+        if !tol.is_finite() || tol < 0.0 {
+            return Err(err("--tolerance must be a non-negative finite number"));
+        }
+    }
+    if let Some(goal) = evo.goal {
+        if !goal.is_finite() {
+            return Err(err("--goal must be a finite number"));
+        }
+        return Ok(ResolvedTarget {
+            stop_spec: Some(GoalSpec {
+                goal,
+                tolerance: evo.tolerance.unwrap_or(0.0),
+            }),
+            explicit: true,
+        });
+    }
+    if let Some(mut spec) = nugget::load_goal(nugget_dir)? {
+        if let Some(tol) = evo.tolerance {
+            spec.tolerance = tol;
+        }
+        return Ok(ResolvedTarget {
+            stop_spec: Some(spec),
+            explicit: true,
+        });
+    }
+    match objective {
+        Objective::PassAll => {
+            let tol = evo.tolerance.unwrap_or(0.0);
+            Ok(ResolvedTarget {
+                stop_spec: Some(GoalSpec {
+                    goal: 0.0,
+                    tolerance: tol,
+                }),
+                explicit: evo.tolerance.is_some() && tol > 0.0,
+            })
+        }
+        Objective::Minimize | Objective::Fastest => {
+            if evo.tolerance.is_some() {
+                return Err(err(
+                    "--tolerance on minimize or fastest needs --goal (or `goal` in nugget.json)",
+                ));
+            }
+            Ok(ResolvedTarget {
+                stop_spec: None,
+                explicit: false,
+            })
+        }
+    }
+}
+
+fn print_goal_reached(score: f64, spec: GoalSpec) {
+    if spec.tolerance > 0.0 {
+        crate::console::line(&format!(
+            "goal reached: proven score {score} <= {} (goal {} + tolerance {})",
+            spec.threshold(),
+            spec.goal,
+            spec.tolerance
+        ));
+    } else {
+        crate::console::line(&format!(
+            "goal reached: proven score {score} <= {}",
+            spec.goal
+        ));
+    }
+}
+
+fn finish_evolved(
+    journal_path: &Path,
+    objective: Objective,
+    coverage: bool,
+    target: ResolvedTarget,
+    archive: &SpeciesHandle,
+) -> Result<RunOutput> {
     let summary = Journal::summary(journal_path)?;
     crate::console::print(&summary);
+    {
+        let arch = archive.borrow();
+        if arch.max_species() > 1 {
+            crate::console::line(&format!(
+                "species proven={} observed={}",
+                arch.len(),
+                arch.observed_species_count()
+            ));
+        }
+    }
     if coverage {
         crate::console::line(&format!("lust-only {}", count_lust_only(journal_path)?));
     }
     let proven = scan_proven(journal_path)?;
-    Ok(RunOutput {
-        solved: exit_solved(objective, &proven),
-    })
+    let solved = match target.stop_spec {
+        Some(spec) => proven.lowest_score.is_some_and(|score| spec.reached(score)),
+        None => exit_solved(objective, &proven),
+    };
+    Ok(RunOutput { solved })
 }
 
 /// Journal lines whose note says lust refused what rustc accepts.
@@ -602,6 +864,7 @@ fn push_recent(recent: &mut Vec<(String, Verdict)>, candidate: &str, verdict: &V
 /// The next candidate in round-robin order, skipping proposers that are
 /// `exhausted` (finished for the run) or `waiting` (said
 /// [`Proposal::Later`] in this batch). None when no proposer has one now.
+#[cfg(test)]
 fn next_candidate(
     proposers: &mut [&mut dyn Proposer],
     cursor: &mut usize,
@@ -610,28 +873,79 @@ fn next_candidate(
     nugget: &Nugget,
     feedback: &Feedback,
 ) -> Result<Option<(String, String)>> {
+    let mut burst_left = 0usize;
+    next_candidate_burst(
+        proposers,
+        cursor,
+        &mut burst_left,
+        1,
+        exhausted,
+        waiting,
+        nugget,
+        feedback,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn next_candidate_burst(
+    proposers: &mut [&mut dyn Proposer],
+    cursor: &mut usize,
+    burst_left: &mut usize,
+    breed_burst: usize,
+    exhausted: &mut [bool],
+    waiting: &mut [bool],
+    nugget: &Nugget,
+    feedback: &Feedback,
+) -> Result<Option<(String, String)>> {
     let len = proposers.len();
+    if len == 0 {
+        return Ok(None);
+    }
     for _ in 0..len {
         if *cursor >= len {
             *cursor = 0;
         }
         let index = *cursor;
-        *cursor += 1;
         if exhausted[index] || waiting[index] {
+            *burst_left = 0;
+            *cursor += 1;
             continue;
         }
         let name = proposers[index].name().to_string();
+        let is_breed = name == "breed" && breed_burst > 1;
+        if is_breed && *burst_left == 0 {
+            *burst_left = breed_burst;
+        }
         match proposers[index].next(nugget, feedback)? {
-            Proposal::Candidate(text) => return Ok(Some((name, text))),
-            Proposal::Later => waiting[index] = true,
-            Proposal::Finished => exhausted[index] = true,
+            Proposal::Candidate(text) => {
+                if is_breed {
+                    *burst_left = burst_left.saturating_sub(1);
+                    if *burst_left == 0 {
+                        *cursor += 1;
+                    }
+                } else {
+                    *cursor += 1;
+                }
+                return Ok(Some((name, text)));
+            }
+            Proposal::Later => {
+                waiting[index] = true;
+                *burst_left = 0;
+                *cursor += 1;
+            }
+            Proposal::Finished => {
+                exhausted[index] = true;
+                *burst_left = 0;
+                *cursor += 1;
+            }
         }
     }
     Ok(None)
 }
 
 /// Finish one candidate whose first pass is `first`: the oracle if it would
-/// be a new best, then the journal line, the printed line, and the best files.
+/// be a new best (or best-of-species when multi-species is active), then the
+/// journal line, the printed line, and the best / species files.
 #[allow(clippy::too_many_arguments)]
 fn settle(
     nugget: &Nugget,
@@ -643,6 +957,8 @@ fn settle(
     work_dir: &Path,
     out_dir: &Path,
     coverage: bool,
+    target: ResolvedTarget,
+    archive: &SpeciesHandle,
     journal: &mut Journal,
     best: &mut Option<Best>,
     last: &mut Option<(String, Verdict)>,
@@ -652,12 +968,20 @@ fn settle(
         Ok(pass) => pass,
         Err(error) => return unevaluated(seed, error),
     };
-    // Prove a new best (and in coverage mode every scored candidate) by
-    // running only the rustc oracle on the already-built fast binary and its
-    // captured case runs, rather than redoing check, build, fast runs, and
-    // `--opt` timing.
-    let to_oracle =
-        would_improve(&pass.verdict, best) || (coverage && pass.verdict.status == Status::Scored);
+    let case_scores = pass.case_scores().to_vec();
+    let species_worthy = archive.borrow().max_species() > 1
+        && archive.borrow().worthy_of_oracle(
+            candidate,
+            &pass.verdict,
+            &case_scores,
+            nugget.objective,
+        );
+    // Prove a new best, a best-of-species champion, or in coverage mode every
+    // scored candidate by running only the rustc oracle on the already-built
+    // fast binary and its captured case runs.
+    let to_oracle = would_improve(&pass.verdict, best)
+        || species_worthy
+        || (coverage && pass.verdict.status == Status::Scored);
     let mut verdict = if to_oracle {
         match pipeline::prove_first_pass(nugget, pass, tools, &eval_options(work_dir, true, 0)) {
             Ok(verdict) => verdict,
@@ -674,10 +998,36 @@ fn settle(
     journal.append(&verdict, proposer)?;
     let n = journal.last_n();
     crate::console::line(&format_candidate_line(n, &verdict, proposer));
+    let prev_best_score = best.as_ref().map(|b| b.score);
     remember(nugget, candidate, &verdict, best, last, recent, out_dir)?;
+    let best_improved = match (prev_best_score, best.as_ref().map(|b| b.score)) {
+        (None, Some(_)) => true,
+        (Some(before), Some(after)) => after < before,
+        _ => false,
+    };
+    let archive_changed = archive
+        .borrow_mut()
+        .observe(candidate, &verdict, &case_scores, proposer);
+    if archive_changed && archive.borrow().max_species() > 1 {
+        archive.borrow().save_to_dir(nugget, out_dir)?;
+    }
+
+    let goal_stop = verdict.status == Status::Proven
+        && match (target.stop_spec, finite_score(&verdict)) {
+            (Some(spec), Some(score)) => {
+                let hit = spec.reached(score);
+                if hit && target.explicit {
+                    print_goal_reached(score, spec);
+                }
+                hit
+            }
+            _ => solved(nugget, &verdict),
+        };
+
     Ok(Outcome {
         recorded: true,
-        stop: solved(nugget, &verdict),
+        progressed: best_improved || archive_changed,
+        stop: goal_stop,
     })
 }
 
@@ -689,6 +1039,7 @@ fn unevaluated(seed: bool, error: crate::error::Error) -> Result<Outcome> {
     eprintln!("crab-cage: {error}");
     Ok(Outcome {
         recorded: false,
+        progressed: false,
         stop: false,
     })
 }

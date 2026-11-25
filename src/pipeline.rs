@@ -168,6 +168,14 @@ pub struct FirstPass {
     source: PathBuf,
     binary: PathBuf,
     runs: Vec<CaseCapture>,
+    case_scores: Vec<(String, f64)>,
+}
+
+impl FirstPass {
+    /// Per-case `(case_id, score)` breakdown captured during the fast pass.
+    pub fn case_scores(&self) -> &[(String, f64)] {
+        &self.case_scores
+    }
 }
 
 /// Evaluate `candidate` against `nugget`.
@@ -219,6 +227,7 @@ pub fn evaluate_first_pass(
         source: PathBuf::new(),
         binary: PathBuf::new(),
         runs: Vec::new(),
+        case_scores: Vec::new(),
     };
 
     if let Err(message) = crate::emit::sandbox_prefilter(candidate) {
@@ -344,6 +353,8 @@ pub fn evaluate_first_pass(
     verdict.status = Status::Scored;
     verdict.score = Some(outcome.score);
 
+    let mut case_scores = outcome.case_scores;
+
     // `fastest`: only a candidate that printed every expected output is
     // timed. A wrong one keeps its `WRONG_OUTPUT_SCORE + failed` score.
     if nugget.objective == Objective::Fastest && verdict.passed == verdict.total {
@@ -354,7 +365,9 @@ pub fn evaluate_first_pass(
             fast_bin: &binary,
             fast_runs: &outcome.runs,
         };
-        time_candidate(&mut verdict, nugget, &timed, tools, opts)?;
+        if let Some(per_case_ms) = time_candidate(&mut verdict, nugget, &timed, tools, opts)? {
+            case_scores = per_case_ms;
+        }
         verdict.ms.opt = elapsed_ms(started);
         if verdict.status != Status::Scored {
             return Ok(empty(verdict));
@@ -366,6 +379,7 @@ pub fn evaluate_first_pass(
         source,
         binary,
         runs: outcome.runs,
+        case_scores,
     })
 }
 
@@ -593,6 +607,8 @@ struct RunOutcome {
     /// candidate has one entry per nugget case; the oracle compares these
     /// bytes and exit kinds with a fresh rustc run.
     runs: Vec<CaseCapture>,
+    /// Per-case `(case_id, score)` breakdown when scored.
+    case_scores: Vec<(String, f64)>,
     /// First `pass_all` or `fastest` mismatch. `None` when every case
     /// matched, or the objective is `minimize`.
     failure: Option<CaseFailure>,
@@ -822,16 +838,16 @@ fn time_candidate(
     build: &TimedBuild,
     tools: &Toolchain,
     opts: &EvalOptions,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<Option<Vec<(String, f64)>>> {
     let Some(tool) = &tools.lust else {
         return time_fast_build(verdict, nugget, build.fast_bin, opts);
     };
     if tool.opt_known_unavailable() {
-        time_fast_build(verdict, nugget, build.fast_bin, opts)?;
+        let per_case = time_fast_build(verdict, nugget, build.fast_bin, opts)?;
         if verdict.status == Status::Scored {
             verdict.note = OPT_UNAVAILABLE.to_string();
         }
-        return Ok(());
+        return Ok(per_case);
     }
     let opt_bin = opts
         .work_dir
@@ -852,7 +868,7 @@ fn time_candidate(
         if missing_cc {
             tool.mark_opt_unavailable();
         }
-        time_fast_build(verdict, nugget, build.fast_bin, opts)?;
+        let per_case = time_fast_build(verdict, nugget, build.fast_bin, opts)?;
         if verdict.status == Status::Scored {
             verdict.note = if missing_cc {
                 OPT_UNAVAILABLE.to_string()
@@ -863,10 +879,13 @@ fn time_candidate(
                 )
             };
         }
-        return Ok(());
+        return Ok(per_case);
     }
     match time_cases(nugget, &opt_bin, opts)? {
-        Timing::Score(score) => verdict.score = Some(score),
+        Timing::Score(score, per_case) => {
+            verdict.score = Some(score);
+            return Ok(Some(per_case));
+        }
         Timing::Mismatch(index, opt_run) => {
             let case = &nugget.cases[index];
             let fast = build
@@ -878,7 +897,7 @@ fn time_candidate(
             )?;
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Time the binary that already ran once. A second run that prints
@@ -888,21 +907,24 @@ fn time_fast_build(
     nugget: &Nugget,
     bin: &Path,
     opts: &EvalOptions,
-) -> crate::error::Result<()> {
+) -> crate::error::Result<Option<Vec<(String, f64)>>> {
     match time_cases(nugget, bin, opts)? {
-        Timing::Score(score) => verdict.score = Some(score),
+        Timing::Score(score, per_case) => {
+            verdict.score = Some(score);
+            Ok(Some(per_case))
+        }
         Timing::Mismatch(..) => {
             verdict.status = Status::Rejected;
             verdict.score = None;
             verdict.note = "nondeterministic output".to_string();
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 enum Timing {
-    /// Sum over cases of the median elapsed milliseconds.
-    Score(f64),
+    /// Sum over cases of the median elapsed milliseconds, plus per-case medians.
+    Score(f64, Vec<(String, f64)>),
     /// The index of the first case whose run was not clean or printed the
     /// wrong output, and that run.
     Mismatch(usize, CaseCapture),
@@ -911,6 +933,7 @@ enum Timing {
 fn time_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::Result<Timing> {
     let limits = host_limits(nugget, opts);
     let mut total = 0.0f64;
+    let mut per_case = Vec::with_capacity(nugget.cases.len());
     for (index, case) in nugget.cases.iter().enumerate() {
         let mut times = Vec::with_capacity(TIMED_RUNS);
         for _ in 0..TIMED_RUNS {
@@ -929,9 +952,11 @@ fn time_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::
             }
             times.push(result.elapsed.as_secs_f64() * 1000.0);
         }
-        total += median(&mut times);
+        let med = median(&mut times);
+        total += med;
+        per_case.push((case.id.clone(), med));
     }
-    Ok(Timing::Score(total))
+    Ok(Timing::Score(total, per_case))
 }
 
 /// The middle value; the mean of the two middle values for an even count.
@@ -1012,6 +1037,7 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
     let mut bad_score: Option<String> = None;
     let mut failure: Option<CaseFailure> = None;
     let mut runs = Vec::with_capacity(nugget.cases.len());
+    let mut case_scores = Vec::with_capacity(nugget.cases.len());
 
     for case in &nugget.cases {
         let result = supervisor::run_capture(Command::new(bin), &limits, case.input.as_bytes())?;
@@ -1024,17 +1050,27 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
                 Objective::PassAll | Objective::Fastest => {
                     if let Some(found) = pass_all_failure(case, &result.stdout) {
                         mismatches = mismatches.saturating_add(1);
+                        case_scores.push((
+                            case.id.clone(),
+                            if nugget.objective == Objective::Fastest {
+                                WRONG_OUTPUT_SCORE
+                            } else {
+                                1.0
+                            },
+                        ));
                         if failure.is_none() {
                             failure = Some(found);
                         }
                     } else {
                         passed = passed.saturating_add(1);
+                        case_scores.push((case.id.clone(), 0.0));
                     }
                 }
                 Objective::Minimize => match parse_score(&result.stdout) {
                     Ok(value) => {
                         sum += value;
                         passed = passed.saturating_add(1);
+                        case_scores.push((case.id.clone(), value));
                     }
                     Err(note) => {
                         if bad_score.is_none() {
@@ -1061,6 +1097,7 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
             score: 0.0,
             stop: Some(class_name(class).to_string()),
             runs,
+            case_scores: Vec::new(),
             failure,
         });
     }
@@ -1070,6 +1107,7 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
             score: 0.0,
             stop: Some(note),
             runs,
+            case_scores: Vec::new(),
             failure,
         });
     }
@@ -1086,6 +1124,7 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
             score: 0.0,
             stop: Some("non-finite score".to_string()),
             runs,
+            case_scores: Vec::new(),
             failure,
         });
     }
@@ -1094,6 +1133,7 @@ fn run_cases(nugget: &Nugget, bin: &Path, opts: &EvalOptions) -> crate::error::R
         score,
         stop: None,
         runs,
+        case_scores,
         failure,
     })
 }

@@ -108,14 +108,18 @@ A candidate may not use `unsafe`, `async`, the file system, the network, the env
 crab-cage run nuggets/sum-squares --candidates my-snippets --lust-bin /path/to/lust
 crab-cage run my-nugget --tweak --budget 120 --jobs 4 --lust-bin /path/to/lust
 crab-cage run my-nugget --backend local --model qwen2.5-coder:7b --lust-bin /path/to/lust
+crab-cage run my-nugget --backend local --breed --species 4 --goal 630 --tolerance 5 --lust-bin /path/to/lust
 ```
 
-| Flag | Proposer |
+| Flag | Proposer / Evolution Control |
 |---|---|
 | `--candidates DIR` | every `*.rs` file in `DIR`, once, in name order. Files added during the run are picked up. Any model or script can feed a run this way. |
 | `--tweak` | changes one numeric literal of the best candidate per proposal: a float by about ±20%, an integer by 1 or 2. No model needed. |
-| `--backend local` | asks a local model for the region, and sends lust's diagnostics back to it when a reply is rejected. `--endpoint` and `--model` choose the server. |
-| (with `--backend local`) | `repair`: when a candidate does not compile, rustc is asked about it, and the fixes rustc marks as safe to apply (`MachineApplicable`, such as a missing `*` in a comparison) are applied and tried as a candidate of its own. No model involved. `--no-repair` turns it off. |
+| `--breed` (`--mutate`) | evolutionary code & parameter breeder: UCB1 selection across proven species, coordinate momentum line-search, same-species differential evolution & crossover, multi-scale/coupled numeric mutations, and sandbox-safe code micro-mutations (`<`↔`<=`, `..`↔`..=`, `.min`↔`.max`, boolean connectives). Defaults `--species` to 4, and `--breed-burst` to 4 when paired with `--backend local`. |
+| `--species K` | maintain up to `K` structurally distinct proven species champions (`<out>/species/`), promoting best-of-species and per-case specialists through `lust` to the `rustc` oracle and feeding multi-parent inspiration + per-case breakdowns back to `--backend local`. |
+| `--goal SCORE` / `--tolerance EPS` | experiment target (also supported in `nugget.json` as `"goal"` and `"tolerance"`): stops early and exits 0 as soon as a `proven` candidate reaches `score <= goal + tolerance`. `--patience N` stops after `N` candidates with no global or species improvement. |
+| `--backend local` | asks a local model for the region, and sends lust's diagnostics, per-case cost breakdown, and alternative proven species back to it. `--endpoint` and `--model` choose the server. |
+| (with `--backend local`) | `repair`: when a candidate does not compile, `lust fix --sandbox` and then `rustc` (`MachineApplicable` fixes) are tried automatically as a `repair` candidate. `--no-repair` turns it off. |
 
 Several can be given; they take turns.
 
