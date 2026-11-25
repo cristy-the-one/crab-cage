@@ -1,0 +1,8 @@
+{
+  "name": "signal-tracker",
+  "objective": "minimize",
+  "goal": 500.0,
+  "tolerance": 150.0,
+  "timeout_ms": 2000,
+  "max_memory": "64M"
+}

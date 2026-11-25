@@ -89,6 +89,26 @@ impl Nugget {
     }
 }
 
+/// Optional stopping target (`goal` + "close enough" `tolerance`) for a nugget.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GoalSpec {
+    pub goal: f64,
+    pub tolerance: f64,
+}
+
+impl GoalSpec {
+    /// Score threshold `goal + tolerance` at or below which a proven candidate
+    /// satisfies the experiment goal.
+    pub fn threshold(self) -> f64 {
+        self.goal + self.tolerance
+    }
+
+    /// Whether a finite proven `score` meets `goal` within `tolerance`.
+    pub fn reached(self, score: f64) -> bool {
+        score.is_finite() && score <= self.threshold() + 1e-12
+    }
+}
+
 /// Read `dir` as a nugget.
 ///
 /// Fails when a marker is missing or repeated, when there are no cases, when
@@ -97,6 +117,7 @@ impl Nugget {
 pub fn load(dir: &Path) -> Result<Nugget> {
     let spec_path = dir.join("nugget.json");
     let spec = read_spec(&spec_path)?;
+    let _ = parse_goal_spec(&spec_path, &spec)?;
     let objective = parse_objective(&spec_path, &spec.objective)?;
     let timeout = Duration::from_millis(spec.timeout_ms.unwrap_or(DEFAULT_TIMEOUT_MS));
     let max_memory = parse_memory(spec.max_memory.as_deref().unwrap_or(DEFAULT_MAX_MEMORY))?;
@@ -117,6 +138,13 @@ pub fn load(dir: &Path) -> Result<Nugget> {
     })
 }
 
+/// Read the optional `goal` and `tolerance` target from `<dir>/nugget.json`.
+pub fn load_goal(dir: &Path) -> Result<Option<GoalSpec>> {
+    let spec_path = dir.join("nugget.json");
+    let spec = read_spec(&spec_path)?;
+    parse_goal_spec(&spec_path, &spec)
+}
+
 #[derive(Deserialize)]
 struct NuggetFile {
     name: String,
@@ -125,6 +153,36 @@ struct NuggetFile {
     timeout_ms: Option<u64>,
     #[serde(default)]
     max_memory: Option<String>,
+    #[serde(default)]
+    goal: Option<f64>,
+    #[serde(default)]
+    tolerance: Option<f64>,
+}
+
+fn parse_goal_spec(path: &Path, spec: &NuggetFile) -> Result<Option<GoalSpec>> {
+    if let Some(tol) = spec.tolerance {
+        if !tol.is_finite() || tol < 0.0 {
+            return Err(err(format!(
+                "{}: tolerance must be a non-negative finite number",
+                path.display()
+            )));
+        }
+    }
+    match spec.goal {
+        Some(goal) => {
+            if !goal.is_finite() {
+                return Err(err(format!(
+                    "{}: goal must be a finite number",
+                    path.display()
+                )));
+            }
+            Ok(Some(GoalSpec {
+                goal,
+                tolerance: spec.tolerance.unwrap_or(0.0),
+            }))
+        }
+        None => Ok(None),
+    }
 }
 
 fn read_spec(path: &Path) -> Result<NuggetFile> {

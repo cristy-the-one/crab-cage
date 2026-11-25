@@ -135,6 +135,12 @@ struct InitArgs {
     /// Objective: `pass_all`, `minimize`, or `fastest`.
     #[arg(long, default_value = "pass_all")]
     objective: String,
+    /// Optional target score written to `nugget.json`.
+    #[arg(long)]
+    goal: Option<f64>,
+    /// Optional "close enough" margin written to `nugget.json`.
+    #[arg(long)]
+    tolerance: Option<f64>,
 }
 
 #[derive(Parser, Debug)]
@@ -174,6 +180,30 @@ struct RunArgs {
     /// Round-robin with `--candidates` when both are set.
     #[arg(long)]
     tweak: bool,
+    /// Evolutionary code and parameter breeder: UCB species selection,
+    /// directional line search, same-species differential evolution / crossover,
+    /// and sandbox-safe code micro-mutations. Defaults `--species` to 4.
+    #[arg(long, visible_alias = "mutate")]
+    breed: bool,
+    /// Fast `--breed` candidates proposed per round-robin turn (defaults to 4
+    /// when paired with `--backend local`, 1 otherwise).
+    #[arg(long)]
+    breed_burst: Option<usize>,
+    /// Number of distinct proven code species champions to maintain and validate
+    /// against `rustc` (defaults to 4 with `--breed`, 1 otherwise).
+    #[arg(long)]
+    species: Option<usize>,
+    /// Target score at which the experiment succeeds and stops early.
+    #[arg(long, allow_hyphen_values = true)]
+    goal: Option<f64>,
+    /// Additive "close enough" margin: stops when a proven candidate reaches
+    /// `score <= goal + tolerance`.
+    #[arg(long)]
+    tolerance: Option<f64>,
+    /// Stop early after this many evaluated candidates without improving the
+    /// global best or advancing the species archive.
+    #[arg(long)]
+    patience: Option<usize>,
     /// `local` asks a loopback model for each region.
     #[arg(long)]
     backend: Option<String>,
@@ -564,6 +594,20 @@ fn delta_cmd(args: DeltaArgs) -> Result<()> {
 
 fn run_cmd(args: RunArgs) -> Result<ExitCode> {
     let lust_bin = resolve_lust_bin(args.lust_bin);
+    let species_cap = args
+        .species
+        .unwrap_or(if args.breed { 4 } else { 1 })
+        .max(1);
+    let breed_burst = args
+        .breed_burst
+        .unwrap_or(if args.breed && args.backend.is_some() {
+            4
+        } else {
+            1
+        });
+    let archive = crab_cage::species::SpeciesArchive::new_handle(species_cap);
+    let archive_ref = (species_cap > 1 || args.breed).then_some(&archive);
+
     let mut folder = args
         .candidates
         .as_ref()
@@ -578,7 +622,7 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
     // proposer, which reads what became of its own regions.
     let repairs = crab_cage::repair::RepairLog::default();
     let mut model = None;
-    run::attach_model(
+    run::attach_model_with_species(
         args.backend.as_deref(),
         args.endpoint.as_deref(),
         args.model.as_deref(),
@@ -586,6 +630,7 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
         args.seed,
         Some(&args.out.join("prompts")),
         Some(&repairs),
+        archive_ref,
         &mut model,
         &mut proposers,
     )?;
@@ -597,7 +642,15 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
         &mut repair,
         &mut proposers,
     );
-    let output = run::execute(
+    let mut breed = None;
+    run::attach_breed(
+        args.breed,
+        args.seed,
+        Some(&archive),
+        &mut breed,
+        &mut proposers,
+    );
+    let output = run::execute_evolved(
         &run::RunOptions {
             nugget_dir: args.nugget_dir,
             budget: args.budget,
@@ -606,6 +659,14 @@ fn run_cmd(args: RunArgs) -> Result<ExitCode> {
             lust_daemon: lust_bin.is_some() && !args.no_lust_daemon,
             coverage: args.coverage,
             lust_bin,
+        },
+        &run::EvolutionOptions {
+            species: species_cap,
+            goal: args.goal,
+            tolerance: args.tolerance,
+            patience: args.patience,
+            archive: Some(archive),
+            breed_burst,
         },
         &mut proposers,
     )?;
@@ -786,6 +847,7 @@ fn objective_rule(objective: Objective) -> &'static str {
 
 fn inspect_cmd(args: InspectArgs) -> Result<()> {
     let loaded = nugget::load(&args.nugget_dir)?;
+    let goal_spec = nugget::load_goal(&args.nugget_dir)?;
     let case_ids: Vec<&str> = loaded.cases.iter().map(|c| c.id.as_str()).collect();
     let sample = loaded.cases.first().map(|case| {
         serde_json::json!({
@@ -799,6 +861,8 @@ fn inspect_cmd(args: InspectArgs) -> Result<()> {
             "name": loaded.name,
             "objective": loaded.objective.as_str(),
             "objective_rule": objective_rule(loaded.objective),
+            "goal": goal_spec.map(|g| g.goal),
+            "tolerance": goal_spec.map(|g| g.tolerance),
             "timeout_ms": loaded.timeout.as_millis() as u64,
             "max_memory": loaded.max_memory,
             "region_first_line": loaded.region_first_line,
@@ -814,6 +878,14 @@ fn inspect_cmd(args: InspectArgs) -> Result<()> {
     println!("nugget: {}", loaded.name);
     println!("objective: {}", loaded.objective.as_str());
     println!("rule: {}", objective_rule(loaded.objective));
+    if let Some(g) = goal_spec {
+        println!(
+            "goal: {} (tolerance {}, threshold <= {})",
+            g.goal,
+            g.tolerance,
+            g.threshold()
+        );
+    }
     println!(
         "limits: timeout_ms={} max_memory={}",
         loaded.timeout.as_millis(),
@@ -842,6 +914,7 @@ fn summary_cmd(args: SummaryArgs) -> Result<()> {
         )));
     }
     let stats = parse_journal_stats(&journal_path)?;
+    let species_manifest = out_dir.and_then(crab_cage::species::read_manifest_json);
     if args.json {
         let best_region = out_dir
             .map(|dir| dir.join("best.region.rs"))
@@ -856,6 +929,18 @@ fn summary_cmd(args: SummaryArgs) -> Result<()> {
             .best
             .as_ref()
             .map(|(score, hash)| serde_json::json!({ "score": score, "hash": hash }));
+        let proposers: Vec<serde_json::Value> = stats
+            .proposers
+            .iter()
+            .map(|p| {
+                serde_json::json!({
+                    "proposer": p.name,
+                    "candidates": p.candidates,
+                    "proven": p.proven,
+                    "best_proven": p.best_proven,
+                })
+            })
+            .collect();
         let payload = serde_json::json!({
             "journal": journal_path.display().to_string(),
             "candidates": stats.candidates,
@@ -873,6 +958,8 @@ fn summary_cmd(args: SummaryArgs) -> Result<()> {
                 "oracle": stats.gate_oracle,
             },
             "top_codes": top_codes,
+            "proposers": proposers,
+            "species": species_manifest,
             "best": best,
             "ms_total": {
                 "check": stats.ms_check,
@@ -888,11 +975,23 @@ fn summary_cmd(args: SummaryArgs) -> Result<()> {
     }
     let text = Journal::summary(&journal_path)?;
     crab_cage::console::print(&text);
+    if let Some(sp) = &species_manifest {
+        if let Some(count) = sp.get("count").and_then(|v| v.as_u64()) {
+            crab_cage::console::line(&format!("species proven={count}"));
+        }
+    }
     crab_cage::console::line(&format!(
         "ms total check={} build={} run={} opt={} oracle={}",
         stats.ms_check, stats.ms_build, stats.ms_run, stats.ms_opt, stats.ms_oracle
     ));
     Ok(())
+}
+
+struct ProposerStat {
+    name: String,
+    candidates: u64,
+    proven: u64,
+    best_proven: Option<f64>,
 }
 
 #[derive(Default)]
@@ -913,6 +1012,7 @@ struct JournalStats {
     ms_opt: u64,
     ms_oracle: u64,
     top_codes: Vec<(String, u64)>,
+    proposers: Vec<ProposerStat>,
     best: Option<(f64, String)>,
 }
 
@@ -922,6 +1022,7 @@ fn parse_journal_stats(path: &Path) -> Result<JournalStats> {
     let segments: Vec<&str> = text.split('\n').collect();
     let mut stats = JournalStats::default();
     let mut codes: HashMap<String, u64> = HashMap::new();
+    let mut proposer_map: HashMap<String, (u64, u64, Option<f64>)> = HashMap::new();
     for (index, raw) in segments.iter().enumerate() {
         let line = raw.trim_end_matches('\r').trim();
         if line.is_empty() {
@@ -942,6 +1043,27 @@ fn parse_journal_stats(path: &Path) -> Result<JournalStats> {
         stats.candidates += 1;
         let status = value.get("status").and_then(|v| v.as_str()).unwrap_or("");
         let gate = value.get("gate").and_then(|v| v.as_str()).unwrap_or("");
+        let proposer_name = value
+            .get("proposer")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let p_entry = proposer_map
+            .entry(proposer_name.to_string())
+            .or_insert((0, 0, None));
+        p_entry.0 += 1;
+        if status == "proven" {
+            p_entry.1 += 1;
+            if let Some(sc) = value
+                .get("score")
+                .and_then(|v| v.as_f64())
+                .filter(|s| s.is_finite())
+            {
+                p_entry.2 = Some(match p_entry.2 {
+                    Some(prev) => prev.min(sc),
+                    None => sc,
+                });
+            }
+        }
         match status {
             "rejected" => {
                 stats.rejected += 1;
@@ -997,6 +1119,21 @@ fn parse_journal_stats(path: &Path) -> Result<JournalStats> {
     ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
     ranked.truncate(10);
     stats.top_codes = ranked;
+    let mut prop_list: Vec<ProposerStat> = proposer_map
+        .into_iter()
+        .map(|(name, (candidates, proven, best_proven))| ProposerStat {
+            name,
+            candidates,
+            proven,
+            best_proven,
+        })
+        .collect();
+    prop_list.sort_by(|a, b| {
+        b.candidates
+            .cmp(&a.candidates)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    stats.proposers = prop_list;
     Ok(stats)
 }
 
@@ -1029,14 +1166,35 @@ fn init_cmd(args: InitArgs) -> Result<()> {
             .unwrap_or("my-nugget")
             .to_string(),
     };
+    if let Some(tol) = args.tolerance {
+        if !tol.is_finite() || tol < 0.0 {
+            return Err(err("--tolerance must be a non-negative finite number"));
+        }
+        if args.goal.is_none() {
+            return Err(err("--tolerance needs --goal"));
+        }
+    }
+    if let Some(goal) = args.goal {
+        if !goal.is_finite() {
+            return Err(err("--goal must be a finite number"));
+        }
+    }
     let cases_dir = args.dir.join("cases");
     fs::create_dir_all(&cases_dir)?;
-    let spec = serde_json::json!({
+    let mut spec = serde_json::json!({
         "name": name,
         "objective": objective.as_str(),
         "timeout_ms": 2000,
         "max_memory": "64M",
     });
+    if let Some(obj) = spec.as_object_mut() {
+        if let Some(goal) = args.goal {
+            obj.insert("goal".to_string(), serde_json::Value::from(goal));
+        }
+        if let Some(tol) = args.tolerance {
+            obj.insert("tolerance".to_string(), serde_json::Value::from(tol));
+        }
+    }
     fs::write(
         &spec_path,
         format!("{}\n", serde_json::to_string_pretty(&spec)?),

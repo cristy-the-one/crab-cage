@@ -25,6 +25,7 @@ use crate::pipeline::{
     candidate_hash, clip_chars, CaseFailure, Diagnostic, Status, Verdict, TEXT_CLIP,
 };
 use crate::rng::Pcg64;
+use crate::species::{species_id, CaseAdvantage, SpeciesHandle, SpeciesSnapshot, DEFAULT_UCB_C};
 
 /// PCG stream for [`LiteralProposer`]. A different stream keeps this sequence
 /// from matching a generator that was given the same seed and stream 0.
@@ -524,6 +525,13 @@ impl ModelProposer {
         self
     }
 
+    /// Share the run's [`SpeciesArchive`] so prompts rotate across proven
+    /// species, show per-case score breakdowns, and cross-pollinate elites.
+    pub fn with_species(mut self, species: Option<SpeciesHandle>) -> Self {
+        self.memory.species = species;
+        self
+    }
+
     /// Send a seed with every request, so a run can be repeated: the first
     /// request gets `seed`, the next `seed + 1`, and so on. One seed for
     /// every request would make a model that repeats a region repeat it
@@ -626,6 +634,11 @@ impl MockModelProposer {
         self.second_opinion = Some(opinion);
         self
     }
+
+    pub fn with_species(mut self, species: Option<SpeciesHandle>) -> Self {
+        self.memory.species = species;
+        self
+    }
 }
 
 impl Proposer for MockModelProposer {
@@ -694,6 +707,14 @@ struct ModelMemory {
     /// Set when `own` is not this proposer's reply itself but that reply
     /// with rustc's fix applied: the lines the fix changed.
     repaired: Option<Vec<String>>,
+    /// Optional multi-species archive shared with the run loop.
+    species: Option<SpeciesHandle>,
+    /// Best proven score seen so far, used to detect LLM stagnation plateaus.
+    best_seen_score: Option<f64>,
+    /// Consecutive settled replies from this proposer that did not beat `best_seen_score`.
+    stagnant_turns: usize,
+    /// Prompts prepared so far, used to alternate refine / crossover / diversify guidance.
+    prompt_turn: usize,
 }
 
 struct Tried {
@@ -735,6 +756,10 @@ impl Default for ModelMemory {
             opinion: None,
             repairs: None,
             repaired: None,
+            species: None,
+            best_seen_score: None,
+            stagnant_turns: 0,
+            prompt_turn: 0,
         }
     }
 }
@@ -770,7 +795,34 @@ impl ModelMemory {
             self.own_text = Some(region.clone());
             self.repaired = None;
             let bad_line = rejected_source_line(&region, verdict);
+            if let Some(score) = verdict.score.filter(|s| {
+                s.is_finite() && matches!(verdict.status, Status::Scored | Status::Proven)
+            }) {
+                let improved = match self.best_seen_score {
+                    Some(prev) => score < prev,
+                    None => true,
+                };
+                if improved {
+                    self.best_seen_score = Some(score);
+                    self.stagnant_turns = 0;
+                } else {
+                    self.stagnant_turns += 1;
+                }
+            } else {
+                self.stagnant_turns += 1;
+            }
             self.remember_tried(hash, region, outcome_of(verdict), bad_line);
+        }
+        if let Some((_, best_score)) = feedback.best {
+            if best_score.is_finite() {
+                let take = match self.best_seen_score {
+                    Some(prev) => best_score < prev,
+                    None => true,
+                };
+                if take {
+                    self.best_seen_score = Some(best_score);
+                }
+            }
         }
         self.adopt_repair(feedback);
         // Still pending after its batch settled: never evaluated.
@@ -864,6 +916,21 @@ impl ModelMemory {
     }
 
     fn base_text(&mut self, nugget: &Nugget, feedback: &Feedback) -> String {
+        if let Some(handle) = &self.species {
+            let multi_species = {
+                let arch = handle.borrow();
+                arch.max_species() > 1 && arch.len() >= 2
+            };
+            if multi_species {
+                if self.rejected_in_a_row >= REJECTS_BEFORE_RESET {
+                    self.rejected_in_a_row = 0;
+                }
+                let chosen = handle.borrow_mut().select_parent(DEFAULT_UCB_C);
+                if let Some(chosen) = chosen {
+                    return chosen.text;
+                }
+            }
+        }
         if self.rejected_in_a_row >= REJECTS_BEFORE_RESET {
             self.rejected_in_a_row = 0;
             return nugget.seed.clone();
@@ -999,6 +1066,14 @@ impl ModelMemory {
     }
 }
 
+struct SpeciesPromptContext {
+    primary_cases: Vec<(String, f64)>,
+    inspiration: Option<(SpeciesSnapshot, Vec<CaseAdvantage>)>,
+    species_count: usize,
+    stagnant_turns: usize,
+    turn: usize,
+}
+
 fn prepare_prompt(
     memory: &mut ModelMemory,
     capabilities: &str,
@@ -1009,6 +1084,36 @@ fn prepare_prompt(
     memory.observe(feedback);
     let second = memory.second_opinion(nugget, opinion);
     let base = memory.base_text(nugget, feedback);
+    let turn = memory.prompt_turn;
+    memory.prompt_turn += 1;
+    let species_ctx = memory.species.as_ref().and_then(|handle| {
+        let archive = handle.borrow();
+        if archive.max_species() <= 1 && archive.is_empty() {
+            return None;
+        }
+        let base_sp = species_id(&base);
+        let primary_cases = archive
+            .entries()
+            .iter()
+            .find(|e| e.species_id == base_sp)
+            .map(|e| e.case_scores.clone())
+            .unwrap_or_default();
+        let inspiration = if archive.max_species() > 1 {
+            archive.select_inspiration(&base_sp, &primary_cases)
+        } else {
+            None
+        };
+        if primary_cases.is_empty() && inspiration.is_none() && archive.max_species() <= 1 {
+            return None;
+        }
+        Some(SpeciesPromptContext {
+            primary_cases,
+            inspiration,
+            species_count: archive.len(),
+            stagnant_turns: memory.stagnant_turns,
+            turn,
+        })
+    });
     let best_score = feedback.best.map(|(_, score)| score);
     let system = system_prompt(capabilities);
     let user = user_prompt(
@@ -1019,6 +1124,7 @@ fn prepare_prompt(
         memory.repaired.as_deref(),
         second.as_deref(),
         best_score,
+        species_ctx.as_ref(),
         &memory.tried,
         &memory.pending,
     );
@@ -1051,6 +1157,7 @@ fn system_prompt(capabilities: &str) -> String {
     out
 }
 
+#[allow(clippy::too_many_arguments)]
 fn user_prompt(
     nugget: &Nugget,
     base: &str,
@@ -1059,6 +1166,7 @@ fn user_prompt(
     repaired: Option<&[String]>,
     second_opinion: Option<&str>,
     best_score: Option<f64>,
+    species_ctx: Option<&SpeciesPromptContext>,
     tried: &[Tried],
     pending: &[Pending],
 ) -> String {
@@ -1102,6 +1210,9 @@ fn user_prompt(
             }
         }
     }
+    if let Some(ctx) = species_ctx {
+        append_species_context(&mut out, nugget.objective, ctx);
+    }
     append_tried(&mut out, tried, pending, base);
     // The request comes last, after the feedback. With the request first and
     // a rejected fragment listed after it, the model continued the fragment
@@ -1117,6 +1228,77 @@ fn user_prompt(
     }
     out.push_str("Reply with the complete new lines that replace them.\n");
     out
+}
+
+const INSPIRATION_CLIP: usize = 600;
+const WORST_CASES_SHOWN: usize = 4;
+
+fn append_species_context(out: &mut String, objective: Objective, ctx: &SpeciesPromptContext) {
+    // 1. Per-case breakdown for `minimize` / `fastest` when there are multiple cases.
+    if matches!(objective, Objective::Minimize | Objective::Fastest) && ctx.primary_cases.len() >= 2
+    {
+        let mut ranked: Vec<&(String, f64)> = ctx
+            .primary_cases
+            .iter()
+            .filter(|(_, val)| val.is_finite())
+            .collect();
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
+        if !ranked.is_empty() {
+            out.push_str("Highest-cost cases on the current lines: ");
+            for (idx, (id, val)) in ranked.iter().take(WORST_CASES_SHOWN).enumerate() {
+                if idx > 0 {
+                    out.push_str(", ");
+                }
+                if objective == Objective::Fastest {
+                    out.push_str(&format!("{id}={val:.2}ms"));
+                } else {
+                    out.push_str(&format!("{id}={val}"));
+                }
+            }
+            out.push_str(".\n");
+        }
+    }
+
+    // 2. Multi-parent cross-species inspiration when a second proven species exists.
+    if let Some((insp, wins)) = &ctx.inspiration {
+        out.push('\n');
+        if let Some(first_win) = wins.first() {
+            out.push_str(&format!(
+                "Alternative proven species (score {}; beats the current lines on case `{}`: {} vs {}):\n",
+                insp.score,
+                first_win.case_id,
+                first_win.inspiration_score,
+                first_win.primary_score
+            ));
+        } else {
+            out.push_str(&format!(
+                "Alternative proven species (score {}):\n",
+                insp.score
+            ));
+        }
+        let clipped = clip_chars(&insp.text, INSPIRATION_CLIP);
+        out.push_str(&clipped);
+        if !clipped.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+
+    // 3. Adaptive evolutionary directive based on archive state and stagnation.
+    if ctx.stagnant_turns >= 3 {
+        out.push_str(
+            "Evolutionary guidance: recent edits plateaued. Propose a structurally distinct algorithm (a new species of code) rather than minor constant edits.\n",
+        );
+    } else if ctx.inspiration.is_some() && ctx.turn % 2 == 1 {
+        out.push_str(
+            "Evolutionary guidance: synthesize the strongest ideas from the current lines and the alternative proven species above.\n",
+        );
+    } else if ctx.species_count >= 1
+        && matches!(objective, Objective::Minimize | Objective::Fastest)
+    {
+        out.push_str(
+            "Evolutionary guidance: improve the algorithm on the highest-cost cases above; fast numeric tuning will refine constants afterward.\n",
+        );
+    }
 }
 
 fn objective_sentence(objective: Objective) -> &'static str {
@@ -3381,6 +3563,63 @@ help: consider dereferencing here
         assert_eq!(
             rejected_source_line("let x = 1;\n    let y = c != \".\";\n", &v).as_deref(),
             Some("let y = c != \".\";")
+        );
+    }
+
+    #[test]
+    fn species_context_includes_worst_cases_and_specialist_inspiration_before_the_request() {
+        use crate::species::SpeciesArchive;
+
+        let min_nugget = region_nugget(Objective::Minimize);
+        let handle = SpeciesArchive::new_handle(4);
+        let sp_a = "    if rem < 15 { true } else { false }\n";
+        let sp_b = "    while step < 4 { step += 1; }\n    step > 2\n";
+        let mut va = scored(2, 2, 100.0, None);
+        va.hash = candidate_hash(sp_a);
+        va.status = Status::Proven;
+        let mut vb = scored(2, 2, 110.0, None);
+        vb.hash = candidate_hash(sp_b);
+        vb.status = Status::Proven;
+
+        handle.borrow_mut().observe(
+            sp_a,
+            &va,
+            &[("01-bursts".into(), 30.0), ("03-mixed".into(), 70.0)],
+            "seed",
+        );
+        handle.borrow_mut().observe(
+            sp_b,
+            &vb,
+            &[("01-bursts".into(), 80.0), ("03-mixed".into(), 30.0)],
+            "local",
+        );
+
+        let mut proposer =
+            MockModelProposer::new(vec!["hybrid_1\n".into(), "hybrid_2\n".into()], "")
+                .with_species(Some(handle));
+        let recent = [(sp_a, &va), (sp_b, &vb)];
+        let fb = Feedback {
+            best: Some((sp_a, 100.0)),
+            last: Some((sp_b, &vb)),
+            recent: &recent,
+            best_verdict: Some(&va),
+        };
+        proposer.next(&min_nugget, &fb).unwrap();
+        let p0 = &proposer.prompts[0].user;
+        assert!(
+            p0.contains("Highest-cost cases on the current lines: 03-mixed=70, 01-bursts=30."),
+            "{p0}"
+        );
+        assert!(
+            p0.contains(
+                "Alternative proven species (score 110; beats the current lines on case `03-mixed`: 30 vs 70):"
+            ),
+            "{p0}"
+        );
+        assert!(p0.contains("while step < 4"), "{p0}");
+        assert!(
+            p0.ends_with("Reply with the complete new lines that replace them.\n"),
+            "request must remain at the very end:\n{p0}"
         );
     }
 }
