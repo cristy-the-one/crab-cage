@@ -90,6 +90,176 @@ fn resume_rejects_changed_cases_without_touching_the_journal() {
     assert_eq!(before, fs::read(out.join("journal.jsonl")).unwrap());
 }
 
+/// A species archive with no journal and no `run-context.json` is prior
+/// evidence. Resuming must refuse it instead of binding a new context and
+/// counting the old champions (`species proven=1`).
+#[test]
+fn unbound_species_archive_is_not_counted() {
+    let out = scratch("species-unbound");
+    let task = scratch("species-unbound-nugget");
+    write_probe(&task, "minimize", "println!(\"score: 9\");\n", None);
+    let manifest = r#"{
+  "max_species": 2,
+  "total_selections": 0,
+  "entries": [
+    {
+      "species_id": "abc123abc123",
+      "hash": "deadbeefdeadbeef",
+      "text": "old candidate\n",
+      "score": 1.0,
+      "proposer": "folder",
+      "evaluations": 1,
+      "selections": 0,
+      "improvements": 0,
+      "variants": [
+        {
+          "hash": "deadbeefdeadbeef",
+          "text": "old candidate\n",
+          "score": 1.0,
+          "proven": true
+        }
+      ]
+    }
+  ]
+}
+"#;
+    fs::create_dir_all(out.join("species")).unwrap();
+    fs::write(out.join("species").join("manifest.json"), manifest).unwrap();
+    let before = fs::read(out.join("species").join("manifest.json")).unwrap();
+    let result = run(
+        &out,
+        &[
+            "run",
+            task.to_str().unwrap(),
+            "--species",
+            "2",
+            "--budget",
+            "0",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success(),
+        "exit {:?} stdout {stdout} stderr {stderr}",
+        result.status.code()
+    );
+    assert!(
+        stderr.contains("use a new --out"),
+        "exit {:?} stdout {stdout} stderr {stderr}",
+        result.status.code()
+    );
+    assert!(
+        !stdout.contains("species proven="),
+        "exit {:?} stdout {stdout} stderr {stderr}",
+        result.status.code()
+    );
+    assert!(!out.join("run-context.json").exists(), "{stdout}");
+    assert_eq!(
+        before,
+        fs::read(out.join("species").join("manifest.json")).unwrap()
+    );
+}
+
+/// A manifest beside an existing context still takes the input-mismatch
+/// rejection. The old proven champion is not counted.
+#[test]
+fn changed_inputs_reject_a_species_archive_with_context() {
+    let out = scratch("species-mismatch");
+    let task = scratch("species-mismatch-nugget");
+    write_probe(&task, "minimize", "println!(\"score: 9\");\n", None);
+    let first = run(
+        &out,
+        &[
+            "run",
+            task.to_str().unwrap(),
+            "--species",
+            "2",
+            "--budget",
+            "0",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    assert!(
+        first.status.success() || first.status.code() == Some(1),
+        "setup exit {:?} stderr {}",
+        first.status.code(),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    assert!(out.join("run-context.json").is_file());
+    let manifest = r#"{
+  "max_species": 2,
+  "total_selections": 0,
+  "entries": [
+    {
+      "species_id": "abc123abc123",
+      "hash": "deadbeefdeadbeef",
+      "text": "old candidate\n",
+      "score": 1.0,
+      "proposer": "folder",
+      "evaluations": 1,
+      "selections": 0,
+      "improvements": 0,
+      "variants": [
+        {
+          "hash": "deadbeefdeadbeef",
+          "text": "old candidate\n",
+          "score": 1.0,
+          "proven": true
+        }
+      ]
+    }
+  ]
+}
+"#;
+    fs::create_dir_all(out.join("species")).unwrap();
+    fs::write(out.join("species").join("manifest.json"), manifest).unwrap();
+    let manifest_before = fs::read(out.join("species").join("manifest.json")).unwrap();
+    let context_before = fs::read(out.join("run-context.json")).unwrap();
+    fs::write(task.join("cases").join("only.in"), "changed\n").unwrap();
+    let result = run(
+        &out,
+        &[
+            "run",
+            task.to_str().unwrap(),
+            "--species",
+            "2",
+            "--budget",
+            "0",
+            "--out",
+            out.to_str().unwrap(),
+        ],
+    );
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    let stderr = String::from_utf8_lossy(&result.stderr);
+    assert!(
+        !result.status.success(),
+        "exit {:?} stdout {stdout} stderr {stderr}",
+        result.status.code()
+    );
+    assert!(
+        stderr.contains("use a new --out"),
+        "exit {:?} stdout {stdout} stderr {stderr}",
+        result.status.code()
+    );
+    assert!(
+        !stdout.contains("species proven="),
+        "exit {:?} stdout {stdout} stderr {stderr}",
+        result.status.code()
+    );
+    assert_eq!(
+        context_before,
+        fs::read(out.join("run-context.json")).unwrap()
+    );
+    assert_eq!(
+        manifest_before,
+        fs::read(out.join("species").join("manifest.json")).unwrap()
+    );
+}
+
 #[test]
 fn demo_folder_run_proves_the_right_snippet() {
     let out = scratch("demo");

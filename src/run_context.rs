@@ -57,8 +57,11 @@ fn bind(out: &Path, context: &Value) -> Result<()> {
         }
         return Ok(());
     }
-    let journal = out.join("journal.jsonl");
-    if journal.exists() && fs::metadata(journal)?.len() != 0 {
+    // A new context must not adopt scores the run would restore. The journal
+    // supplies proven scores and seen hashes. `species/manifest.json` supplies
+    // species champions even when the journal is missing or empty.
+    // `best.region.rs` is read only to recover text for a journal hash.
+    if prior_evidence(out)? {
         return Err(err(
             "existing journal has no run-context.json; use a new --out directory",
         ));
@@ -67,6 +70,16 @@ fn bind(out: &Path, context: &Value) -> Result<()> {
     file.write_all(&serde_json::to_vec_pretty(context)?)?;
     file.sync_all()?;
     Ok(())
+}
+
+/// True when `out` holds evidence [`crate::run::execute_evolved`] would restore
+/// and that evidence is not yet bound to a `run-context.json`.
+fn prior_evidence(out: &Path) -> Result<bool> {
+    let journal = out.join("journal.jsonl");
+    if journal.is_file() && fs::metadata(&journal)?.len() != 0 {
+        return Ok(true);
+    }
+    Ok(out.join("species").join("manifest.json").is_file())
 }
 
 #[cfg(test)]
@@ -95,6 +108,42 @@ mod tests {
         let stored: Value =
             serde_json::from_slice(&fs::read(dir.join("run-context.json")).unwrap()).unwrap();
         assert_eq!(stored, context);
+        fs::remove_file(dir.join("run-context.json")).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn species_manifest_without_context_is_not_bound() {
+        let dir = std::env::temp_dir().join(format!("crab-context-species-{}", std::process::id()));
+        fs::create_dir_all(dir.join("species")).unwrap();
+        fs::write(dir.join("species").join("manifest.json"), "{}\n").unwrap();
+        assert!(bind(&dir, &json!({"schema": 1})).is_err());
+        assert!(!dir.join("run-context.json").exists());
+        fs::remove_file(dir.join("species").join("manifest.json")).unwrap();
+        fs::remove_dir(dir.join("species")).unwrap();
+        fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn changed_inputs_still_reject_when_a_manifest_is_present() {
+        let dir =
+            std::env::temp_dir().join(format!("crab-context-manifest-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let context = json!({"schema": 1, "cases": ["original"]});
+        bind(&dir, &context).unwrap();
+        fs::create_dir_all(dir.join("species")).unwrap();
+        let manifest = "{\"entries\":[]}\n";
+        fs::write(dir.join("species").join("manifest.json"), manifest).unwrap();
+        assert!(bind(&dir, &json!({"schema": 1, "cases": ["changed"]})).is_err());
+        let stored: Value =
+            serde_json::from_slice(&fs::read(dir.join("run-context.json")).unwrap()).unwrap();
+        assert_eq!(stored, context);
+        assert_eq!(
+            fs::read_to_string(dir.join("species").join("manifest.json")).unwrap(),
+            manifest
+        );
+        fs::remove_file(dir.join("species").join("manifest.json")).unwrap();
+        fs::remove_dir(dir.join("species")).unwrap();
         fs::remove_file(dir.join("run-context.json")).unwrap();
         fs::remove_dir(dir).unwrap();
     }

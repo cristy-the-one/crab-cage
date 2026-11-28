@@ -11,47 +11,41 @@ The funnel, fused sandbox build, warm slots, oracle promotion and species
 archive now exist. The findings below dated November 11 describe the older
 implementation, rather than a current backlog.
 
-This follow-up closes two ways to reuse an answer under changed inputs:
+This follow-up closes one way to reuse an answer under changed inputs, in this
+repository. The Lust and Grap changes below are still open pull requests.
 
 - Crab Cage's resume deduplication used only candidate-region hashes. A changed
   template, case, objective or limit could retain an obsolete proven best.
-  `run-context.json` now binds the journal to those inputs and compiler
-  identities before any restored scores are used. Legacy runs need a new output
-  directory; goals, budgets and proposers can still change.
-- Lust's whole-request cache looked for literal `include_str!` / `env!` text.
-  Rust permits comments and whitespace before `!`. An unchanged program using
-  `include_str /* comment */ !` printed an obsolete included file after a
-  rebuild. The cache now conservatively excludes the macro-name families;
-  ordinary candidates keep a cheap byte scan and unit object caching remains.
-  The new external-input regression fails against the original binary.
+  `run-context.json` binds the template (prefix, seed text, and suffix), the
+  cases, the objective, the limits (timeout and max memory), coverage mode,
+  the output of `rustc --version --verbose`, the crab-cage package version, and
+  the lust path together with that binary's version and build when a lust
+  binary is used. Those values are checked before any restored scores are used.
+  A legacy journal or `species/manifest.json` without this context needs a new
+  output directory. Goal, budget, proposers, and the nugget name can still
+  change.
+- Lust's cache fix is pending in
+  [lust-lang#49](https://github.com/cristy-the-one/lust-lang/pull/49). That pull
+  request reports, measured on Windows with rustc 1.96.0, that the whole-request
+  cache matched literal macro-name-plus-bang text and missed valid comments and
+  whitespace before `!`. Its full core unit suite is 393/405 pass on the changed
+  tree, with the same 12 failures on untouched `35505d4c` (392/404 pass). All 32
+  external-input rebuilds in that pull request match rustc. A small interleaved
+  benchmark there, 30 samples after five warmups, reports cached cold medians of
+  22.137 ms (baseline) and 22.005 ms (changed), and warm body-edit medians of
+  20.628 ms and 20.451 ms. That pull request does not claim a general compiler
+  speedup.
 
-Grap is useful as retrieval memory outside the funnel. Its new `crab_memory`
-example indexes existing journals and saved programs, retains provenance, and
-links candidates through shared diagnostics. It retrieved real "missing score"
-failures from the saved delta-kernel experiments. It does not automatically
-feed a proposer. Measure solved tasks per fixed time/model/seed budget before
-adding that coupling; retrieved evidence still needs current gates and rustc.
-Adding Grap to Lust would work against the compiler's dependency and latency
-budget.
-
-Validation on Windows with rustc 1.96.0: Crab Cage's full suite passes with a
-real Lust, and Grap's suite and example tests pass. Lust's cache unit tests pass.
-The broader Lust unit suite has the same 12 failures on both the untouched
-commit (392/404 pass) and the changed tree (393/405 pass). These include Windows
-path/tool assumptions, a name-suggestion expectation, panic-source markers,
-and `driver::patch::tests::inactive_edit_matches_cold`; they remain separate
-follow-up work. This is not a claim of exhaustive Rust compatibility.
-
-The rebuilt Lust release passes all 32 external-input builds against rustc,
-and Crab Cage's real-Lust and evolution integration suites pass with that
-release. A small sandboxed arithmetic program was built 35 times per mode
-and binary, discarding five warmups and interleaving baseline/changed order.
-On this Windows host, median cached cold build time was 22.137 / 22.005 ms
-(baseline/changed); warm body edits were 20.628 / 20.451 ms. Outputs were checked
-on every build. No regression is visible in this small workload; this is not
-a general compiler speedup claim. Raw results and the local harness are in
-Lust's ignored `target/cache-guard-benchmark.json` and
-`target/bench-cache-guard.py`.
+Grap's `crab_memory` example is pending in
+[grap-rust#135](https://github.com/cristy-the-one/grap-rust/pull/135), not on
+Grap's `master` branch. That pull request would search a run's journal and saved
+programs, keep provenance, and link candidates through shared diagnostic codes.
+It reports a manual search on Windows (rustc 1.96.0) over saved delta-kernel
+experiments that retrieved a real "missing score" rejection with its source and
+provenance. It does not automatically feed a proposer, and it says search-quality
+gains for automated evolution have not been measured. Retrieved evidence would
+still need current gates and rustc. Adding Grap to Lust would work against the
+compiler's dependency and latency budget.
 
 ## Original review: 2026-11-11
 
