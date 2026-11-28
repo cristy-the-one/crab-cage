@@ -12,7 +12,8 @@ archive now exist. The findings below dated November 11 describe the older
 implementation, rather than a current backlog.
 
 This follow-up closes one way to reuse an answer under changed inputs, in this
-repository. The Lust and Grap changes below are still open pull requests.
+repository. The associated Lust and Grap changes and their validation are
+recorded below.
 
 - Crab Cage's resume deduplication used only candidate-region hashes. A changed
   template, case, objective or limit could retain an obsolete proven best.
@@ -24,28 +25,35 @@ repository. The Lust and Grap changes below are still open pull requests.
   A legacy journal or `species/manifest.json` without this context needs a new
   output directory. Goal, budget, proposers, and the nugget name can still
   change.
-- Lust's cache fix is pending in
-  [lust-lang#49](https://github.com/cristy-the-one/lust-lang/pull/49). That pull
-  request reports, measured on Windows with rustc 1.96.0, that the whole-request
-  cache matched literal macro-name-plus-bang text and missed valid comments and
-  whitespace before `!`. Its full core unit suite is 393/405 pass on the changed
-  tree, with the same 12 failures on untouched `35505d4c` (392/404 pass). All 32
-  external-input rebuilds in that pull request match rustc. A small interleaved
-  benchmark there, 30 samples after five warmups, reports cached cold medians of
-  22.137 ms (baseline) and 22.005 ms (changed), and warm body-edit medians of
-  20.628 ms and 20.451 ms. That pull request does not claim a general compiler
-  speedup.
+- Lust's external-input cache fix in
+  [lust-lang#49](https://github.com/cristy-the-one/lust-lang/pull/49) handles
+  whitespace and comments before macro bangs, shebangs, and a leading UTF-8 BOM.
+  On Windows with rustc 1.99.0, all 70 cached external-input rebuilds match the
+  oracle. Ordinary strings, comments and identifiers do not disable whole-request
+  caching; the unit cache
+  remains available. This correctness repair does not claim a general speedup.
+- The combined 0.4.0 validation in
+  [lust-lang#51](https://github.com/cristy-the-one/lust-lang/pull/51) includes
+  [the restored core baseline](https://github.com/cristy-the-one/lust-lang/pull/50):
+  Windows 408, Linux 424 and macOS ARM 423 core tests pass with zero failures or
+  ignored tests. The standalone Linux/macOS core jobs explicitly report two
+  missing-Zig prerequisites; the full macOS and Windows gates install Zig.
+  `core-units` and all four platform gates, including native Intel macOS, are
+  required on Lust's `next` branch. Intel packages include TinyCC and its runtime
+  in the existing layout; both macOS packages produce sandboxed f64 trig results
+  matching rustc on their respective architectures.
 
-Grap's `crab_memory` example is pending in
-[grap-rust#135](https://github.com/cristy-the-one/grap-rust/pull/135), not on
-Grap's `master` branch. That pull request would search a run's journal and saved
-programs, keep provenance, and link candidates through shared diagnostic codes.
-It reports a manual search on Windows (rustc 1.96.0) over saved delta-kernel
-experiments that retrieved a real "missing score" rejection with its source and
-provenance. It does not automatically feed a proposer, and it says search-quality
-gains for automated evolution have not been measured. Retrieved evidence would
-still need current gates and rustc. Adding Grap to Lust would work against the
-compiler's dependency and latency budget.
+Grap's `crab_memory` example was merged in
+[grap-rust#135](https://github.com/cristy-the-one/grap-rust/pull/135) and is on
+Grap's `master` branch. It searches a run's journal and saved programs, keeps
+provenance, and links candidates through shared diagnostic codes. The PR reports
+a manual search on Windows (rustc 1.96.0) over saved delta-kernel experiments
+that retrieved a real "missing score" rejection with its source and provenance.
+It does not automatically feed a proposer; search-quality gains for automated
+evolution have not been measured. Retrieved evidence still needs current gates
+and rustc. These are trusted local reads: validating hashes blocks path tricks,
+but does not confine symlinks already inside `work/`. Grap stays outside Lust's
+compiler dependencies and latency budget.
 
 ## Original review: 2026-11-11
 
