@@ -355,6 +355,7 @@ pub fn execute_evolved(
     };
     let tools = Toolchain { lust };
     fs::create_dir_all(&options.out_dir)?;
+    crate::run_context::ensure(&options.out_dir, &nugget, &tools, options.coverage)?;
     let journal_path = options.out_dir.join("journal.jsonl");
     let mut journal = Journal::open(&journal_path)?;
 
