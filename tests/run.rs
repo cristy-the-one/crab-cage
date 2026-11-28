@@ -58,6 +58,39 @@ fn journal_records(out: &PathBuf) -> Vec<serde_json::Value> {
 }
 
 #[test]
+fn resume_rejects_changed_cases_without_touching_the_journal() {
+    let out = scratch("context");
+    let task = scratch("context-nugget");
+    fs::create_dir_all(task.join("cases")).unwrap();
+    fs::write(
+        task.join("nugget.json"),
+        r#"{"name":"context","objective":"pass_all"}"#,
+    )
+    .unwrap();
+    fs::write(
+        task.join("template.rs"),
+        "fn main() {\n// CRAB:BEGIN\nprintln!(\"ok\");\n// CRAB:END\n}\n",
+    )
+    .unwrap();
+    fs::write(task.join("cases/one.in"), "").unwrap();
+    fs::write(task.join("cases/one.out"), "ok\n").unwrap();
+    let args = [
+        "run",
+        task.to_str().unwrap(),
+        "--out",
+        out.to_str().unwrap(),
+    ];
+    assert!(run(&out, &args).status.success());
+    let before = fs::read(out.join("journal.jsonl")).unwrap();
+    assert!(run(&out, &args).status.success());
+    fs::write(task.join("cases/one.out"), "changed\n").unwrap();
+    let result = run(&out, &args);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("use a new --out"));
+    assert_eq!(before, fs::read(out.join("journal.jsonl")).unwrap());
+}
+
+#[test]
 fn demo_folder_run_proves_the_right_snippet() {
     let out = scratch("demo");
     let candidates = scratch("demo-cands");

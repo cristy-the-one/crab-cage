@@ -149,12 +149,23 @@ prompts/          with --backend local: each request to the model and its reply,
 
 - **Only `proven` counts.** A candidate becomes the best only after `rustc` has built it and printed the same output as the fast build. A candidate whose `rustc` build disagrees with itself between two runs is rejected as nondeterministic.
 - **Exit code.** For `pass_all`, 0 only when a proven candidate has score 0. For `minimize` and `fastest`, 0 when any candidate is proven; neither stops early.
-- **Resume.** Run again with the same `--out`. Candidates already in the journal are skipped, and the best is restored.
+- **Resume.** Run again with the same `--out`. Candidates already in the journal are skipped, and the best is restored. `run-context.json` binds scores to the template, seed, cases, objective, limits, coverage mode and compiler versions. Changed inputs or a legacy journal without this context require a new `--out` directory. Goals, budget and proposer settings may change on resume.
 - **`--coverage`** measures lust against rustc; it is not for finding the best candidate fast. rustc is asked about every candidate lust refuses to compile, and a program rustc accepts is copied to `<out>/lust-only/` with what lust said: a gap in lust. Every candidate that runs is compared with its rustc build, not only a new best, so every one ends `proven`, `diverged` or rejected by rustc. The summary gains a line `lust-only N`. It costs one rustc run for most candidates and needs `--lust-bin`. `nuggets/coverage/` holds 26 small tasks written for it, each with a `reference.rs`.
 - **`--seed N`** makes a run repeatable. `--tweak` draws its changes from it (default 1). With `--backend local`, each request to the model carries a seed counted up from N, and a server that honours seeds (Ollama does) then gives the same replies again. Without it the server picks its own seed and two runs differ.
 - **`--budget N`** is the number of candidates to journal, the seed included (default 200). A run also stops after 50 proposals in a row that add nothing new.
 - **`--jobs N`** evaluates up to `N` candidates at the same time. The journal keeps the order the candidates were proposed in.
 - **`work/divergences/<hash>/`** holds the source, the input, and both outputs whenever lust and `rustc` disagree. Each one is a lust bug report.
+
+Past runs can also supply proposal evidence. The sibling `grap-rust` repository's
+`crab_memory` example searches a run's journal and saved programs and links
+candidates through shared diagnostic codes:
+
+```sh
+cargo run --manifest-path /path/to/grap-rust/Cargo.toml --example crab_memory -- /path/to/crab-out "L0113 comparison"
+```
+
+It reads the run without changing it. Retrieval runs outside the evaluation
+loop; retrieved code must pass the current nugget's gates and rustc oracle.
 
 ## Lust
 
