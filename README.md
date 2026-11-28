@@ -22,7 +22,7 @@ Crab Cage is MIT OR Apache-2.0. It does not phone home. The only network client 
 ## What you need
 
 - Rust (the 1.74 toolchain or anything newer) and `rustc` on `PATH`. Linux and Windows are the tested hosts.
-- Optional: a [lust v0.3.2](https://github.com/cristy-the-one/lust-lang/releases/tag/v0.3.2) binary (prebuilt releases for Linux, Windows, and macOS). Without lust, `rustc` does the fast gates too: slower, same results.
+- Optional: a [lust v0.4.0](https://github.com/cristy-the-one/lust-lang/releases/tag/v0.4.0) binary (prebuilt releases for Linux, Windows, and macOS). Without lust, `rustc` does the fast gates too: slower, same results.
 - Optional, for `--backend local`: Ollama or llama.cpp with a coding model. See [A local model](#a-local-model).
 
 ## Build
@@ -156,13 +156,14 @@ prompts/          with --backend local: each request to the model and its reply,
 - **`--jobs N`** evaluates up to `N` candidates at the same time. The journal keeps the order the candidates were proposed in.
 - **`work/divergences/<hash>/`** holds the source, the input, and both outputs whenever lust and `rustc` disagree. Each one is a lust bug report.
 
-Past runs can also supply proposal evidence. That search is pending in
-[grap-rust#135](https://github.com/cristy-the-one/grap-rust/pull/135): a
-`crab_memory` example, not yet on Grap's `master` branch, would search a run's
-journal and saved programs and link candidates through shared diagnostic codes.
-It would read the run without changing it. Retrieval would stay outside the
+Past runs can also supply proposal evidence through Grap's
+[`crab_memory` example](https://github.com/cristy-the-one/grap-rust/blob/master/examples/crab_memory.rs),
+merged in [grap-rust#135](https://github.com/cristy-the-one/grap-rust/pull/135).
+It searches a run's journal and saved programs and links candidates through
+shared diagnostic codes, without changing the run. Retrieval stays outside the
 evaluation loop; retrieved code must pass the current nugget's gates and the
-rustc oracle.
+rustc oracle. Use it on trusted local runs: hash validation blocks path tricks,
+but does not prevent following a symlink already inside the run's `work/`.
 
 ## Lust
 
@@ -172,7 +173,7 @@ Lust is an external binary. This repo does not contain it.
 crab-cage lust-probe --lust-bin "$HOME/lust/bin/lust"
 ```
 
-prints the version, the path, and whether `--max-memory` and `--time-limit` exist. With lust 0.3.1+ / 0.3.2 Crab Cage reads the structured `interface` object from `lust capabilities --json` in one call (falling back to usage text on older builds), fuses check and build via `lust build --json --sandbox`, and sends `lust capabilities --sandbox --summary` to local models.
+prints the version, the path, and whether `--max-memory` and `--time-limit` exist. With lust 0.3.1 and newer, Crab Cage reads the structured `interface` object from `lust capabilities --json` in one call (falling back to usage text on older builds), fuses check and build via `lust build --json --sandbox`, and sends `lust capabilities --sandbox --summary` to local models.
 
 A candidate is checked and built with `lust build --json --sandbox --max-memory <nugget's> --time-limit <nugget's>` (or separate `lust check --json --sandbox` + `lust build` on older lust builds). A program that runs past the limit stops itself with `L0533`; one that allocates past the cap stops with `L0532`. The host keeps its own backstops, because lust's limits do not cover everything: a wall clock half a second later than lust's, and an address-space cap (Unix) or a job-object commit cap (Windows), 1 GiB by default.
 
